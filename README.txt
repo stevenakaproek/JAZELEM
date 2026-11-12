@@ -231,7 +231,9 @@ Fan Tuner tab:
 - Live RPM / duty per fan, CPU / GPU / board temperatures, graphs.
 - Per fan: BIOS (hands off), Manual (slider) or Curve (drag the points;
   follows the CPU, the GPU or the hotter of the two). Headers the library
-  cannot control on this board are shown as "read-only".
+  cannot control are shown as "read-only"; headers that never spin (nothing
+  plugged in) are folded away under "headers at 0 RPM". On the MSI X870E
+  Tomahawk every header, SYS fans included, is controllable (tested).
 - Profiles: Silent / Balanced / Performance (made for your fans the first time
   you pick one; "Reset to default" undoes your edits) and your own ("Save as
   new"). The last profile you picked is applied when PC Tuner starts.

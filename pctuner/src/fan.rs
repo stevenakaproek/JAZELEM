@@ -183,12 +183,13 @@ fn preset_points(name: &str) -> Option<[[f32; 2]; 5]> {
     }
 }
 
-/// A built-in profile for the fans this PC has: a curve per controllable fan (never under its floor).
+/// A built-in profile for the fans this PC has: a curve per controllable fan that is spinning (empty
+/// headers stay on BIOS), never under its floor. The GPU is included even when its fans are stopped at idle.
 /// Silent leaves the graphics card on its own curve, which can stop its fans at idle.
 pub fn builtin_profile(name: &str, fans: &[FanInfo], pumps: &HashMap<String, bool>) -> Option<Profile> {
     let pts = preset_points(name)?;
     let mut p = Profile::default();
-    for f in fans.iter().filter(|f| f.controllable) {
+    for f in fans.iter().filter(|f| f.controllable && (f.gpu || f.rpm.unwrap_or(0.0) > 0.0)) {
         let pump = pumps.get(&f.id).copied().unwrap_or(f.pump);
         if name == "Silent" && f.gpu {
             continue;
@@ -900,16 +901,37 @@ fn fans_and_temps(ui: &mut egui::Ui, s: &Status, rpm_hist: &HashMap<String, VecD
             ui.label("No fans were found.");
         });
     }
-    for row in s.fans.chunks(3) {
-        ui.columns(3, |cols| {
-            for (i, f) in row.iter().enumerate() {
-                let setting = view.settings.get(&f.id).cloned().unwrap_or_default();
-                if let Some(a) = fan_card(&mut cols[i], f, rpm_hist.get(&f.id), &setting, view, s) {
-                    actions.push((f.id.clone(), floor_for(f.pump, f.min), a));
+    // headers that have never spun (nothing plugged in) go into a folded group at the end
+    let (shown, empty): (Vec<&FanInfo>, Vec<&FanInfo>) = s.fans.iter().partition(|f| {
+        f.gpu
+            || view.settings.get(&f.id).map(|x| *x != FanSetting::Bios).unwrap_or(false)
+            || rpm_hist.get(&f.id).map(|h| h.iter().any(|v| *v > 0.0)).unwrap_or(false)
+            || f.rpm.unwrap_or(0.0) > 0.0
+    });
+    let mut cards = |ui: &mut egui::Ui, list: &[&FanInfo]| {
+        for row in list.chunks(3) {
+            ui.columns(3, |cols| {
+                for (i, f) in row.iter().enumerate() {
+                    let setting = view.settings.get(&f.id).cloned().unwrap_or_default();
+                    if let Some(a) = fan_card(&mut cols[i], f, rpm_hist.get(&f.id), &setting, view, s) {
+                        actions.push((f.id.clone(), floor_for(f.pump, f.min), a));
+                    }
                 }
-            }
-        });
-        ui.add_space(4.0);
+            });
+            ui.add_space(4.0);
+        }
+    };
+    cards(ui, &shown);
+    if !empty.is_empty() {
+        let names: Vec<&str> = empty.iter().map(|f| f.name.as_str()).collect();
+        egui::CollapsingHeader::new(RichText::new(format!("{} headers at 0 RPM - probably nothing plugged in", empty.len())).color(theme::TEXT_DIM))
+            .id_salt("fan-empty")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(RichText::new(names.join(", ")).size(12.0).color(theme::TEXT_FAINT));
+                ui.add_space(4.0);
+                cards(ui, &empty);
+            });
     }
     ui.add_space(6.0);
 
@@ -1221,6 +1243,13 @@ mod tests {
         assert!(!silent.fans.contains_key("/gpu-nvidia/0/control/1"));
         assert!(perf.fans.contains_key("/gpu-nvidia/0/control/1"));
         assert!(!perf.fans.contains_key("/lpc/nct6687d/0/fan/2"), "read-only fans are never in a profile");
+        // an empty header (0 RPM) stays on BIOS; a GPU stopped at idle is still included
+        let mut more = fans.clone();
+        more.push(FanInfo { id: "/lpc/x/control/9".into(), name: "System Fan #4".into(), rpm: Some(0.0), controllable: true, ..Default::default() });
+        more.iter_mut().filter(|f| f.gpu).for_each(|f| f.rpm = Some(0.0));
+        let bal = builtin_profile("Balanced", &more, &pumps).unwrap();
+        assert!(!bal.fans.contains_key("/lpc/x/control/9"));
+        assert!(bal.fans.contains_key("/gpu-nvidia/0/control/1"));
         // floors hold inside every built-in curve: pump >= 50, GPU >= its 30 % driver minimum
         let pump = &silent.fans["/lpc/nct6687d/0/control/1"];
         let FanSetting::Curve { points, .. } = pump else { panic!() };
