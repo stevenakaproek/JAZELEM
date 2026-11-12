@@ -1,5 +1,8 @@
 # build output
 pctuner/target/
+pctuner/fanhelper/out/
+pctuner/fanhelper/bin/
+pctuner/fanhelper/obj/
 
 # binaries and packages (publish PCTuner.exe as a GitHub Release instead)
 *.exe

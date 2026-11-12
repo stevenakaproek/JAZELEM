@@ -4,6 +4,7 @@
 
 mod bloat;
 mod common;
+mod fan;
 mod gpu;
 mod network;
 mod opwin;
@@ -27,6 +28,7 @@ fn tab_icon(title: &str) -> &'static str {
         "Network" => "🌐",
         "CPU Scheduler" => "⏱",
         "RTX 5080 Profiles" => "🎮",
+        "Fan Tuner" => "🌀",
         "USB Port Finder" => "🔌",
         _ => "•",
     }
@@ -53,10 +55,11 @@ impl App {
                 Box::new(network::NetworkTab::new()),
                 Box::new(scheduler::SchedulerTab::new()),
                 Box::new(gpu::GpuTab::new()),
+                Box::new(fan::FanTab::new()),
                 Box::new(usb::UsbTab::new()),
             ],
             // PCTUNER_TAB=<index> opens on that tab (used with the self-test to screenshot one tab)
-            active: std::env::var("PCTUNER_TAB").ok().and_then(|v| v.parse::<usize>().ok()).filter(|i| *i < 8).unwrap_or(0),
+            active: std::env::var("PCTUNER_TAB").ok().and_then(|v| v.parse::<usize>().ok()).filter(|i| *i < 9).unwrap_or(0),
             admin: common::is_admin(),
             switched_at: 0.0,
             selftest: std::env::var_os("PCTUNER_SELFTEST").map(|_| std::time::Instant::now()),
@@ -95,6 +98,9 @@ impl eframe::App for App {
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
 
         let now = ctx.input(|i| i.time);
+        for t in self.tabs.iter_mut() {
+            t.tick();
+        }
         let mut go: Option<usize> = None;
         let gpu_index = self.tabs.iter().position(|t| t.title() == "RTX 5080 Profiles");
 
@@ -154,6 +160,13 @@ impl eframe::App for App {
         });
 
         self.selftest_step(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // e.g. the Fan Tuner hands every fan back to the BIOS
+        for t in self.tabs.iter_mut() {
+            t.on_exit();
+        }
     }
 }
 

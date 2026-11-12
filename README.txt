@@ -224,6 +224,34 @@ change (with a warning if it is risky), then a progress bar, then each item
 ticking off with a count and an Undo button. Nothing is applied until you
 press the green button in that window.
 
+Fan Tuner tab:
+- Needs the PawnIO driver (already installed on this PC) and PC Tuner run as
+  administrator. Without admin only the graphics card is shown and nothing
+  can be changed.
+- Live RPM / duty per fan, CPU / GPU / board temperatures, graphs.
+- Per fan: BIOS (hands off), Manual (slider) or Curve (drag the points;
+  follows the CPU, the GPU or the hotter of the two). Headers the library
+  cannot control on this board are shown as "read-only".
+- Profiles: Silent / Balanced / Performance (made for your fans the first time
+  you pick one; "Reset to default" undoes your edits) and your own ("Save as
+  new"). The last profile you picked is applied when PC Tuner starts.
+  Saved in %LOCALAPPDATA%\PCTuner\fan-profiles.json.
+- Safety (inside the PCTunerFan helper, so it holds if the window freezes):
+  never below 20 % (pumps 50 %, GPU fan 30 % = its driver minimum); CPU or
+  GPU at 90 C -> every controlled fan 100 % until both are under 80 C; if
+  temperatures cannot be read for 5 s the fans go back to the BIOS; fans go
+  back to the BIOS when PC Tuner closes, crashes, or stops talking for 10 s.
+- Limits: if both PC Tuner and its helper are force-killed, fans stay at
+  their last speed (never under the floor) until PC Tuner is opened again or
+  the PC restarts. GPU fans: turn off MSI Afterburner's fan control first.
+- First-run checklist (run as administrator):
+  1. The tab lists your motherboard fans; note which say "read-only".
+  2. CPU Fan > Manual > move the slider: the RPM follows within a few seconds.
+  3. Close PC Tuner: the fan returns to its BIOS speed.
+  4. Pick Balanced, close and reopen PC Tuner: Balanced is applied again.
+  5. Optional: End task on PCTuner.exe in Task Manager - within ~10 s the
+     fans return to BIOS control.
+
 Network tab:
 - Latency test: 20 pings to the internet (1.1.1.1 by default) and to your
   router, with average, jitter and packet loss. Changes nothing.

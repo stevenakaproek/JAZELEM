@@ -31,24 +31,42 @@ Game Pass, Steam, Easy Anti-Cheat, the Store, Windows Security or Edge depends o
 - **RTX 5080 Profiles** - live clock / temperature / power / load graphs, presets, an always-visible
   **Reset GPU to stock**, and a safety trial that puts the GPU back on Stock at the next sign-in
   if Windows logs a crash while a new tune is being tested.
+- **Fan Tuner** - live fan RPM / duty and CPU / GPU / board temperatures; per fan: BIOS, Manual
+  (slider) or Curve (draggable points, follows CPU, GPU or the hotter of the two); Silent / Balanced /
+  Performance profiles plus your own, the last one applied at startup. Safety: never below 20 %
+  (pumps 50 %), 100 % at 90 °C, fans back to the BIOS when PC Tuner closes or crashes.
 
+![Fan Tuner tab](docs/fan.png)
 ![Network tab](docs/network.png)
 ![Preview before a change](docs/services-preview.png)
 
 ## Build
 
-Needs Rust (rustup, MSVC toolchain) and Visual Studio 2022 Build Tools (C++).
+Needs Rust (rustup, MSVC toolchain), Visual Studio 2022 Build Tools (C++) and, for the fan helper,
+the .NET 8 SDK (`winget install Microsoft.DotNet.SDK.8`). The fan helper is built first and embedded
+into PCTuner.exe:
 
 ```
 cd pctuner
+powershell -ExecutionPolicy Bypass -File fanhelper\build.ps1
 cargo build --release
 ```
+
+Fan control at run time needs the [PawnIO](https://pawnio.eu) driver installed (not WinRing0).
 
 The release build asks for administrator rights (it changes system settings). The debug build runs
 unelevated in view-only mode. `cargo test` runs the unit tests (use the debug profile).
 
+## Third-party components
+
+The Fan Tuner's helper (`pctuner/fanhelper`) uses, unmodified from NuGet,
+[LibreHardwareMonitorLib](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) 0.9.6
+(MPL-2.0; source code at that link) and its dependencies (HidSharp - Apache-2.0, and others listed in
+its package). These DLLs are embedded in PCTuner.exe and unpacked to `%LOCALAPPDATA%\PCTuner\fan`.
+Hardware access goes through the separately installed [PawnIO](https://pawnio.eu) driver.
+
 ## Disclaimer
 
-These tools change Windows services, the registry, scheduled tasks, network adapter settings and
-GPU tuning. They were written for one specific PC. Read the preview before applying anything,
+These tools change Windows services, the registry, scheduled tasks, network adapter settings,
+fan speeds and GPU tuning. They were written for one specific PC. Read the preview before applying anything,
 and use at your own risk.

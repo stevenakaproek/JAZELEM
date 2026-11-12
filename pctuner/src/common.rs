@@ -273,4 +273,8 @@ pub fn admin_banner(ui: &mut eframe::egui::Ui) {
 pub trait Tab {
     fn title(&self) -> &'static str;
     fn ui(&mut self, ui: &mut eframe::egui::Ui);
+    /// Called every frame for every tab, visible or not (background work such as the fan profile).
+    fn tick(&mut self) {}
+    /// Called once when PC Tuner closes (e.g. to hand fans back to the BIOS).
+    fn on_exit(&mut self) {}
 }

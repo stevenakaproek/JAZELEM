@@ -1,8 +1,8 @@
 [package]
 name = "pctuner"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
-description = "PC Tuner - services, startup, scheduler, bloat removal, USB port finder and RTX 5080 profiles in one app"
+description = "PC Tuner - services, startup, scheduler, bloat removal, network, fan control, USB port finder and RTX 5080 profiles in one app"
 
 [dependencies]
 eframe = "0.29"
