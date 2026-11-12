@@ -172,6 +172,8 @@ pub struct ProfileStore {
     /// Applied when PC Tuner starts.
     pub last: Option<String>,
     pub profiles: BTreeMap<String, Profile>,
+    /// Fans the user tuned on their own: profiles leave these alone ("own setting").
+    pub pinned: BTreeMap<String, FanSetting>,
 }
 
 fn preset_points(name: &str) -> Option<[[f32; 2]; 5]> {
@@ -453,6 +455,8 @@ fn demo_status(t: f64) -> Status {
 enum CardAction {
     Set(FanSetting),
     Pump(bool),
+    /// Drop the fan's own setting and use the profile's again.
+    FollowProfile,
 }
 
 pub struct FanTab {
@@ -474,6 +478,8 @@ pub struct FanTab {
     active: Option<String>,
     new_name: String,
     note: Option<String>,
+    /// An own setting changed at this time and is not saved yet (saved shortly after, so a curve drag is one write).
+    pin_dirty: Option<Instant>,
 }
 
 impl FanTab {
@@ -494,6 +500,7 @@ impl FanTab {
             active: None,
             new_name: String::new(),
             note: None,
+            pin_dirty: None,
         };
         // apply the last profile at startup (only as administrator: otherwise nothing can be controlled)
         if !demo {
@@ -506,6 +513,16 @@ impl FanTab {
                     }
                 }
             }
+            // own fan settings without a profile still come back at startup
+            if tab.active.is_none() && !tab.store.pinned.is_empty() {
+                for (id, s) in tab.store.pinned.clone() {
+                    tab.settings.insert(id, s);
+                }
+                tab.note = Some("Your own fan settings were applied when PC Tuner started.".into());
+                if common::is_admin() {
+                    tab.start();
+                }
+            }
         }
         if demo {
             // the Balanced profile, with the CPU fan changed by hand (shows "changed - not saved")
@@ -513,6 +530,8 @@ impl FanTab {
                 tab.store.profiles.insert("Balanced".into(), p.clone());
                 tab.use_profile("Balanced", &p);
             }
+            // the CPU fan tuned by hand: its own setting, kept when profiles change
+            tab.store.pinned.insert("/lpc/nct6687d/0/control/0".into(), FanSetting::Manual { percent: 45.0 });
             tab.settings.insert("/lpc/nct6687d/0/control/0".into(), FanSetting::Manual { percent: 45.0 });
             tab.note = Some("Balanced was applied when PC Tuner started.".into());
             tab.afterburner.store(true, Ordering::Relaxed);
@@ -584,7 +603,8 @@ impl FanTab {
         self.settings.values().any(|s| *s != FanSetting::Bios)
     }
 
-    /// Take a profile's settings: listed fans as saved, every other fan back to BIOS.
+    /// Take a profile's settings: listed fans as saved, every other fan back to BIOS -
+    /// except fans with their own setting, which keep it.
     fn use_profile(&mut self, name: &str, p: &Profile) {
         for s in self.settings.values_mut() {
             *s = FanSetting::Bios;
@@ -592,8 +612,42 @@ impl FanTab {
         for (id, s) in &p.fans {
             self.settings.insert(id.clone(), s.clone());
         }
-        self.pumps = p.pumps.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for (id, s) in &self.store.pinned {
+            self.settings.insert(id.clone(), s.clone());
+        }
+        // pump choices: the profile's, then keep the user's own for pinned fans
+        let mut pumps: HashMap<String, bool> = p.pumps.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for id in self.store.pinned.keys() {
+            if let Some(v) = self.pumps.get(id) {
+                pumps.insert(id.clone(), *v);
+            }
+        }
+        self.pumps = pumps;
         self.active = Some(name.to_string());
+    }
+
+    /// The setting the active profile gives a fan (BIOS when it is not listed).
+    fn profile_setting(&self, id: &str) -> FanSetting {
+        self.active.as_ref().and_then(|n| self.store.profiles.get(n)).and_then(|p| p.fans.get(id).cloned()).unwrap_or_default()
+    }
+
+    /// Give a fan its own setting (kept when profiles change); saved straight away.
+    fn pin(&mut self, id: &str, s: &FanSetting) {
+        self.store.pinned.insert(id.to_string(), s.clone());
+        self.pin_dirty = Some(Instant::now());
+    }
+
+    /// Hand a fan back to the active profile.
+    fn unpin(&mut self, id: &str) {
+        self.store.pinned.remove(id);
+        let s = self.profile_setting(id);
+        self.settings.insert(id.to_string(), s);
+        self.save_store();
+    }
+
+    /// Settings of the fans that follow the profile (own settings are not part of it).
+    fn following(&self) -> BTreeMap<String, FanSetting> {
+        normalized(&self.settings).into_iter().filter(|(k, _)| !self.store.pinned.contains_key(k)).collect()
     }
 
     fn save_store(&mut self) {
@@ -619,13 +673,17 @@ impl FanTab {
     }
 
     fn current_profile(&self) -> Profile {
-        Profile { fans: normalized(&self.settings), pumps: self.pumps.iter().map(|(k, v)| (k.clone(), *v)).collect() }
+        let pumps = self.pumps.iter().filter(|(k, _)| !self.store.pinned.contains_key(*k)).map(|(k, v)| (k.clone(), *v)).collect();
+        Profile { fans: self.following(), pumps }
     }
 
     fn modified(&self) -> bool {
         match self.active.as_ref().and_then(|n| self.store.profiles.get(n)) {
-            Some(p) => normalized(&self.settings) != p.fans,
-            None => self.any_controlled(),
+            Some(p) => {
+                let saved: BTreeMap<String, FanSetting> = p.fans.iter().filter(|(k, _)| !self.store.pinned.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+                self.following() != saved
+            }
+            None => !self.following().is_empty(),
         }
     }
 
@@ -756,9 +814,16 @@ impl Tab for FanTab {
             self.watch();
             self.sync();
         }
+        if self.pin_dirty.map(|t| t.elapsed() > Duration::from_millis(600)).unwrap_or(false) {
+            self.pin_dirty = None;
+            self.save_store();
+        }
     }
 
     fn on_exit(&mut self) {
+        if self.pin_dirty.take().is_some() {
+            self.save_store();
+        }
         if let Some(mut h) = self.helper.take() {
             h.stop();
         }
@@ -807,21 +872,22 @@ impl Tab for FanTab {
             };
             hero_card(ui, &s, &cpu_hist, &gpu_hist);
             self.profile_bar(ui, &s.fans, can);
-            let view = View { settings: &self.settings, can, afterburner };
+            let view = View { settings: &self.settings, pinned: &self.store.pinned, can, afterburner, profile: self.active.as_deref() };
             fans_and_temps(ui, &s, &rpm_hist, &view, &mut actions);
         });
         for (id, floor, a) in actions {
             match a {
-                CardAction::Set(FanSetting::Manual { percent }) => {
-                    self.settings.insert(id, FanSetting::Manual { percent: percent.max(floor) });
-                }
-                CardAction::Set(FanSetting::Curve { source, points }) => {
-                    let points = points.into_iter().map(|p| [p[0], p[1].clamp(floor, 100.0)]).collect();
-                    self.settings.insert(id, FanSetting::Curve { source, points });
-                }
+                // a fan the user tunes gets its own setting: switching profiles leaves it alone
                 CardAction::Set(s) => {
+                    let s = match s {
+                        FanSetting::Manual { percent } => FanSetting::Manual { percent: percent.max(floor) },
+                        FanSetting::Curve { source, points } => FanSetting::Curve { source, points: points.into_iter().map(|p| [p[0], p[1].clamp(floor, 100.0)]).collect() },
+                        other => other,
+                    };
+                    self.pin(&id, &s);
                     self.settings.insert(id, s);
                 }
+                CardAction::FollowProfile => self.unpin(&id),
                 CardAction::Pump(p) => {
                     if p {
                         match self.settings.get_mut(&id) {
@@ -829,6 +895,15 @@ impl Tab for FanTab {
                             Some(FanSetting::Curve { points, .. }) => points.iter_mut().for_each(|pt| pt[1] = pt[1].max(PUMP_FLOOR)),
                             _ => {}
                         }
+                    }
+                    if let Some(s) = self.store.pinned.get_mut(&id) {
+                        if let (true, FanSetting::Manual { percent }) = (p, &mut *s) {
+                            *percent = percent.max(PUMP_FLOOR);
+                        }
+                        if let (true, FanSetting::Curve { points, .. }) = (p, &mut *s) {
+                            points.iter_mut().for_each(|pt| pt[1] = pt[1].max(PUMP_FLOOR));
+                        }
+                        self.pin_dirty = Some(Instant::now());
                     }
                     self.pumps.insert(id, p);
                 }
@@ -841,8 +916,11 @@ impl Tab for FanTab {
 /// Read-only view of the tab state the page needs.
 struct View<'a> {
     settings: &'a HashMap<String, FanSetting>,
+    /// fans with their own setting (profiles leave them alone)
+    pinned: &'a BTreeMap<String, FanSetting>,
     can: bool,
     afterburner: bool,
+    profile: Option<&'a str>,
 }
 
 /// Banners plus the hero card: the hottest of CPU and GPU, with live graphs.
@@ -984,6 +1062,9 @@ fn fan_card(ui: &mut egui::Ui, f: &FanInfo, hist: Option<&VecDeque<f32>>, settin
                 if f.pump {
                     theme::chip(ui, "pump", theme::OPTIONAL);
                 }
+                if f.controllable && view.pinned.contains_key(&f.id) {
+                    theme::chip(ui, "own setting", theme::GAMING);
+                }
             });
         });
         ui.label(RichText::new(&f.hw).size(12.0).color(theme::TEXT_FAINT));
@@ -1010,6 +1091,23 @@ fn fan_card(ui: &mut egui::Ui, f: &FanInfo, hist: Option<&VecDeque<f32>>, settin
         // ---- control
         ui.add_space(6.0);
         let floor = floor_for(f.pump, f.min);
+        // own setting vs following the profile
+        // plain labels wrap inside the card (a horizontal row would widen it past its column)
+        ui.add_enabled_ui(view.can, |ui| {
+            if view.pinned.contains_key(&f.id) {
+                ui.label(RichText::new("Own setting - profiles leave this fan alone.").size(11.5).color(theme::GAMING));
+                let tip = match view.profile {
+                    Some(p) => format!("Use {p}'s setting for this fan again."),
+                    None => "Let the next profile you pick set this fan.".to_string(),
+                };
+                if ui.small_button("Follow profile").on_hover_text(tip).clicked() {
+                    action = Some(CardAction::FollowProfile);
+                }
+            } else {
+                let who = view.profile.map(|p| format!("Follows {p}.")).unwrap_or_else(|| "Follows the profile.".into());
+                ui.label(RichText::new(format!("{who} Change it here to give this fan its own setting.")).size(11.5).color(theme::TEXT_FAINT));
+            }
+        });
         ui.add_enabled_ui(view.can, |ui| {
             ui.horizontal(|ui| {
                 let bios = *setting == FanSetting::Bios;
@@ -1266,6 +1364,42 @@ mod tests {
         let back: ProfileStore = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
         assert_eq!(back.last.as_deref(), Some("Performance"));
         assert_eq!(back.profiles["Performance"], perf);
+    }
+
+    /// The user's case: Performance is on, the pump is set to Manual by hand, then a profile is picked.
+    #[test]
+    fn fan_own_settings_survive_profile_switch() {
+        let fans = demo_status(0.0).fans;
+        let pump = "/lpc/nct6687d/0/control/1";
+        let cpu = "/lpc/nct6687d/0/control/0";
+        let mut t = FanTab::new();
+        t.demo = true; // never write fan-profiles.json from a test
+        t.store = ProfileStore::default();
+        t.settings.clear();
+        t.load_profile("Performance", &fans);
+        assert!(matches!(t.settings[pump], FanSetting::Curve { .. }));
+        // the user sets the pump to Manual 60 %
+        t.pin(pump, &FanSetting::Manual { percent: 60.0 });
+        t.settings.insert(pump.into(), FanSetting::Manual { percent: 60.0 });
+        assert!(!t.modified(), "an own setting is not a change to the profile");
+        // switching profiles keeps the pump, changes the others
+        t.load_profile("Silent", &fans);
+        assert_eq!(t.settings[pump], FanSetting::Manual { percent: 60.0 }, "the pump keeps its own setting");
+        assert_eq!(t.settings[cpu], t.store.profiles["Silent"].fans[cpu], "other fans follow the profile");
+        // saving the profile does not swallow the own setting
+        let saved = t.current_profile();
+        assert!(!saved.fans.contains_key(pump));
+        // Follow profile hands the pump back
+        t.unpin(pump);
+        assert_eq!(t.settings[pump], t.store.profiles["Silent"].fans[pump]);
+        assert!(t.store.pinned.is_empty());
+        // and the store round-trips with own settings
+        t.pin(cpu, &FanSetting::Manual { percent: 45.0 });
+        let back: ProfileStore = serde_json::from_str(&serde_json::to_string(&t.store).unwrap()).unwrap();
+        assert_eq!(back.pinned[cpu], FanSetting::Manual { percent: 45.0 });
+        // older files without "pinned" still load
+        let old: ProfileStore = serde_json::from_str(r#"{"last":"Balanced","profiles":{}}"#).unwrap();
+        assert!(old.pinned.is_empty());
     }
 
     #[test]

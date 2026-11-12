@@ -255,6 +255,8 @@ Fan Tuner tab:
 - Profiles: Silent / Balanced / Performance (made for your fans the first time
   you pick one; "Reset to default" undoes your edits) and your own ("Save as
   new"). The last profile you picked is applied when PC Tuner starts.
+  A fan you change yourself gets its own setting ("own setting" chip):
+  switching profiles leaves it alone until you press "Follow profile".
   Saved in %LOCALAPPDATA%\PCTuner\fan-profiles.json.
 - Safety (inside the PCTunerFan helper, so it holds if the window freezes):
   never below 20 % (pumps 50 %, GPU fan 30 % = its driver minimum); CPU or
