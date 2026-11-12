@@ -128,7 +128,9 @@ $Targets = @(
 )
 
 # ======================================================================= helpers
+$script:LogCount = 0
 function Write-Log([string]$msg, [string]$color = 'Gray') {
+    $script:LogCount++
     $line = "{0}  {1}" -f (Get-Date -Format 'HH:mm:ss'), $msg
     if (-not $IsSystem) { Write-Host $line -ForegroundColor $color }
     try { Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8 } catch { }
@@ -159,11 +161,16 @@ function Load-State {
                 Policies = [System.Collections.ArrayList]@(@($s.Policies) | Where-Object { $_ })
                 Usched   = [System.Collections.ArrayList]@(@($s.Usched) | Where-Object { $_ })
                 Backups  = [System.Collections.ArrayList]@(@($s.Backups) | Where-Object { $_ })
+                Tasks      = [System.Collections.ArrayList]@(@($s.Tasks) | Where-Object { $_ })
+                Features   = [System.Collections.ArrayList]@(@($s.Features) | Where-Object { $_ })
+                Frameworks = [System.Collections.ArrayList]@(@($s.Frameworks) | Where-Object { $_ })
             }
         } catch { Write-Log "State file unreadable: $($_.Exception.Message)" 'Yellow' }
     }
     [pscustomobject]@{ Removed = New-Object System.Collections.ArrayList; Policies = New-Object System.Collections.ArrayList
-                       Usched = New-Object System.Collections.ArrayList; Backups = New-Object System.Collections.ArrayList }
+                       Usched = New-Object System.Collections.ArrayList; Backups = New-Object System.Collections.ArrayList
+                       Tasks = New-Object System.Collections.ArrayList; Features = New-Object System.Collections.ArrayList
+                       Frameworks = New-Object System.Collections.ArrayList }
 }
 function Save-State { ConvertTo-Json -InputObject $script:State -Depth 6 | Set-Content -LiteralPath $StateFile -Encoding UTF8 }
 
@@ -280,7 +287,8 @@ function Invoke-Hook([string]$hook, [string]$phase, $t) {
         'PhoneLink/after'   { Set-TrackedValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableMmx' 0 }
         'Feedback/after' {
             $task = Get-ScheduledTask -TaskPath '\Microsoft\Windows\PerformanceTrace\' -TaskName 'ShowFeedbackToast' -ErrorAction SilentlyContinue
-            if ($task -and $task.State -ne 'Disabled') { if ($WhatIf) { Write-Log '  would disable ShowFeedbackToast task' } else { Disable-ScheduledTask -InputObject $task | Out-Null; Write-Log '  disabled ShowFeedbackToast task' 'DarkGray' } }
+            if ($task -and $task.State -ne 'Disabled') { if ($WhatIf) { Write-Log '  would disable ShowFeedbackToast task' } else { Disable-ScheduledTask -InputObject $task | Out-Null; Write-Log '  disabled ShowFeedbackToast task' 'DarkGray'
+                if (-not ($script:State.Tasks | Where-Object { $_.Name -eq 'ShowFeedbackToast' })) { [void]$script:State.Tasks.Add([pscustomobject]@{ Path = '\Microsoft\Windows\PerformanceTrace\'; Name = 'ShowFeedbackToast' }) } } }
         }
         'Ink/after' {
             # The handwriting framework has no other users once Main is gone.
@@ -288,7 +296,10 @@ function Invoke-Hook([string]$hook, [string]$phase, $t) {
                 $users = Get-AppxPackage -AllUsers | Where-Object { $_.Dependencies.Name -contains $fw.Name -and $_.Name -ne $fw.Name }
                 if ($users) { Write-Log "  keeping $($fw.Name): still used by $($users.Name -join ', ')"; continue }
                 if ($WhatIf) { Write-Log "  would remove framework $($fw.PackageFullName)"; continue }
-                try { Remove-AppxPackage -Package $fw.PackageFullName -AllUsers; Write-Log "  removed framework $($fw.PackageFullName)" 'DarkGray' } catch { Write-Log "  framework not removed: $($_.Exception.Message)" 'Yellow' }
+                try {
+                    Remove-AppxPackage -Package $fw.PackageFullName -AllUsers; Write-Log "  removed framework $($fw.PackageFullName)" 'DarkGray'
+                    if (-not ($script:State.Frameworks | Where-Object { $_.Pfn -eq $fw.PackageFamilyName })) { [void]$script:State.Frameworks.Add([pscustomobject]@{ Name = $fw.Name; Pfn = $fw.PackageFamilyName; Time = $Stamp }) }
+                } catch { Write-Log "  framework not removed: $($_.Exception.Message)" 'Yellow' }
             }
         }
         'Teams/after' {
@@ -320,7 +331,10 @@ function Invoke-Hook([string]$hook, [string]$phase, $t) {
                 $f = Get-WindowsOptionalFeature -Online -FeatureName 'Recall' -ErrorAction Stop
                 if ($f.State -eq 'Enabled') {
                     if ($WhatIf) { Write-Log '  would disable optional feature Recall' }
-                    else { Disable-WindowsOptionalFeature -Online -FeatureName 'Recall' -NoRestart | Out-Null; Write-Log '  disabled optional feature Recall' 'DarkGray' }
+                    else {
+                        Disable-WindowsOptionalFeature -Online -FeatureName 'Recall' -NoRestart | Out-Null; Write-Log '  disabled optional feature Recall' 'DarkGray'
+                        if (-not ($script:State.Features -contains 'Recall')) { [void]$script:State.Features.Add('Recall') }
+                    }
                 }
             } catch { }
         }
@@ -329,7 +343,10 @@ function Invoke-Hook([string]$hook, [string]$phase, $t) {
             if (-not $IsSystem) { Move-ToQuarantine "$env:ProgramData\Microsoft OneDrive" }
             # New user profiles get OneDrive from a Run entry in the Default user hive.
             $hive = 'C:\Users\Default\NTUSER.DAT'
-            if ((Test-Path $hive) -and -not $IsSystem) {
+            # A preview never mounts the Default user hive (a failed unload would leave it locked).
+            if ((Test-Path $hive) -and -not $IsSystem -and $WhatIf) {
+                Write-Log '  would remove OneDriveSetup from the Default user Run key if it is there, backed up (a preview does not open that profile)'
+            } elseif ((Test-Path $hive) -and -not $IsSystem) {
                 $loaded = $false
                 try {
                     & reg.exe load 'HKU\DebloatDefault' $hive 2>$null | Out-Null
@@ -337,12 +354,9 @@ function Invoke-Hook([string]$hook, [string]$phase, $t) {
                     if ($loaded) {
                         $run = Get-ItemProperty -LiteralPath 'Registry::HKEY_USERS\DebloatDefault\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue
                         if ($run -and $run.OneDriveSetup) {
-                            if ($WhatIf) { Write-Log '  would remove OneDriveSetup from the Default user Run key' }
-                            else {
-                                [void](Backup-RegKey 'HKEY_USERS\DebloatDefault\Software\Microsoft\Windows\CurrentVersion\Run' 'DefaultUser-Run')
-                                Remove-ItemProperty -LiteralPath 'Registry::HKEY_USERS\DebloatDefault\Software\Microsoft\Windows\CurrentVersion\Run' -Name OneDriveSetup
-                                Write-Log '  removed OneDriveSetup from the Default user Run key (backed up)' 'DarkGray'
-                            }
+                            [void](Backup-RegKey 'HKEY_USERS\DebloatDefault\Software\Microsoft\Windows\CurrentVersion\Run' 'DefaultUser-Run')
+                            Remove-ItemProperty -LiteralPath 'Registry::HKEY_USERS\DebloatDefault\Software\Microsoft\Windows\CurrentVersion\Run' -Name OneDriveSetup
+                            Write-Log '  removed OneDriveSetup from the Default user Run key (backed up)' 'DarkGray'
                         }
                         $run = $null
                     }
@@ -389,7 +403,10 @@ function Remove-AppxTarget($t) {
         $still = @(Get-AppxPackage -AllUsers -Name $name -ErrorAction SilentlyContinue)
         $ok = ($still.Count -eq 0)
         Write-Log $(if ($ok) { "  done: $name removed" } else { "  WARNING: $name still registered for some user" }) $(if ($ok) { 'Green' } else { 'Yellow' })
-        if (-not ($script:State.Removed | Where-Object { $_.Name -eq $name -and -not $_.Restored })) {
+        # removing an app again that a Restore only unblocked blocks it again
+        $open = @($script:State.Removed | Where-Object { $_.Name -eq $name -and -not $_.Restored })
+        foreach ($o in $open) { $o | Add-Member -NotePropertyName Unblocked -NotePropertyValue $false -Force }
+        if (-not $open) {
             [void]$script:State.Removed.Add([pscustomobject]@{ Name = $name; Kind = 'appx'; Pfn = $pfn; Store = $t.Store; Time = $Stamp; Restored = $false })
         }
     }
@@ -406,7 +423,7 @@ function Remove-CapabilityTarget($t) {
         if ($null -eq $script:CapCache) { Write-Log 'Reading Windows optional capabilities (takes a moment)...' 'DarkGray'; $script:CapCache = @(Get-WindowsCapability -Online -ErrorAction Stop) }
         $caps = @($script:CapCache | Where-Object { $_.Name -like "$($t.Name)*" -and $_.State -eq 'Installed' })
     }
-    catch { Write-Log "  cannot query capabilities: $($_.Exception.Message)" 'Yellow'; return }
+    catch { Write-Log "  ERROR on $($t.Name): cannot query capabilities: $($_.Exception.Message)" 'Red'; return }
     if (-not $caps) { if (-not $Reapply) { Write-Log "  not installed: $($t.Name)" 'DarkGray' }; return }
     foreach ($c in $caps) {
         Write-Log "Removing capability $($c.Name)  -  $($t.Loses)" 'Cyan'
@@ -436,6 +453,12 @@ function Register-ReapplyTask {
 function Invoke-Restore {
     $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
     foreach ($r in @($script:State.Removed | Where-Object { -not $_.Restored })) {
+        # Already settled: reinstalled by hand since, or unblocked by an earlier Restore (reported then, not again).
+        if ($r.Kind -eq 'appx' -and @(Get-AppxPackage -AllUsers -Name $r.Name -ErrorAction SilentlyContinue).Count) {
+            if ($r.Pfn) { Remove-Item -LiteralPath (Join-Path $DeprovKey $r.Pfn) -Force -ErrorAction SilentlyContinue }
+            $r.Restored = $true; Write-Log "$($r.Name): installed again - nothing to restore" 'DarkGray'; continue
+        }
+        if ($r.Unblocked) { Write-Log "$($r.Name): still unblocked from an earlier Restore, reinstall it by hand" 'DarkGray'; continue }
         switch ($r.Kind) {
             'appx' {
                 if ($r.Pfn) { Remove-Item -LiteralPath (Join-Path $DeprovKey $r.Pfn) -Force -ErrorAction SilentlyContinue }
@@ -443,18 +466,46 @@ function Invoke-Restore {
                     Write-Log "Reinstalling $($r.Name) from the Store ($($r.Store))..." 'Cyan'
                     & winget.exe install --source msstore --id $r.Store --accept-package-agreements --accept-source-agreements --silent | Out-Null
                     if ($LASTEXITCODE -eq 0) { $r.Restored = $true; Write-Log '  reinstalled' 'Green' } else { Write-Log "  winget exit code $LASTEXITCODE - reinstall it from the Store by name" 'Yellow' }
-                } else { Write-Log "$($r.Name): unblocked - reinstall from the Microsoft Store by name if you want it." 'Yellow'; $r.Restored = $true }
+                } else {
+                    # Unblocked (no Deprovisioned marker, the re-check task leaves it alone) but NOT reinstalled.
+                    $r | Add-Member -NotePropertyName Unblocked -NotePropertyValue $true -Force
+                    $why = if ($r.Store) { 'winget not found' } else { 'no Store id' }
+                    Write-Log "NOT restored: $($r.Name) - $why; unblocked, reinstall it from the Microsoft Store by name" 'Yellow'
+                }
             }
             'capability' {
                 Write-Log "Re-adding capability $($r.Name) (needs internet)..." 'Cyan'
                 try { Add-WindowsCapability -Online -Name $r.Name | Out-Null; $r.Restored = $true; Write-Log '  done' 'Green' } catch { Write-Log "  failed: $($_.Exception.Message)" 'Yellow' }
             }
             'win32' {
-                if ($r.Store -and $winget) { & winget.exe install --source msstore --id $r.Store --accept-package-agreements --accept-source-agreements --silent | Out-Null }
-                $r.Restored = $true
-                Write-Log "$($r.Name): reinstalled via the Store or returns with its parent app." 'Yellow'
+                if ($r.Store -and $winget) {
+                    Write-Log "Reinstalling $($r.Name) from the Store ($($r.Store))..." 'Cyan'
+                    & winget.exe install --source msstore --id $r.Store --accept-package-agreements --accept-source-agreements --silent | Out-Null
+                    if ($LASTEXITCODE -eq 0) { $r.Restored = $true; Write-Log '  reinstalled' 'Green' } else { Write-Log "  winget exit code $LASTEXITCODE - reinstall it from the Store by name" 'Yellow' }
+                } else {
+                    $r | Add-Member -NotePropertyName Unblocked -NotePropertyValue $true -Force
+                    # nothing blocks a win32 app without a Store id (Teams add-in): reported once, then settled
+                    if (-not $r.Store) { $r.Restored = $true }
+                    Write-Log "NOT restored: $($r.Name) - reinstall it by hand (the Teams add-in comes back with Teams)" 'Yellow'
+                }
             }
         }
+    }
+    foreach ($tk in @($script:State.Tasks)) {
+        Write-Log "Re-enabling task $($tk.Name)..." 'Cyan'
+        try { Enable-ScheduledTask -TaskPath $tk.Path -TaskName $tk.Name -ErrorAction Stop | Out-Null; [void]$script:State.Tasks.Remove($tk); Write-Log '  done' 'Green' }
+        catch { Write-Log "  failed: $($_.Exception.Message)" 'Yellow' }
+    }
+    foreach ($fe in @($script:State.Features)) {
+        Write-Log "Re-enabling optional feature $fe..." 'Cyan'
+        try { Enable-WindowsOptionalFeature -Online -FeatureName $fe -NoRestart -ErrorAction Stop | Out-Null; [void]$script:State.Features.Remove($fe); Write-Log '  done' 'Green' }
+        catch { Write-Log "  failed: $($_.Exception.Message)" 'Yellow' }
+    }
+    foreach ($fw in @($script:State.Frameworks)) {
+        if (Get-AppxPackage -AllUsers -Name $fw.Name -ErrorAction SilentlyContinue) { [void]$script:State.Frameworks.Remove($fw); continue }
+        Write-Log "Re-registering framework $($fw.Name)..." 'Cyan'
+        try { Add-AppxPackage -RegisterByFamilyName -MainPackage $fw.Pfn -ErrorAction Stop; [void]$script:State.Frameworks.Remove($fw); Write-Log '  done' 'Green' }
+        catch { Write-Log "  failed: $($_.Exception.Message) - it comes back with an app that needs it" 'Yellow' }
     }
     foreach ($p in @($script:State.Policies)) {
         try {
@@ -464,10 +515,28 @@ function Invoke-Restore {
         } catch { }
     }
     $script:State.Policies.Clear()
-    foreach ($b in @($script:State.Backups) | Sort-Object Time -Descending) {
-        if (Test-Path -LiteralPath $b.File) { & reg.exe import $b.File 2>$null | Out-Null; Write-Log "  re-imported $($b.Key)" 'DarkGray' }
+    # Registry exports. The Default user Run key lives in a hive that is mounted only while it is needed.
+    # reg.exe runs through cmd so its stderr (it reports success there too) cannot trip ErrorActionPreference=Stop.
+    $keep = New-Object System.Collections.ArrayList
+    $hive = 'C:\Users\Default\NTUSER.DAT'; $hiveTried = $false; $hiveLoaded = $false
+    try {
+        foreach ($b in @($script:State.Backups | Sort-Object Time -Descending)) {
+            if (-not (Test-Path -LiteralPath $b.File)) { Write-Log "  backup file missing for $($b.Key): $($b.File)" 'Yellow'; continue }
+            if ($b.Key -like 'HKEY_USERS\DebloatDefault*' -and -not $hiveTried) {
+                $hiveTried = $true
+                $out = & cmd.exe /c "reg.exe load HKU\DebloatDefault `"$hive`" 2>&1"
+                $hiveLoaded = ($LASTEXITCODE -eq 0)
+                if (-not $hiveLoaded) { Write-Log "  could not load the Default user hive (reg.exe exit $LASTEXITCODE): $(($out | Out-String).Trim())" 'Yellow' }
+            }
+            $out = & cmd.exe /c "reg.exe import `"$($b.File)`" 2>&1"
+            if ($LASTEXITCODE -eq 0) { Write-Log "  re-imported $($b.Key)" 'DarkGray' }
+            else { Write-Log "  could not re-import $($b.Key) (reg.exe exit $LASTEXITCODE): $(($out | Out-String).Trim())" 'Yellow'; [void]$keep.Add($b) }
+        }
+    } finally {
+        if ($hiveLoaded) { [gc]::Collect(); [gc]::WaitForPendingFinalizers(); Start-Sleep -Milliseconds 500; & cmd.exe /c "reg.exe unload HKU\DebloatDefault >nul 2>&1" }
     }
-    $script:State.Backups.Clear(); $script:State.Usched.Clear()
+    # failed imports stay recorded so a later Restore can retry them
+    $script:State.Backups = $keep; $script:State.Usched.Clear()
     Unregister-ScheduledTask -TaskName 'ReapplyDebloat' -TaskPath '\Debloat\' -Confirm:$false -ErrorAction SilentlyContinue
     Write-Log 'Restore finished. Quarantined files are kept under C:\ProgramData\Debloat\backup\<date>\quarantine.' 'Green'
 }
@@ -500,7 +569,11 @@ if ($List) { Show-List; return }
 if (-not $WhatIf) {
     Initialize-DataDir
     Add-Content -LiteralPath $LogFile -Value "`r`n===== $(Get-Date -Format s)  Apply=$Apply Optional=$Optional Restore=$Restore Reapply=$Reapply" -Encoding UTF8
-} else { $LogFile = Join-Path $env:TEMP 'debloat-preview.log' }
+} else {
+    # every preview overwrites its log instead of letting it grow without end
+    $LogFile = Join-Path $env:TEMP 'debloat-preview.log'
+    try { Set-Content -LiteralPath $LogFile -Value '' -Encoding UTF8 } catch { }
+}
 $script:State = Load-State
 
 if ($Restore) {
@@ -513,7 +586,8 @@ if ($Restore) {
 
 if ($Reapply) {
     # Only re-remove what was removed before, if an update brought it back. No per-user changes.
-    $names = @($script:State.Removed | Where-Object { -not $_.Restored -and $_.Kind -in 'appx', 'capability' } | ForEach-Object Name)
+    # an app that a Restore unblocked (but could not reinstall) stays unblocked
+    $names = @($script:State.Removed | Where-Object { -not $_.Restored -and -not $_.Unblocked -and $_.Kind -in 'appx', 'capability' } | ForEach-Object Name)
     $work = @($Targets | Where-Object { $_.Kind -eq 'appx' -and $names -contains $_.Name })
     $work += @($script:State.Removed | Where-Object { -not $_.Restored -and $_.Kind -eq 'capability' } | ForEach-Object { @{ Kind = 'capability'; Name = $_.Name; Loses = '(re-check)' } })
     foreach ($e in @($script:State.Usched)) { Remove-UschedEntry $e }
@@ -549,7 +623,12 @@ foreach ($t in $work) {
         switch ($t.Kind) {
             'appx'       { Remove-AppxTarget $t }
             'capability' { Remove-CapabilityTarget $t }
-            'system'     { Write-Log "Applying: $($t.Name)  -  $($t.Loses)" 'Cyan'; Invoke-Hook $t.Hook 'run' $t }
+            'system'     {
+                Write-Log "Applying: $($t.Name)  -  $($t.Loses)" 'Cyan'
+                $before = $script:LogCount
+                Invoke-Hook $t.Hook 'run' $t
+                if ($script:LogCount -eq $before) { Write-Log '  already set' 'DarkGray' }
+            }
         }
     } catch { Write-Log "  ERROR on $($t.Name): $($_.Exception.Message)" 'Red' }
     if (-not $WhatIf) { Save-State }

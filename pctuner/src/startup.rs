@@ -305,6 +305,12 @@ struct Snap {
     exists: bool,
     #[serde(rename = "Data", default)]
     data: serde_json::Value,
+    /// Registry value type and raw bytes (hex), so undo restores the exact value. Missing in older
+    /// records and in the PS tool's history: those fall back to `data`.
+    #[serde(rename = "VType", default, skip_serializing_if = "Option::is_none")]
+    vtype: Option<u32>,
+    #[serde(rename = "Raw", default, skip_serializing_if = "Option::is_none")]
+    raw: Option<String>,
 }
 
 /// Everything needed to toggle an entry. Same field names as the PS tool's `Loc` hashtables, so
@@ -437,20 +443,30 @@ fn ext_prefix(c: &str) -> Option<String> {
 }
 
 /// Get-ExePath: the file a command line points at, or None when it can't be told.
+#[cfg(test)]
 fn get_exe_path(cmd: &str) -> Option<String> {
+    get_exe_path_sure(cmd).map(|(p, _)| p)
+}
+
+/// Get-ExePath plus whether the path is certain (quoted, a known extension, or resolved on disk).
+/// `false` means it was guessed from the first word of an unquoted command, which cuts paths with
+/// spaces short - such a path not existing proves nothing.
+fn get_exe_path_sure(cmd: &str) -> Option<(String, bool)> {
     if cmd.is_empty() || cmd.starts_with('(') {
         return None;
     }
     let c = expand_env(cmd.trim());
-    let p = if let Some(rest) = c.strip_prefix('"') {
+    let (p, sure) = if let Some(rest) = c.strip_prefix('"') {
         match rest.find('"') {
-            Some(end) if end > 0 => rest[..end].to_string(),
-            _ => c.trim_matches('"').to_string(),
+            Some(end) if end > 0 => (rest[..end].to_string(), true),
+            _ => (c.trim_matches('"').to_string(), true),
         }
     } else if let Some(m) = ext_prefix(&c) {
-        m
+        (m, true)
     } else {
-        c.split_whitespace().next().unwrap_or("").to_string()
+        let first = c.split_whitespace().next().unwrap_or("").to_string();
+        let whole = first.len() == c.len();
+        (first, whole)
     };
     if p.is_empty() {
         return None;
@@ -461,12 +477,12 @@ fn get_exe_path(cmd: &str) -> Option<String> {
         for dir in [format!(r"{root}\System32"), root.clone()] {
             let full = format!(r"{}\{}", dir.trim_end_matches('\\'), leaf);
             if Path::new(&full).exists() {
-                return Some(full);
+                return Some((full, true));
             }
         }
         return None; // bare command name we can't resolve - don't call it "missing"
     }
-    Some(p)
+    Some((p, sure))
 }
 
 /// Case-insensitive match of one rule's alternations.
@@ -765,6 +781,15 @@ fn shell_folder(hive: winreg::HKEY, name: &str) -> Option<String> {
     value_string(&v).filter(|s| !s.is_empty())
 }
 
+/// One file in a Startup folder. Shortcuts keep the bare path as their command (the .lnk resolver
+/// below looks them up by it); any other file (.url, .ahk, .js, ...) is quoted, because the folder
+/// path contains spaces ("Start Menu") and the file itself is what starts.
+fn folder_entry(name: &str, full: &str, approved: &str, label: &str) -> Entry {
+    let cmd = if name.to_ascii_lowercase().ends_with(".lnk") { full.to_string() } else { format!("\"{full}\"") };
+    let loc = Loc { approved: Some(approved.to_string()), value: Some(name.to_string()), ..Default::default() };
+    new_entry(Kind::StartupFolder, name, label, &cmd, approved_enabled(approved, name), loc, "")
+}
+
 fn scan_startup_folders(out: &mut Raw, warnings: &mut Vec<String>) {
     let user = shell_folder(HKEY_CURRENT_USER, "Startup").or_else(|| {
         std::env::var("APPDATA").ok().map(|a| format!(r"{a}\Microsoft\Windows\Start Menu\Programs\Startup"))
@@ -793,8 +818,7 @@ fn scan_startup_folders(out: &mut Raw, warnings: &mut Vec<String>) {
             if name.to_ascii_lowercase().ends_with(".lnk") {
                 lnks.push(full.clone());
             }
-            let loc = Loc { approved: Some(approved.clone()), value: Some(name.clone()), ..Default::default() };
-            out.push((new_entry(Kind::StartupFolder, &name, label, &full, approved_enabled(&approved, &name), loc, ""), true));
+            out.push((folder_entry(&name, &full, &approved, label), true));
         }
     }
     if lnks.is_empty() {
@@ -969,10 +993,10 @@ fn scan_tweaks(out: &mut Raw) {
 fn fill_publishers(raw: &mut Raw, warnings: &mut Vec<String>) {
     const BAD: [char; 6] = ['<', '>', '|', '"', '*', '?'];
     let mut paths: HashMap<String, String> = HashMap::new(); // lower -> original
-    let mut exe_of: Vec<Option<String>> = Vec::with_capacity(raw.len());
+    let mut exe_of: Vec<Option<(String, bool)>> = Vec::with_capacity(raw.len());
     for (e, need) in raw.iter() {
-        let p = if *need { get_exe_path(&e.command) } else { None };
-        if let Some(p) = &p {
+        let p = if *need { get_exe_path_sure(&e.command) } else { None };
+        if let Some((p, _)) = &p {
             if !p.contains(BAD) && Path::new(p).is_file() {
                 paths.entry(p.to_lowercase()).or_insert_with(|| p.clone());
             }
@@ -997,9 +1021,11 @@ fn fill_publishers(raw: &mut Raw, warnings: &mut Vec<String>) {
         }
         e.publisher = match exe {
             None => String::new(),
-            Some(p) if p.contains(BAD) => String::new(),
-            Some(p) if !Path::new(&p).is_file() => "(file missing)".into(),
-            Some(p) => company.get(&p.to_lowercase()).cloned().unwrap_or_default(),
+            Some((p, _)) if p.contains(BAD) => String::new(),
+            // a guessed path (first word of an unquoted command) not existing proves nothing
+            Some((p, false)) if !Path::new(&p).is_file() => String::new(),
+            Some((p, _)) if !Path::new(&p).is_file() => "(file missing)".into(),
+            Some((p, _)) => company.get(&p.to_lowercase()).cloned().unwrap_or_default(),
         };
         if e.publisher == "(file missing)" && e.category != "Keep" && matches!(e.kind, Kind::Run | Kind::StartupFolder | Kind::Task) {
             if is_windows_task(e) {
@@ -1051,14 +1077,76 @@ fn scan() -> ScanResult {
 
 // ------------------------------------------------------------------ state changes
 
+/// What is stored at `p\n` right now, type and bytes included.
+fn snap_value(p: &str, n: &str) -> Snap {
+    let d = read_value(p, n);
+    Snap {
+        p: p.to_string(),
+        n: n.to_string(),
+        exists: d.is_some(),
+        data: d.as_ref().map(value_json).unwrap_or_default(),
+        vtype: d.as_ref().map(|x| x.vtype.clone() as u32),
+        raw: d.as_ref().map(|x| x.bytes.iter().map(|b| format!("{b:02x}")).collect()),
+    }
+}
+
 fn tweak_snapshot(values: &[TweakVal]) -> Vec<Snap> {
-    values
-        .iter()
-        .map(|v| {
-            let d = read_value(&v.p, &v.n);
-            Snap { p: v.p.clone(), n: v.n.clone(), exists: d.is_some(), data: d.map(|x| value_json(&x)).unwrap_or_default() }
-        })
-        .collect()
+    values.iter().map(|v| snap_value(&v.p, &v.n)).collect()
+}
+
+fn reg_type(t: u32) -> Option<RegType> {
+    [
+        REG_NONE,
+        REG_SZ,
+        REG_EXPAND_SZ,
+        REG_BINARY,
+        REG_DWORD,
+        REG_DWORD_BIG_ENDIAN,
+        REG_LINK,
+        REG_MULTI_SZ,
+        REG_RESOURCE_LIST,
+        REG_FULL_RESOURCE_DESCRIPTOR,
+        REG_RESOURCE_REQUIREMENTS_LIST,
+        REG_QWORD,
+    ]
+    .into_iter()
+    .find(|x| x.clone() as u32 == t)
+}
+
+fn hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+}
+
+/// Put one snapshot back exactly: the original type and bytes, or no value at all when there was none.
+/// Records without type/bytes (older history, the PS tool's history) are restored as a DWORD.
+fn restore_snap(s: &Snap) -> Result<(), String> {
+    if !s.exists {
+        remove_value_quiet(&s.p, &s.n);
+        return Ok(());
+    }
+    if let (Some(t), Some(raw)) = (s.vtype, s.raw.as_deref()) {
+        let vtype = reg_type(t).ok_or_else(|| format!("unknown registry type {t}"))?;
+        let bytes = hex_bytes(raw).ok_or("damaged snapshot bytes")?;
+        return open_write(&s.p)?.set_raw_value(&s.n, &RegValue { bytes, vtype }).map_err(|e| e.to_string());
+    }
+    let d = json_to_dword(&s.data)?;
+    open_write(&s.p)?.set_value(&s.n, &d).map_err(|e| e.to_string())
+}
+
+fn find_snap<'a>(loc: &'a Loc, p: &str, n: &str) -> Option<&'a Snap> {
+    loc.prev.iter().find(|s| s.p.eq_ignore_ascii_case(p) && s.n.eq_ignore_ascii_case(n))
+}
+
+/// The registry value a Run / Startup folder / Store app change writes (None for other kinds).
+fn state_value(kind: Kind, loc: &Loc) -> Option<(String, String)> {
+    match kind {
+        Kind::Run | Kind::StartupFolder => Some((loc.approved.clone()?, loc.value.clone()?)),
+        Kind::StoreApp => Some((format!(r"{STORE_BASE}\{}\{}", loc.pkg.as_deref()?, loc.task_id.as_deref()?), "State".into())),
+        _ => None,
+    }
 }
 
 fn json_to_dword(d: &serde_json::Value) -> Result<u32, String> {
@@ -1071,7 +1159,15 @@ fn json_to_dword(d: &serde_json::Value) -> Result<u32, String> {
 }
 
 /// Set-EntryEnabled for everything except scheduled tasks (those go through PowerShell in a batch).
-fn set_native(kind: Kind, loc: &Loc, on: bool) -> Result<(), String> {
+/// `undo`: put back the value saved in `loc.prev` when the change was made (exact undo), if there is one.
+fn set_native(kind: Kind, loc: &Loc, on: bool, undo: bool) -> Result<(), String> {
+    if undo {
+        if let Some((p, n)) = state_value(kind, loc) {
+            if let Some(s) = find_snap(loc, &p, &n) {
+                return restore_snap(s);
+            }
+        }
+    }
     match kind {
         Kind::Run | Kind::StartupFolder => {
             let approved = loc.approved.as_deref().ok_or("missing StartupApproved key")?;
@@ -1102,22 +1198,30 @@ fn set_native(kind: Kind, loc: &Loc, on: bool) -> Result<(), String> {
             }
         }
         Kind::Tweak => {
+            let mut failed = vec![];
             for v in &loc.values {
                 if on {
-                    // Restore what was there before we switched it off; otherwise remove our value (= Windows default)
-                    let prev = loc.prev.iter().find(|s| s.p.eq_ignore_ascii_case(&v.p) && s.n.eq_ignore_ascii_case(&v.n));
-                    match prev {
-                        Some(s) if s.exists => {
-                            let d = json_to_dword(&s.data)?;
-                            open_write(&v.p)?.set_value(&v.n, &d).map_err(|e| e.to_string())?;
+                    // Restore what was there before we switched it off; otherwise remove our value (= Windows default).
+                    // Keep going on a failure so one bad value doesn't leave the rest switched off.
+                    let r = match find_snap(loc, &v.p, &v.n) {
+                        Some(s) => restore_snap(s),
+                        None => {
+                            remove_value_quiet(&v.p, &v.n);
+                            Ok(())
                         }
-                        _ => remove_value_quiet(&v.p, &v.n),
+                    };
+                    if let Err(e) = r {
+                        failed.push(format!(r"{}\{}: {e}", v.p, v.n));
                     }
                 } else {
                     open_write(&v.p)?.set_value(&v.n, &(v.v as u32)).map_err(|e| e.to_string())?;
                 }
             }
-            Ok(())
+            if failed.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} of {} values could not be restored: {}", failed.len(), loc.values.len(), failed.join("; ")))
+            }
         }
         Kind::Task => Err("scheduled tasks are changed through PowerShell".into()),
     }
@@ -1128,8 +1232,11 @@ struct Op {
     name: String,
     loc: Loc,
     on: bool,
-    /// Tweak being switched off from the main list: snapshot first, roll back on failure.
+    /// A change from the main list: snapshot what is there first so undo can put it back exactly.
+    /// Tweaks being switched off are also rolled back on failure.
     snapshot: bool,
+    /// Undo of a history record: restore the snapshot in `loc.prev` when there is one.
+    undo: bool,
 }
 
 /// Turn a raw error into the PS tool's friendlier wording.
@@ -1165,12 +1272,18 @@ fn apply_ops(ops: &[Op]) -> Vec<Result<Loc, String>> {
         if op.kind == Kind::Tweak && op.snapshot {
             loc.prev = tweak_snapshot(&loc.values); // so undo restores exactly
         }
-        let r = match set_native(op.kind, &loc, op.on) {
+        if op.snapshot {
+            if let Some((p, n)) = state_value(op.kind, &loc) {
+                // StartupApproved bytes / Store app State as they are now (or absent), for an exact undo
+                loc.prev = vec![snap_value(&p, &n)];
+            }
+        }
+        let r = match set_native(op.kind, &loc, op.on, op.undo) {
             Ok(()) => Ok(loc),
             Err(e) => {
                 if op.kind == Kind::Tweak && op.snapshot && !op.on {
                     // Don't leave a half-applied setting behind: put back whatever was written before the failure
-                    let _ = set_native(Kind::Tweak, &loc, true);
+                    let _ = set_native(Kind::Tweak, &loc, true, true);
                 }
                 Err(explain(op, &e))
             }
@@ -1218,22 +1331,99 @@ fn parse_ps_history(text: &str) -> Result<Vec<Hist>, String> {
     Ok(out)
 }
 
-/// Load our history; on first run import the PowerShell tool's history (same record format).
-fn load_history() -> (Vec<Hist>, Option<String>) {
-    if common::data_dir().join(HISTORY).exists() {
-        return (common::load_json(HISTORY), None);
+/// Write the history through a temp file, so a crash or power loss mid-write never leaves a
+/// truncated file behind (rename replaces the old file in one step).
+fn save_history_to(data: &Path, v: &[Hist]) -> Result<(), String> {
+    use std::io::Write;
+    let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+    let target = data.join(HISTORY);
+    let tmp = data.join(format!("{HISTORY}.tmp"));
+    let r = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &target)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    let Some(base) = std::env::var_os("LOCALAPPDATA") else { return (vec![], None) };
-    let ps_file = Path::new(&base).join("StartupCleaner").join("history.json");
-    let Ok(text) = std::fs::read_to_string(&ps_file) else { return (vec![], None) };
+    r.map_err(|e| e.to_string())
+}
+
+/// Result of reading the history at start-up.
+struct HistLoad {
+    hist: Vec<Hist>,
+    /// Shown as the last-action text (e.g. "Imported 12 changes ...").
+    note: Option<String>,
+    /// Shown as a warning banner (the file could not be read).
+    warning: Option<String>,
+    /// false: the file is there but could neither be read nor backed up - never overwrite it.
+    writable: bool,
+}
+
+/// Load our history; on first run import the PowerShell tool's history (same record format).
+fn load_history() -> HistLoad {
+    let base = std::env::var_os("LOCALAPPDATA");
+    load_history_in(&common::data_dir(), base.as_deref().map(Path::new))
+}
+
+/// `data`: our data folder; `ps_base`: the folder holding the PS tool's StartupCleaner\history.json.
+fn load_history_in(data: &Path, ps_base: Option<&Path>) -> HistLoad {
+    let own = data.join(HISTORY);
+    match std::fs::read(&own) {
+        Ok(bytes) => {
+            let parsed = std::str::from_utf8(&bytes).map_err(|e| e.to_string()).and_then(parse_ps_history);
+            match parsed {
+                Ok(v) => return HistLoad { hist: v, note: None, warning: None, writable: true },
+                Err(e) => {
+                    // Keep the bytes: rename it out of the way (or copy it when that fails), never overwrite it.
+                    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    let backup = format!("startup-history.corrupt-{secs}.json");
+                    let kept = std::fs::rename(&own, data.join(&backup)).is_ok() || std::fs::write(data.join(&backup), &bytes).is_ok();
+                    if !kept {
+                        let w = format!("Could not read {HISTORY} ({e}) and could not back it up, so it is left untouched. Changes made now are not saved and can only be undone until PC Tuner closes.");
+                        return HistLoad { hist: vec![], note: None, warning: Some(w), writable: false };
+                    }
+                    // Never fall back to the PowerShell history here: its Undone flags are older than
+                    // the damaged file, so changes already undone would be offered for undo again.
+                    let w = format!("Could not read {HISTORY} ({e}); it was kept as {backup}. Earlier changes cannot be undone from this tab.");
+                    return HistLoad { hist: vec![], note: None, warning: Some(w), writable: true };
+                }
+            }
+        }
+        // Import only on a true first run: a moved-aside damaged file means we already had our own history.
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound && has_corrupt_backup(data) => {
+            return HistLoad { hist: vec![], note: None, warning: None, writable: true };
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let w = format!("Could not read {HISTORY} ({e}), so it is left untouched. Changes made now are not saved and can only be undone until PC Tuner closes.");
+            return HistLoad { hist: vec![], note: None, warning: Some(w), writable: false };
+        }
+    }
+    let empty = || HistLoad { hist: vec![], note: None, warning: None, writable: true };
+    let Some(base) = ps_base else { return empty() };
+    let ps_file = base.join("StartupCleaner").join("history.json");
+    let Ok(text) = std::fs::read_to_string(&ps_file) else { return empty() };
     match parse_ps_history(&text) {
         Ok(v) => {
-            common::save_json(HISTORY, &v);
             let n = v.len();
-            (v, Some(format!("Imported {n} change(s) from the PowerShell Startup Cleaner history.")))
+            let mut note = format!("Imported {n} change(s) from the PowerShell Startup Cleaner history.");
+            if let Err(e) = save_history_to(data, &v) {
+                note.push_str(&format!(" (could not save {HISTORY}: {e})"));
+            }
+            HistLoad { hist: v, note: Some(note), warning: None, writable: true }
         }
-        Err(e) => (vec![], Some(format!("Could not import {}: {e}", ps_file.display()))),
+        Err(e) => HistLoad { hist: vec![], note: Some(format!("Could not import {}: {e}", ps_file.display())), warning: None, writable: true },
     }
+}
+
+/// A damaged history of ours was moved aside earlier (startup-history.corrupt-*).
+fn has_corrupt_backup(data: &Path) -> bool {
+    std::fs::read_dir(data)
+        .map(|rd| rd.filter_map(Result::ok).any(|f| f.file_name().to_string_lossy().starts_with("startup-history.corrupt-")))
+        .unwrap_or(false)
 }
 
 // ------------------------------------------------------------------ operation windows
@@ -1446,13 +1636,23 @@ pub struct StartupTab {
     warnings: Vec<String>,
     show_history: bool,
     hist_sel: HashSet<usize>,
+    /// Shown inside the history window (e.g. "Nothing to undo.").
+    hist_status: String,
+    /// The history file could not be read or saved (warning banner).
+    history_warning: Option<String>,
+    /// false: the history file could not be read nor backed up, so it is never overwritten.
+    history_writable: bool,
     /// The open operation window (preview -> working -> result), if any.
     op: Option<OpShow>,
 }
 
 impl StartupTab {
     pub fn new() -> Self {
-        let (history, note) = load_history();
+        Self::from_load(load_history())
+    }
+
+    fn from_load(h: HistLoad) -> Self {
+        let HistLoad { hist: history, note, warning, writable } = h;
         StartupTab {
             entries: vec![],
             scanned: false,
@@ -1470,12 +1670,11 @@ impl StartupTab {
             // screenshot hook for the history window (read-only): PCTUNER_DEMO=startup:history
             show_history: demo_history(),
             hist_sel: HashSet::new(),
+            hist_status: String::new(),
+            history_warning: warning,
+            history_writable: writable,
             op: if demo_history() { None } else { opwin::demo_stage("startup").map(demo_op) },
         }
-    }
-
-    fn busy(&self) -> bool {
-        self.job.is_some() || self.explorer_job.is_some()
     }
 
     fn start(&mut self, work: Work, ops: Vec<Op>) {
@@ -1487,6 +1686,16 @@ impl StartupTab {
     fn rescan(&mut self) {
         if !self.busy() {
             self.start(Work::Rescan, vec![]);
+        }
+    }
+
+    /// Save the history; a failure is shown as a banner instead of being dropped.
+    fn save_history(&mut self) {
+        if !self.history_writable {
+            return; // the unreadable file is kept as it is (the banner already says so)
+        }
+        if let Err(e) = save_history_to(&common::data_dir(), &self.history) {
+            self.history_warning = Some(format!("Could not save {HISTORY} ({e}). The changes were made, but may not be undoable after PC Tuner closes."));
         }
     }
 
@@ -1522,7 +1731,8 @@ impl StartupTab {
                         loc.prev = h.loc.prev.clone();
                     }
                 }
-                Op { kind: e.kind, name: e.name.clone(), loc, on, snapshot: e.kind == Kind::Tweak && !on }
+                let snapshot = matches!(e.kind, Kind::Run | Kind::StartupFolder | Kind::StoreApp) || (e.kind == Kind::Tweak && !on);
+                Op { kind: e.kind, name: e.name.clone(), loc, on, snapshot, undo: false }
             })
             .collect();
         let skipped = total - work.len();
@@ -1546,7 +1756,7 @@ impl StartupTab {
             .iter()
             .map(|&i| {
                 let h = &self.history[i];
-                Op { kind: h.kind, name: h.name.clone(), loc: h.loc.clone(), on: h.from, snapshot: false }
+                Op { kind: h.kind, name: h.name.clone(), loc: h.loc.clone(), on: h.from, snapshot: false, undo: true }
             })
             .collect();
         self.start(Work::Undo { idx }, ops);
@@ -1593,7 +1803,7 @@ impl StartupTab {
                         }
                     }
                 }
-                common::save_json(HISTORY, &self.history);
+                self.save_history();
                 let mut summary = format!("{ok} {verb}");
                 if skipped > 0 {
                     summary.push_str(&format!(", {skipped} already in that state"));
@@ -1622,7 +1832,7 @@ impl StartupTab {
                         }
                     }
                 }
-                common::save_json(HISTORY, &self.history);
+                self.save_history();
                 self.last_action = format!("Undid {ok} change(s).");
                 if failed > 0 {
                     self.last_action.push_str(&format!(" {failed} could not be undone."));
@@ -1832,7 +2042,7 @@ impl StartupTab {
                             body.rows(24.0, order.len(), |mut row| {
                                 let i = order[row.index()];
                                 let h = &hist[i];
-                                row.set_selected(sel.contains(&i));
+                                row.set_selected(!h.undone && sel.contains(&i));
                                 let (c, c2) = if h.undone { (theme::DIM, theme::DIM) } else { (theme::TEXT, theme::TEXT_DIM) };
                                 row.col(|ui| cell(ui, &h.time, c2));
                                 row.col(|ui| cell(ui, &h.name, c));
@@ -1848,7 +2058,8 @@ impl StartupTab {
                 });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let n = self.hist_sel.len();
+                    // only active rows count (undone ones can't be selected, this is a safety net)
+                    let n = self.hist_sel.iter().filter(|&&i| self.history.get(i).is_some_and(|h| !h.undone)).count();
                     let label = if n > 0 { format!("   Undo selected ({n})   ") } else { "   Undo selected   ".to_string() };
                     if ui.add_enabled(!busy && n > 0, theme::primary_button(&label)).clicked() {
                         act = Some(H::UndoSel);
@@ -1865,6 +2076,8 @@ impl StartupTab {
                     }
                     if busy {
                         ui.spinner();
+                    } else if !self.hist_status.is_empty() {
+                        ui.label(RichText::new(&self.hist_status).color(theme::TEXT_DIM));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -1878,19 +2091,23 @@ impl StartupTab {
                 });
             });
         if let Some(i) = clicked {
-            if !self.hist_sel.remove(&i) {
-                self.hist_sel.insert(i);
-            }
+            self.hist_status.clear();
+            hist_click(&self.history, &mut self.hist_sel, i);
         }
         if close {
             self.show_history = false;
+            self.hist_status.clear();
+        }
+        if act.is_some() {
+            self.hist_status.clear();
         }
         match act {
             Some(H::UndoSel) => {
                 let idx: Vec<usize> = self.hist_sel.drain().collect();
                 let op = undo_op(&self.history, idx, "Undo selected changes");
                 if op.win.items.is_empty() {
-                    self.last_action = "Nothing to undo.".into();
+                    // shown in this window (the main page is behind the backdrop)
+                    self.hist_status = "Nothing to undo - the selected changes were already undone.".into();
                 } else {
                     self.op = Some(op);
                 }
@@ -1904,10 +2121,21 @@ impl StartupTab {
             Some(H::Clear) => {
                 self.history.retain(|h| !h.undone);
                 self.hist_sel.clear();
-                common::save_json(HISTORY, &self.history);
+                self.save_history();
             }
             None => {}
         }
+    }
+}
+
+/// A click on history row `i`: active rows toggle; undone rows can't be selected (a stale selection is dropped).
+fn hist_click(history: &[Hist], sel: &mut HashSet<usize>, i: usize) {
+    if history.get(i).is_some_and(|h| !h.undone) {
+        if !sel.remove(&i) {
+            sel.insert(i);
+        }
+    } else {
+        sel.remove(&i);
     }
 }
 
@@ -1926,6 +2154,11 @@ fn cell(ui: &mut egui::Ui, text: &str, c: egui::Color32) {
 impl Tab for StartupTab {
     fn title(&self) -> &'static str {
         "Startup Cleaner"
+    }
+
+    /// A change or an Explorer restart is running: closing PC Tuner waits for it.
+    fn busy(&self) -> bool {
+        self.job.is_some() || self.explorer_job.is_some()
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
@@ -2029,7 +2262,7 @@ impl Tab for StartupTab {
         if let Some(include_optional) = clean {
             self.op = Some(clean_op(&self.entries, include_optional));
         }
-        for w in &self.warnings {
+        for w in self.history_warning.iter().chain(&self.warnings) {
             theme::banner(ui, theme::LOCKED, w);
         }
 
@@ -2246,6 +2479,266 @@ mod tests {
         assert_eq!(get_exe_path("rundll32.exe foo").map(|s| s.to_lowercase()), Some(format!(r"{sr}\System32\rundll32.exe").to_lowercase()));
         assert_eq!(get_exe_path("notreal_zzz_cmd /x"), None);
         assert_eq!(get_exe_path(r"%SystemRoot%\system32\cmd.exe /c").map(|s| s.to_lowercase()), Some(format!(r"{sr}\system32\cmd.exe").to_lowercase()));
+    }
+
+    /// Unquoted paths with spaces and file types the extension list doesn't know.
+    #[test]
+    fn startup_exe_path_spaces_and_other_types() {
+        let url = r"C:\x\Start Menu\Programs\Startup\Discord.url";
+        assert_eq!(get_exe_path(&format!("\"{url}\"")).as_deref(), Some(url));
+        assert_eq!(get_exe_path_sure(&format!("\"{url}\"")), Some((url.to_string(), true)));
+        // unquoted: the first word is only a guess
+        assert_eq!(get_exe_path_sure(url), Some((r"C:\x\Start".to_string(), false)));
+        assert_eq!(get_exe_path_sure(r"C:\Program Files\App\app.exe --min").map(|x| x.1), Some(true));
+        assert_eq!(get_exe_path_sure(r"C:\gone\tool").map(|x| x.1), Some(true)); // one word: nothing was cut off
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pctuner-startup-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A real .url / .ahk file in a "Start Menu" Startup folder exists, so it is never junk; a missing
+    /// one still is. Reads files and publishers only.
+    #[test]
+    fn startup_folder_non_shortcuts_not_junk() {
+        let d = temp_dir("folder");
+        let dir = d.join("Start Menu").join("Programs").join("Startup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let approved = r"HKCU:\Software\PCTunerTestScratch\startup-none"; // never created: read as "enabled"
+        let mut raw: Raw = vec![];
+        for name in ["Discord.url", "MyMacros.ahk"] {
+            let full = dir.join(name);
+            std::fs::write(&full, "x").unwrap();
+            raw.push((folder_entry(name, &full.display().to_string(), approved, "Startup folder (you)"), true));
+        }
+        let gone = dir.join("Gone.exe").display().to_string();
+        raw.push((folder_entry("Gone.exe", &gone, approved, "Startup folder (you)"), true));
+        // an unquoted command cut short at a space proves nothing either
+        raw.push((new_entry(Kind::Run, "Spaced", "HKCU Run", &dir.join("Tool.ahk").display().to_string(), true, Loc::default(), ""), true));
+        assert!(raw[0].0.command.starts_with('"'));
+        let mut warnings = vec![];
+        fill_publishers(&mut raw, &mut warnings);
+        for (e, _) in &raw[..2] {
+            assert_ne!(e.category, "Junk", "{} exists", e.name);
+            assert_ne!(e.publisher, "(file missing)");
+        }
+        assert_eq!((raw[2].0.category, raw[2].0.publisher.as_str()), ("Junk", "(file missing)"));
+        assert_ne!(raw[3].0.category, "Junk");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn startup_history_click_skips_undone() {
+        let h = |undone: bool| Hist { batch: 1, time: String::new(), kind: Kind::Run, name: "x".into(), location: String::new(), loc: Loc::default(), from: true, to: false, undone };
+        let hist = vec![h(false), h(true)];
+        let mut sel = HashSet::new();
+        hist_click(&hist, &mut sel, 1);
+        assert!(sel.is_empty(), "undone rows can't be selected");
+        hist_click(&hist, &mut sel, 0);
+        assert!(sel.contains(&0));
+        hist_click(&hist, &mut sel, 0);
+        assert!(sel.is_empty());
+        sel.insert(1); // selected before it became undone
+        hist_click(&hist, &mut sel, 1);
+        assert!(sel.is_empty());
+    }
+
+    #[test]
+    fn startup_snapshot_bytes_roundtrip() {
+        assert_eq!(hex_bytes("0300ff"), Some(vec![3, 0, 255]));
+        assert_eq!(hex_bytes("030"), None);
+        assert_eq!(hex_bytes("zz"), None);
+        assert_eq!(reg_type(REG_SZ as u32), Some(REG_SZ));
+        assert_eq!(reg_type(REG_BINARY as u32), Some(REG_BINARY));
+        assert_eq!(reg_type(999), None);
+        // older records (and the PS tool's) have no type/bytes and still load
+        let s: Snap = serde_json::from_str(r#"{"P":"HKCU:\\x","N":"y","Exists":true,"Data":1}"#).unwrap();
+        assert_eq!((s.vtype, s.raw), (None, None));
+        let loc = Loc { pkg: Some("P".into()), task_id: Some("T".into()), ..Default::default() };
+        assert_eq!(state_value(Kind::StoreApp, &loc), Some((format!(r"{STORE_BASE}\P\T"), "State".to_string())));
+        assert_eq!(state_value(Kind::Tweak, &loc), None);
+    }
+
+    const PS_ONE: &str = r#"[{"Batch":1,"Time":"t","Kind":"Run","Name":"X","Location":"HKCU Run","From":true,"To":false}]"#;
+
+    #[test]
+    fn startup_busy_through_tab_trait() {
+        let mut t = StartupTab::from_load(HistLoad { hist: vec![], note: None, warning: None, writable: true });
+        assert!(!(&t as &dyn Tab).busy());
+        // an Explorer restart still running after the op window is done
+        t.explorer_job = Some(Job::spawn(|| -> Result<String, String> {
+            loop {
+                std::thread::park();
+            }
+        }));
+        assert!((&t as &dyn Tab).busy());
+    }
+
+    #[test]
+    fn startup_history_load_cases() {
+        // nothing at all
+        let d = temp_dir("hist-none");
+        let r = load_history_in(&d, Some(&d));
+        assert!(r.hist.is_empty() && r.note.is_none() && r.warning.is_none() && r.writable);
+
+        // PS history only: imported and saved as our own file
+        let d = temp_dir("hist-ps");
+        std::fs::create_dir_all(d.join("StartupCleaner")).unwrap();
+        std::fs::write(d.join("StartupCleaner").join("history.json"), PS_ONE).unwrap();
+        let r = load_history_in(&d, Some(&d));
+        assert_eq!(r.hist.len(), 1);
+        assert!(r.note.as_deref().unwrap().starts_with("Imported 1 change(s)"));
+        assert!(d.join(HISTORY).exists() && !d.join(format!("{HISTORY}.tmp")).exists());
+        // our own file now takes precedence over the PS one
+        std::fs::write(d.join("StartupCleaner").join("history.json"), "[]").unwrap();
+        let r = load_history_in(&d, Some(&d));
+        assert_eq!((r.hist.len(), r.note.is_none()), (1, true));
+
+        // a damaged PS file: note, and no file of ours is written
+        let d = temp_dir("hist-psbad");
+        std::fs::create_dir_all(d.join("StartupCleaner")).unwrap();
+        std::fs::write(d.join("StartupCleaner").join("history.json"), "[{").unwrap();
+        let r = load_history_in(&d, Some(&d));
+        assert!(r.hist.is_empty() && r.note.as_deref().unwrap().starts_with("Could not import"));
+        assert!(!d.join(HISTORY).exists());
+
+        // our own file truncated: kept as a backup (never overwritten), warning, and the old PS
+        // history is NOT re-imported (its Undone flags are stale)
+        let d = temp_dir("hist-corrupt");
+        let truncated = r#"[{"Batch":1,"Kind":"Run","Na"#;
+        std::fs::write(d.join(HISTORY), truncated).unwrap();
+        std::fs::create_dir_all(d.join("StartupCleaner")).unwrap();
+        std::fs::write(d.join("StartupCleaner").join("history.json"), PS_ONE).unwrap();
+        let r = load_history_in(&d, Some(&d));
+        let w = r.warning.expect("warning");
+        assert!(w.starts_with(&format!("Could not read {HISTORY}")) && w.contains("startup-history.corrupt-"), "{w}");
+        assert!(r.hist.is_empty() && r.note.is_none() && r.writable);
+        assert!(!d.join(HISTORY).exists());
+        // next launch: own file missing but a backup exists, so still no import
+        let r = load_history_in(&d, Some(&d));
+        assert!(r.hist.is_empty() && r.note.is_none() && r.warning.is_none() && r.writable);
+        assert!(!d.join(HISTORY).exists());
+        let backups: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|f| f.file_name().to_string_lossy().starts_with("startup-history.corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), truncated);
+
+        // corrupt and no PS history: empty, warning, still writable
+        let d2 = temp_dir("hist-corrupt2");
+        std::fs::write(d2.join(HISTORY), "").unwrap();
+        let r = load_history_in(&d2, None);
+        assert!(r.hist.is_empty() && r.warning.is_some() && r.writable && !d2.join(HISTORY).exists());
+
+        for x in ["hist-none", "hist-ps", "hist-psbad", "hist-corrupt", "hist-corrupt2"] {
+            let _ = std::fs::remove_dir_all(temp_dir(x));
+        }
+    }
+
+    /// Deletes one subkey of HKCU\Software\PCTunerTestScratch (and the parent when empty) on drop.
+    struct Scratch(&'static str);
+    impl Scratch {
+        fn path(&self) -> String {
+            format!(r"HKCU:\Software\PCTunerTestScratch\{}", self.0)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            let _ = hkcu.delete_subkey_all(format!(r"Software\PCTunerTestScratch\{}", self.0));
+            let _ = hkcu.delete_subkey(r"Software\PCTunerTestScratch"); // fails while other tests still use it
+        }
+    }
+
+    fn run_op(kind: Kind, loc: Loc, on: bool, snapshot: bool, undo: bool) -> Result<Loc, String> {
+        apply_ops(&[Op { kind, name: "test".into(), loc, on, snapshot, undo }]).remove(0)
+    }
+
+    /// StartupApproved: switch off/on and undo put back exactly what was there (absent / 03 + old time).
+    #[test]
+    #[ignore]
+    fn startup_registry_approved_roundtrip() {
+        let s = Scratch("startup-approved");
+        let loc = Loc { approved: Some(s.path()), value: Some("X".into()), ..Default::default() };
+        // (a) no value before
+        let changed = run_op(Kind::Run, loc.clone(), false, true, false).unwrap();
+        let v = read_value(&s.path(), "X").unwrap();
+        assert_eq!(v.bytes[0], 3);
+        assert!(v.bytes[4..12].iter().any(|&b| b != 0));
+        assert!(!changed.prev[0].exists);
+        run_op(Kind::Run, changed, true, false, true).unwrap();
+        assert!(read_value(&s.path(), "X").is_none(), "undo removes a value that wasn't there");
+        // (b) already off with its own timestamp
+        let orig = vec![3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        open_write(&s.path()).unwrap().set_raw_value("X", &RegValue { bytes: orig.clone(), vtype: REG_BINARY }).unwrap();
+        let changed = run_op(Kind::StartupFolder, loc.clone(), true, true, false).unwrap();
+        assert_eq!(read_value(&s.path(), "X").unwrap().bytes[0], 2);
+        run_op(Kind::StartupFolder, changed, false, false, true).unwrap();
+        let v = read_value(&s.path(), "X").unwrap();
+        assert_eq!((v.bytes, v.vtype), (orig, REG_BINARY));
+        // old records without a snapshot keep the 02/03 behaviour
+        run_op(Kind::Run, loc, true, false, true).unwrap();
+        assert_eq!(read_value(&s.path(), "X").unwrap().bytes[0], 2);
+    }
+
+    /// Store app State: a DWORD 0 comes back as 0 (not 1), a missing one as missing.
+    #[test]
+    #[ignore]
+    fn startup_registry_state_snapshot_restore() {
+        let s = Scratch("startup-state");
+        open_write(&s.path()).unwrap().set_value("State", &0u32).unwrap();
+        let snap = snap_value(&s.path(), "State");
+        open_write(&s.path()).unwrap().set_value("State", &2u32).unwrap();
+        restore_snap(&snap).unwrap();
+        let v = read_value(&s.path(), "State").unwrap();
+        assert_eq!((u32::from_reg_value(&v).unwrap(), v.vtype), (0, REG_DWORD));
+        let missing = snap_value(&s.path(), "Nope");
+        open_write(&s.path()).unwrap().set_value("Nope", &2u32).unwrap();
+        restore_snap(&missing).unwrap();
+        assert!(read_value(&s.path(), "Nope").is_none());
+    }
+
+    /// Tweak: undo restores the original type (REG_SZ stays REG_SZ) and removes values that weren't there;
+    /// a failure part-way through switching off is rolled back; a bad snapshot doesn't stop the rest.
+    #[test]
+    #[ignore]
+    fn startup_registry_tweak_roundtrip() {
+        let s = Scratch("startup-tweak");
+        let p = s.path();
+        open_write(&p).unwrap().set_value("A", &"1".to_string()).unwrap();
+        let loc = Loc {
+            values: vec![TweakVal { p: p.clone(), n: "A".into(), v: 0 }, TweakVal { p: p.clone(), n: "B".into(), v: 0 }],
+            ..Default::default()
+        };
+        let changed = run_op(Kind::Tweak, loc.clone(), false, true, false).unwrap();
+        assert_eq!(read_value(&p, "A").unwrap().vtype, REG_DWORD);
+        assert_eq!(changed.prev.len(), 2);
+        run_op(Kind::Tweak, changed.clone(), true, false, true).unwrap();
+        let a = read_value(&p, "A").unwrap();
+        assert_eq!((a.vtype.clone(), String::from_reg_value(&a).unwrap()), (REG_SZ, "1".to_string()));
+        assert!(read_value(&p, "B").is_none());
+
+        // the second value can't be written: the first one goes back to its snapshot
+        let bad = Loc {
+            values: vec![TweakVal { p: p.clone(), n: "A".into(), v: 0 }, TweakVal { p: r"HKXX:\nowhere".into(), n: "B".into(), v: 0 }],
+            ..Default::default()
+        };
+        assert!(run_op(Kind::Tweak, bad, false, true, false).is_err());
+        let a = read_value(&p, "A").unwrap();
+        assert_eq!((a.vtype.clone(), String::from_reg_value(&a).unwrap()), (REG_SZ, "1".to_string()));
+
+        // a damaged snapshot for A: B is still restored, and the error names A
+        run_op(Kind::Tweak, loc, false, true, false).unwrap();
+        let mut broken = changed;
+        broken.prev[0].raw = Some("zz".into());
+        let e = set_native(Kind::Tweak, &broken, true, true).unwrap_err();
+        assert!(e.starts_with("1 of 2 values") && e.contains(r"\A:"), "{e}");
+        assert!(read_value(&p, "B").is_none());
     }
 
     #[test]

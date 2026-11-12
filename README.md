@@ -3,8 +3,13 @@
 A gaming-safe Windows 11 tuning toolkit, built for a Ryzen 7 9800X3D + RTX 5080 gaming PC
 that plays Halo Infinite (Xbox app / Game Pass) and Steam games.
 
-Every change is previewed first, applied with live progress, and can be undone. Anything Xbox,
-Game Pass, Steam, Easy Anti-Cheat, the Store, Windows Security or Edge depends on is left alone.
+Every system change (services, startup, bloat, tweaks, network, performance, CPU scheduler, GPU
+profiles) is previewed first, applied with live progress, and can be undone. Fan Tuner changes apply
+live and are handed back to the BIOS with BIOS mode or by closing PC Tuner. Anything Xbox,
+Game Pass, Steam, Easy Anti-Cheat, the Store or Windows Security depends on is left alone. Edge
+stays installed and working: its updater is set to Manual (it still updates itself), its elevation
+service is off, and background preloading/autolaunch are turned off. Closing PC Tuner while a
+change is being applied waits until it has finished, so the change is recorded and can be undone.
 
 ![RTX 5080 tab](docs/gpu.png)
 
@@ -16,7 +21,7 @@ Game Pass, Steam, Easy Anti-Cheat, the Store, Windows Security or Edge depends o
 | `ServiceManager.ps1` | Disable / set to Manual unneeded services, with presets and undo |
 | `StartupCleaner.ps1` | Switch off startup junk (Run keys, tasks, Explorer add-ons), never deletes |
 | `Remove-Bloat.ps1` | In-depth removal of bundled Store apps, with reinstall blocks and restore |
-| `PostInstall-Tweaks.ps1` | Telemetry tasks, Edge preloading, Teredo for Xbox online play |
+| `PostInstall-Tweaks.ps1` | Telemetry tasks, Edge preloading, Teredo for Xbox online play; saves the state before the first Apply so `-Undo` puts back exactly that |
 | `TweakScheduler.ps1` | Win32PrioritySeparation presets (CPU scheduler) |
 | `USB-PortFinder.ps1` | Finds which USB ports sit closest to the CPU |
 | `RTX5080/` | MSI Afterburner undervolt presets (Stock / Efficiency / Balanced / Performance) |
@@ -29,8 +34,8 @@ Game Pass, Steam, Easy Anti-Cheat, the Store, Windows Security or Edge depends o
 - **Network** - live ping / jitter / packet-loss test, adapter power saving and latency settings,
   with an honest note on what each one does (most "ping tweaks" are TCP-only; Halo's match traffic is UDP).
 - **RTX 5080 Profiles** - live clock / temperature / power / load graphs, presets, an always-visible
-  **Reset GPU to stock**, and a safety trial that puts the GPU back on Stock at the next sign-in
-  if Windows logs a crash while a new tune is being tested.
+  **Reset GPU to stock**, and a safety trial that sends Stock to Afterburner at the next sign-in
+  if Windows logs a crash while a new tune is being tested (the check stays until Stock is confirmed).
 - **Performance** - evidence-based settings for games and a snappier desktop (flip model for
   windowed DX10/11 games, faster menus, optional taskbar / mouse / power tweaks), read-only checks
   (Game Mode, HAGS, refresh rate, power saving) and a list of popular tweaks left alone because
@@ -38,11 +43,20 @@ Game Pass, Steam, Easy Anti-Cheat, the Store, Windows Security or Edge depends o
 - **Fan Tuner** - live fan RPM / duty and CPU / GPU / board temperatures; per fan: BIOS, Manual
   (slider) or Curve (draggable points, follows CPU, GPU or the hotter of the two); Silent / Balanced /
   Performance profiles plus your own, the last one applied at startup. Safety: never below 20 %
-  (pumps 50 %), 100 % at 90 °C, fans back to the BIOS when PC Tuner closes or crashes.
+  (pumps 50 %), 100 % at 90 °C, fans back to the BIOS when PC Tuner closes or crashes, and while
+  temperatures cannot be read. If PC Tuner
+  and its PCTunerFan helper are force-killed together, fans stay at their last speed (never under
+  the floor) until the PC restarts.
+- **Sidebar** - **Reset GPU to stock** (always visible) and **Power / BIOS**: restarts straight into
+  the UEFI/BIOS setup, or shuts down so the next start opens it, using Windows' own `shutdown /fw`.
+  Needs administrator rights and a UEFI-booted PC, and asks for confirmation first. Every open
+  program closes immediately without saving, and there is nothing to undo.
 
 ![Fan Tuner tab](docs/fan.png)
 ![Network tab](docs/network.png)
 ![Preview before a change](docs/services-preview.png)
+
+Download: get PCTuner.exe from the GitHub Releases page (the exe is not in the repo).
 
 ## Build
 

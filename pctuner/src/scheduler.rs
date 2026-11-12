@@ -97,6 +97,34 @@ fn preset_of(value: u32) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| decode(p.value).signature == sig)
 }
 
+/// Index of the preset whose schedule matches `value` (0x26 selects the same card as 0x02).
+fn preset_index(value: u32) -> Option<usize> {
+    let sig = decode(value).signature;
+    PRESETS.iter().position(|p| decode(p.value).signature == sig)
+}
+
+/// History bookkeeping once a write is back: a successful change adds an entry, a successful
+/// undo marks its entry undone, and a failed write leaves the history as it was (so a failed
+/// undo can be retried). Returns true when the history changed and must be saved.
+fn apply_result(history: &mut Vec<HistEntry>, from: u32, to: u32, undo_of: Option<usize>, ok: bool, time: String) -> bool {
+    if !ok {
+        return false;
+    }
+    match undo_of {
+        None => {
+            history.push(HistEntry { time, from, to, undone: false });
+            true
+        }
+        Some(i) => match history.get_mut(i) {
+            Some(h) => {
+                h.undone = true;
+                true
+            }
+            None => false,
+        },
+    }
+}
+
 fn label_of(value: u32) -> String {
     preset_of(value).map(|p| p.name.to_string()).unwrap_or_else(|| format!("Custom value 0x{value:02X}"))
 }
@@ -145,7 +173,7 @@ pub struct SchedulerTab {
 impl SchedulerTab {
     pub fn new() -> Self {
         let current = read_value();
-        let selected = PRESETS.iter().position(|p| p.value == current);
+        let selected = preset_index(current);
         let mut tab = SchedulerTab { current, selected, history: common::load_json(HISTORY), op: None, pending: None, run: None, demo: false };
         if let Some(stage) = opwin::demo_stage("scheduler") {
             // sample window for screenshots - nothing is written
@@ -189,22 +217,19 @@ impl SchedulerTab {
         }
         let run = self.run.take().unwrap();
         let result = run.result.unwrap();
-        if result.is_ok() && run.undo_of.is_none() {
-            self.history.push(HistEntry { time: common::now(), from: run.from, to: run.to, undone: false });
+        if apply_result(&mut self.history, run.from, run.to, run.undo_of, result.is_ok(), common::now()) {
             common::save_json(HISTORY, &self.history);
         }
-        if let Some(i) = run.undo_of {
-            if let Some(h) = self.history.get_mut(i) {
-                h.undone = true;
-            }
-            common::save_json(HISTORY, &self.history);
-        }
-        if result.is_ok() {
-            self.current = read_value();
-            self.selected = PRESETS.iter().position(|p| p.value == self.current);
-        }
+        // re-read after a failure too, so `current` and the next window's "from" match the registry
+        self.current = read_value();
+        self.selected = preset_index(self.current);
         if let Some(op) = &mut self.op {
-            op.can_undo = result.is_ok() && run.undo_of.is_none();
+            let failed_undo = result.is_err() && run.undo_of.is_some();
+            op.can_undo = (result.is_ok() && run.undo_of.is_none()) || failed_undo;
+            if failed_undo {
+                // the entry is still not undone, so the Undo event picks the same one again
+                op.undo_label = "Retry undo".into();
+            }
             op.finish(|_| Some(match &result {
                 Ok(()) => Ok(RESTART_NOTE.to_string()),
                 Err(e) => Err(format!("Could not change it: {e}")),
@@ -357,11 +382,15 @@ impl SchedulerTab {
             let can = common::is_admin() && self.run.is_none();
             if ui.add_enabled(can && self.selected.is_some(), theme::primary_button("   Apply selected preset   ")).clicked() {
                 let p = &PRESETS[self.selected.unwrap()];
-                if p.value == self.current {
-                    // nothing to write: the window opens in its "nothing to do" state
+                if decode(p.value).signature == decode(self.current).signature {
+                    // nothing to write (same schedule, maybe stored as another value): the window opens in its "nothing to do" state
                     let mut w = OpWindow::new("CPU SCHEDULER", "change", "changed", vec![]);
                     w.empty_title = "Already set".into();
-                    w.empty_text = format!("The scheduler is already on {} (0x{:02X}).", p.name, p.value);
+                    w.empty_text = if p.value == self.current {
+                        format!("The scheduler is already on {} (0x{:02X}).", p.name, p.value)
+                    } else {
+                        format!("The scheduler is already on {} (stored as 0x{:02X}, the same schedule as 0x{:02X}).", p.name, self.current, p.value)
+                    };
                     self.pending = None;
                     self.op = Some(w);
                 } else {
@@ -375,9 +404,78 @@ impl SchedulerTab {
             }
             if ui.button("Refresh").clicked() {
                 self.current = read_value();
+                self.selected = preset_index(self.current);
             }
         });
         ui.add_space(2.0);
         ui.label(RichText::new("Turn lengths are nominal and only matter when threads share a core. This is the same value Bitsum TweakScheduler edits - use one tool or the other.").size(12.5).color(theme::TEXT_DIM));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_known_values() {
+        // (value, game turn ms, background turn ms, (long, fixed, boost), ratio)
+        let cases: &[(u32, f64, f64, (bool, bool, u32), &str)] = &[
+            (0x02, 93.8, 31.3, (false, false, 2), "3:1"),
+            (0x26, 93.8, 31.3, (false, false, 2), "3:1"),
+            (0x2A, 93.8, 93.8, (false, true, 2), "1:1 (equal turns)"),
+            (0x16, 187.5, 62.5, (true, false, 2), "3:1"),
+            (0x00, 31.3, 31.3, (false, false, 0), "1:1"),
+            (0x3F, 93.8, 31.3, (false, false, 2), "3:1"),
+        ];
+        for &(v, fg, bg, sig, ratio) in cases {
+            let d = decode(v);
+            assert_eq!(d.fg_ms, fg, "game turn 0x{v:02X}");
+            assert_eq!(d.bg_ms, bg, "background turn 0x{v:02X}");
+            assert_eq!(d.signature, sig, "signature 0x{v:02X}");
+            assert_eq!(d.boost, sig.2, "boost 0x{v:02X}");
+            assert_eq!(d.ratio, ratio, "ratio 0x{v:02X}");
+        }
+        assert_eq!(decode(0x2A).kind, "Fixed");
+        assert_eq!(decode(0x16).interval, "Long");
+        assert_eq!(decode(0x26).interval, "Short");
+    }
+
+    #[test]
+    fn preset_matching_by_schedule() {
+        for (i, p) in PRESETS.iter().enumerate() {
+            assert_eq!(preset_index(p.value), Some(i));
+            assert_eq!(preset_of(p.value).map(|q| q.value), Some(p.value));
+        }
+        // 0x26 and 0x3F store the default schedule in other bits
+        assert_eq!(preset_index(0x26), Some(0));
+        assert_eq!(preset_index(0x3F), Some(0));
+        assert_eq!(label_of(0x26), "Windows default");
+        // long + fixed + no boost matches no preset
+        assert_eq!(preset_index(0x18), None);
+        assert!(preset_of(0x18).is_none());
+        assert_eq!(label_of(0x18), "Custom value 0x18");
+    }
+
+    #[test]
+    fn history_rules() {
+        let mut h = Vec::new();
+        // a failed change records nothing
+        assert!(!apply_result(&mut h, 0x02, 0x16, None, false, "t".into()));
+        assert!(h.is_empty());
+        // successful changes are recorded
+        assert!(apply_result(&mut h, 0x02, 0x16, None, true, "t".into()));
+        assert!(apply_result(&mut h, 0x16, 0x2A, None, true, "t".into()));
+        assert_eq!(h.len(), 2);
+        // a failed undo keeps the entry as not undone, so the next undo picks it again
+        assert!(!apply_result(&mut h, 0x2A, 0x16, Some(1), false, "t".into()));
+        assert!(!h[1].undone);
+        assert_eq!(h.iter().rposition(|e| !e.undone), Some(1));
+        // a successful undo marks it; the next undo goes to the older change
+        assert!(apply_result(&mut h, 0x2A, 0x16, Some(1), true, "t".into()));
+        assert!(h[1].undone && !h[0].undone);
+        assert_eq!(h.iter().rposition(|e| !e.undone), Some(0));
+        // an index that is not in the history changes nothing
+        assert!(!apply_result(&mut h, 0x16, 0x02, Some(9), true, "t".into()));
+        assert_eq!(h.len(), 2);
     }
 }

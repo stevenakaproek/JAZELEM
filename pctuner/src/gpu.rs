@@ -316,10 +316,14 @@ pub fn ab_running() -> bool {
         .unwrap_or(false)
 }
 
-fn kill_ab() {
+/// Close Afterburner. Returns true when it was running (and so has to be started again if the change fails).
+fn kill_ab() -> bool {
     if ab_running() {
         let _ = common::run("taskkill", &["/F", "/IM", "MSIAfterburner.exe"]);
         std::thread::sleep(Duration::from_secs(2));
+        true
+    } else {
+        false
     }
 }
 
@@ -328,22 +332,44 @@ fn launch_ab(args: &[String]) -> Result<(), String> {
     std::process::Command::new(&exe).args(args).spawn().map(|_| ()).map_err(|e| format!("could not start {}: {e}", exe.display()))
 }
 
+/// What to add to the error when a change failed after Afterburner was closed. `relaunch`: start it again
+/// unchanged (the GUI); otherwise it is left closed (the sign-in guard: Afterburner's own startup settings
+/// may hold the very trial preset that crashed the PC).
+fn after_failed_change(was_running: bool, relaunch: bool) -> String {
+    if !was_running {
+        String::new()
+    } else if !relaunch {
+        " Afterburner was left closed so the trial preset is not re-applied.".into()
+    } else {
+        match launch_ab(&[]) {
+            Ok(()) => " Afterburner was restarted unchanged.".into(),
+            Err(e) => format!(" Afterburner could not be restarted - start it manually: {e}."),
+        }
+    }
+}
+
 /// Close Afterburner, back up the cfg, rewrite slot N with the preset. Returns the backup path.
-fn write_preset_slot(p: &Preset) -> Result<PathBuf, String> {
+/// `relaunch_on_error`: start Afterburner again unchanged when a step after closing it fails.
+fn write_preset_slot(p: &Preset, relaunch_on_error: bool) -> Result<PathBuf, String> {
+    let missing = || format!("No RTX 5080 profile file found in {}\\Profiles. Open Afterburner once, close it, and retry.", ab_dir().display());
     // Build once before closing Afterburner so a bad curve never leaves it closed (the PS original checks after).
-    let pre = Cfg::read().ok_or_else(|| format!("No RTX 5080 profile file found in {}\\Profiles. Open Afterburner once, close it, and retry.", ab_dir().display()))?;
+    let pre = Cfg::read().ok_or_else(missing)?;
     preset_section_lines(&pre, p)?;
-    kill_ab();
-    let cfg = Cfg::read().ok_or_else(|| format!("No RTX 5080 profile file found in {}\\Profiles. Open Afterburner once, close it, and retry.", ab_dir().display()))?;
     let dir = backup_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let fname = cfg.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let backup = dir.join(format!("{}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"), fname));
-    std::fs::copy(&cfg.path, &backup).map_err(|e| format!("backup failed: {e}"))?;
-    let section = preset_section_lines(&cfg, p)?;
-    let out = Cfg { path: cfg.path.clone(), lines: with_section(&cfg, p.slot, section), crlf: cfg.crlf };
-    std::fs::write(&out.path, out.to_bytes()).map_err(|e| format!("could not write {} (run as administrator): {e}", out.path.display()))?;
-    Ok(backup)
+    let was_running = kill_ab();
+    let write = || -> Result<PathBuf, String> {
+        // read again: Afterburner may have saved the file while closing
+        let cfg = Cfg::read().ok_or_else(missing)?;
+        let fname = cfg.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let backup = dir.join(format!("{}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"), fname));
+        std::fs::copy(&cfg.path, &backup).map_err(|e| format!("backup failed: {e}"))?;
+        let section = preset_section_lines(&cfg, p)?;
+        let out = Cfg { path: cfg.path.clone(), lines: with_section(&cfg, p.slot, section), crlf: cfg.crlf };
+        std::fs::write(&out.path, out.to_bytes()).map_err(|e| format!("could not write {} (run as administrator): {e}", out.path.display()))?;
+        Ok(backup)
+    };
+    write().map_err(|e| e + &after_failed_change(was_running, relaunch_on_error))
 }
 
 fn last_backup() -> Option<PathBuf> {
@@ -365,19 +391,25 @@ const STEP_TRIAL: &str = "trial";
 const STEP_END_TRIAL: &str = "endtrial";
 const STEP_COPY: &str = "copy";
 
-/// Put a backup back (runs in a Job); every step is reported as it completes.
-fn restore_backup(last: &Path, report: &dyn Fn(&str, StepResult)) {
+/// Put a backup back (runs in a Job); every step is reported as it completes. `stop_trial`: a safety trial
+/// is open and ends once the restored profiles are running (it stays as it is when a step fails).
+fn restore_backup(last: &Path, stop_trial: bool, report: &dyn Fn(&str, StepResult)) {
     let Some(cfg) = cfg_file() else {
         report(STEP_COPY, Err("No RTX 5080 profile file to restore over.".into()));
         return;
     };
-    kill_ab();
+    let was_running = kill_ab();
     if let Err(e) = std::fs::copy(last, &cfg) {
-        report(STEP_COPY, Err(format!("could not copy the backup (run as administrator): {e}")));
+        report(STEP_COPY, Err(format!("could not copy the backup (run as administrator): {e}.{}", after_failed_change(was_running, true))));
         return;
     }
     report(STEP_COPY, Ok(String::new()));
-    report(STEP_START, launch_ab(&[]).map(|_| String::new()));
+    let started = launch_ab(&[]).map(|_| String::new());
+    let ok = started.is_ok();
+    report(STEP_START, started);
+    if ok && stop_trial {
+        report(STEP_END_TRIAL, end_trial());
+    }
 }
 
 // ------------------------------------------------------------------ live GPU readout
@@ -465,41 +497,66 @@ pub fn current_state() -> State {
 
 /// The preset shown as "currently applied". Under load the live reading decides alone (None = custom
 /// settings); the saved [Startup] preset only stands in while the GPU is idle or nvidia-smi is missing.
-fn current_preset(s: &State) -> Option<usize> {
-    match &s.live {
-        Some(l) if l.full_clocks => s.live_preset,
-        _ => s.saved,
+/// `live` is the reading on screen (the newest sample), so the hero and the live-check chip always agree.
+fn current_preset(saved: Option<usize>, live: Option<&Live>) -> Option<usize> {
+    match live {
+        Some(l) if l.full_clocks => live_preset(l),
+        _ => saved,
     }
 }
 
-fn wait_for_live(p: &Preset) -> StepResult {
+/// How sure we are that Afterburner really loaded a preset.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Applied {
+    /// Afterburner was not started with it (or the slot could not be written)
+    Failed,
+    /// the GPU runs at full clocks with the preset's memory offset
+    Confirmed,
+    /// sent, but the GPU is idle or nvidia-smi gave no reading: nothing to compare yet
+    Unverified,
+    /// the GPU runs at full clocks with a different memory offset
+    Mismatch,
+}
+
+/// Compare one nvidia-smi reading with the preset.
+fn live_verdict(l: Option<&Live>, p: &Preset) -> Applied {
+    match l {
+        Some(l) if l.full_clocks && (l.mem_offset - p.mem as i64).abs() <= 5 => Applied::Confirmed,
+        Some(l) if l.full_clocks => Applied::Mismatch,
+        _ => Applied::Unverified,
+    }
+}
+
+fn wait_for_live(p: &Preset) -> (Applied, StepResult) {
     for _ in 0..10 {
         std::thread::sleep(Duration::from_secs(1));
-        if let Some(l) = gpu_live() {
-            if l.full_clocks && (l.mem_offset - p.mem as i64).abs() <= 5 {
-                return Ok(String::new());
-            }
+        if live_verdict(gpu_live().as_ref(), p) == Applied::Confirmed {
+            return (Applied::Confirmed, Ok(String::new()));
         }
     }
-    match gpu_live() {
-        Some(l) if !l.full_clocks => Ok("Sent - the GPU is idle, so the live check confirms it once a game is running.".into()),
-        _ => Err("Sent, but the live memory offset does not match yet - check Afterburner.".into()),
+    let l = gpu_live();
+    match (live_verdict(l.as_ref(), p), &l) {
+        (Applied::Confirmed, _) => (Applied::Confirmed, Ok(String::new())),
+        (Applied::Unverified, Some(_)) => (Applied::Unverified, Ok("Sent - the GPU is idle, so the live check confirms it once a game is running.".into())),
+        (Applied::Unverified, None) => (Applied::Unverified, Err("Sent, but the live memory offset could not be read - check Afterburner.".into())),
+        (v, _) => (v, Err("Sent, but the live memory offset does not match yet - check Afterburner.".into())),
     }
 }
 
 /// Apply a preset (runs in a Job): optionally write its slot first, then tell Afterburner to load it.
-/// Every step is reported as it completes. Returns true when Afterburner was started with the preset.
+/// Every step is reported as it completes. Returns Failed when Afterburner was not started with the preset,
+/// otherwise what the live check saw.
 /// `before_start` runs after the optional slot write and right before Afterburner is started (the safety
 /// trial is armed there, so a crash at the moment of applying is already covered); `start_failed` runs when
-/// Afterburner could not be started.
-fn apply_preset(idx: usize, write: bool, report: &dyn Fn(&str, StepResult), before_start: &dyn Fn(), start_failed: &dyn Fn()) -> bool {
+/// Afterburner could not be started. `relaunch_on_error`: see write_preset_slot.
+fn apply_preset(idx: usize, write: bool, relaunch_on_error: bool, report: &dyn Fn(&str, StepResult), before_start: &dyn Fn(), start_failed: &dyn Fn()) -> Applied {
     let p = &PRESETS[idx];
     if write {
-        match write_preset_slot(p) {
+        match write_preset_slot(p, relaunch_on_error) {
             Ok(backup) => report(STEP_WRITE, Ok(format!("Backup: {}", backup.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()))),
             Err(e) => {
                 report(STEP_WRITE, Err(e));
-                return false;
+                return Applied::Failed;
             }
         }
     }
@@ -507,11 +564,12 @@ fn apply_preset(idx: usize, write: bool, report: &dyn Fn(&str, StepResult), befo
     if let Err(e) = launch_ab(&[format!("-Profile{}", p.slot)]) {
         report(STEP_START, Err(e));
         start_failed();
-        return false;
+        return Applied::Failed;
     }
     report(STEP_START, Ok(String::new()));
-    report(STEP_CONFIRM, wait_for_live(p));
-    true
+    let (verdict, r) = wait_for_live(p);
+    report(STEP_CONFIRM, r);
+    verdict
 }
 
 // ------------------------------------------------------------------ trial + auto-revert
@@ -550,12 +608,66 @@ pub struct Trial {
     /// true when the sign-in check could not be registered: the trial has NO automatic revert
     #[serde(default)]
     pub unguarded: bool,
+    /// "reverted" only: the guard saw Stock confirmed (live reading or Afterburner's saved settings).
+    /// false = Stock was sent but not confirmed, and the sign-in check stays to try again.
+    #[serde(default)]
+    pub verified: bool,
+    /// "reverted" only: how many times the sign-in check has sent Stock for this trial
+    #[serde(default)]
+    pub attempts: u32,
+    /// "reverted" only: Stock actually reached Afterburner at one attempt at least (false = every attempt failed
+    /// to load it, so the GPU may still run the crashing preset)
+    #[serde(default)]
+    pub sent: bool,
+    /// "reverted" only: how many of the attempts actually handed Stock to Afterburner
+    #[serde(default)]
+    pub sends: u32,
+    /// "reverted" only: Stock was sent MAX_REVERT_ATTEMPTS times without confirmation and the sign-in check stopped
+    #[serde(default)]
+    pub gave_up: bool,
+    /// "reverted" only: what went wrong at the last attempt (empty when Stock was confirmed)
+    #[serde(default)]
+    pub last_error: String,
 }
+
+/// The sign-in check sends Stock at most this many times after a crash, then removes itself and says so.
+const MAX_REVERT_ATTEMPTS: u32 = 3;
 
 impl Trial {
     fn pending(&self) -> bool {
         self.status == "pending"
     }
+    /// reverted after a crash, but Stock was not confirmed: the sign-in check sends it again (until it gives up)
+    fn revert_unverified(&self) -> bool {
+        self.status == "reverted" && !self.verified && !self.gave_up
+    }
+    /// the sign-in check still has work to do for this trial
+    fn armed(&self) -> bool {
+        self.pending() || self.revert_unverified()
+    }
+}
+
+/// Write gpu-trial.json through a temp file and a rename, so the tab never reads half a file.
+fn save_trial(t: &Trial) {
+    let path = common::data_dir().join(TRIAL_FILE);
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(s) = serde_json::to_string_pretty(t) {
+        if std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// "Keep" was clicked on `shown` (what the banner showed); `disk` is gpu-trial.json read just now.
+/// Ok = the trial to confirm. Never confirms a trial the sign-in check has reverted in the meantime.
+fn keep_target(shown: Option<&Trial>, disk: Option<&Trial>) -> Result<Trial, String> {
+    let Some(t) = disk.filter(|t| t.pending()) else {
+        return Err("The trial is no longer pending - see the notice above.".into());
+    };
+    if shown.map(|s| (&s.preset, s.applied_at)) != Some((&t.preset, t.applied_at)) {
+        return Err("The trial changed - check the notice and try again.".into());
+    }
+    Ok(t.clone())
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -586,10 +698,15 @@ pub enum Decision {
     CleanReboot,
     /// a crash was logged after the preset was applied: go back to Stock
     RevertAfterCrash,
+    /// an earlier revert sent Stock but could not confirm it: send it again
+    RetryRevert,
 }
 
 /// What the sign-in check does. Pure: all inputs are passed in. Boot times are unix seconds, 0 = unknown.
 pub fn guard_decision(trial: Option<&Trial>, current_boot_time: i64, crash_events_after_apply: bool) -> Decision {
+    if trial.map(|t| t.revert_unverified()).unwrap_or(false) {
+        return Decision::RetryRevert;
+    }
     let Some(t) = trial.filter(|t| t.pending()) else { return Decision::NoTrial };
     let boot_known = t.boot_time > 0 && current_boot_time > 0;
     if boot_known && (current_boot_time - t.boot_time).abs() <= BOOT_TOLERANCE {
@@ -678,6 +795,7 @@ fn start_trial(preset: &str, previous: &str) -> StepResult {
         status: "pending".into(),
         reason: String::new(),
         unguarded: registered.is_err(),
+        ..Default::default()
     };
     common::save_json(TRIAL_FILE, &trial);
     if load_trial().as_ref() != Some(&trial) {
@@ -691,9 +809,11 @@ fn start_trial(preset: &str, previous: &str) -> StepResult {
     Ok("If the PC crashes, the GPU goes back to Stock at your next sign-in.".into())
 }
 
-/// End a pending trial: delete its file and remove the sign-in check. A "reverted" notice is left for the user to read.
+/// End a trial the sign-in check still acts on (pending, or a revert not confirmed yet): delete its file and
+/// remove the sign-in check. The user has now chosen the GPU state, so a task that survives a failed
+/// unregister finds nothing to act on. A settled "reverted" notice is left for the user to read.
 fn end_trial() -> StepResult {
-    if load_trial().map(|t| t.pending()).unwrap_or(false) {
+    if load_trial().map(|t| t.armed()).unwrap_or(false) {
         delete_trial();
     }
     unregister_task().map(|_| String::new())
@@ -706,10 +826,41 @@ fn guard_log(line: &str) {
 
 /// Sign-in check of the GPU trial (`PCTuner.exe --gpu-guard [--dry-run]`). Returns the process exit code.
 /// `dry_run` only logs the decision; nothing is changed.
+/// The trial file after the guard sent Stock following a crash (or a retry). Whatever happened, the trial is
+/// "reverted" from now on, so the tab never offers Keep on a preset that crashed the PC. `startup_is_stock`:
+/// Afterburner's saved [Startup] settings hold Stock (only asked for when the live check was idle).
+/// Not confirmed: the sign-in check stays to send Stock again, until MAX_REVERT_ATTEMPTS sends, then it gives up.
+fn revert_outcome(t: &Trial, crash_text: String, applied: Applied, startup_is_stock: bool) -> Trial {
+    let verified = match applied {
+        Applied::Confirmed => true,
+        Applied::Unverified => startup_is_stock,
+        Applied::Failed | Applied::Mismatch => false,
+    };
+    let attempts = t.attempts.saturating_add(1);
+    let sent_now = applied != Applied::Failed;
+    let last_error = match applied {
+        _ if verified => String::new(),
+        Applied::Failed => "Stock could not be loaded into Afterburner".into(),
+        Applied::Mismatch => "the GPU ran something other than Stock (live memory offset differs)".into(),
+        _ => "Stock was sent but not confirmed (GPU idle, Afterburner's saved settings not Stock yet)".into(),
+    };
+    Trial {
+        status: "reverted".into(),
+        reason: crash_text,
+        verified,
+        attempts,
+        sent: t.sent || sent_now,
+        sends: t.sends.saturating_add(sent_now as u32),
+        gave_up: !verified && attempts >= MAX_REVERT_ATTEMPTS,
+        last_error,
+        ..t.clone()
+    }
+}
+
 pub fn guard_main(dry_run: bool) -> i32 {
     let mode = if dry_run { "dry-run" } else { "guard" };
     let trial = load_trial();
-    let Some(t) = trial.as_ref().filter(|t| t.pending()) else {
+    let Some(t) = trial.as_ref().filter(|t| t.armed()) else {
         let why = match &trial {
             Some(t) => format!("trial status is \"{}\"", t.status),
             None => "no trial file".into(),
@@ -717,38 +868,58 @@ pub fn guard_main(dry_run: bool) -> i32 {
         guard_log(&format!("[{mode}] decision={:?} ({why})", guard_decision(trial.as_ref(), 0, false)));
         return 0;
     };
-    let boot = boot_time();
-    let (crash, crash_text) = match crash_event_after(t.applied_at) {
-        Ok(Some(what)) => (true, what),
-        Ok(None) => (false, "no crash events".to_string()),
-        Err(e) => (false, format!("event log could not be read: {e}")),
+    let (decision, crash_text) = if t.revert_unverified() {
+        guard_log(&format!("[{mode}] decision=RetryRevert preset={} (Stock was sent earlier but not confirmed)", t.preset));
+        (Decision::RetryRevert, t.reason.clone())
+    } else {
+        let boot = boot_time();
+        let (crash, crash_text) = match crash_event_after(t.applied_at) {
+            Ok(Some(what)) => (true, what),
+            Ok(None) => (false, "no crash events".to_string()),
+            Err(e) => (false, format!("event log could not be read: {e}")),
+        };
+        let decision = guard_decision(Some(t), boot, crash);
+        guard_log(&format!(
+            "[{mode}] decision={decision:?} preset={} applied_at={} trial_boot={} current_boot={boot} crash={crash} ({crash_text})",
+            t.preset, t.applied_at, t.boot_time
+        ));
+        (decision, crash_text)
     };
-    let decision = guard_decision(Some(t), boot, crash);
-    guard_log(&format!(
-        "[{mode}] decision={decision:?} preset={} applied_at={} trial_boot={} current_boot={boot} crash={crash} ({crash_text})",
-        t.preset, t.applied_at, t.boot_time
-    ));
-    if decision != Decision::RevertAfterCrash || dry_run {
+    if !matches!(decision, Decision::RevertAfterCrash | Decision::RetryRevert) || dry_run {
         return 0;
     }
 
     // Crash during the trial: make sure slot 3 holds Stock (written with a backup if not) and load it.
+    // Afterburner is not restarted "unchanged" when the slot write fails: its startup settings may hold the trial preset.
     let stock = &PRESETS[0];
     let slot_ok = Cfg::read().map(|c| section_is_preset(c.section(&format!("Profile{}", stock.slot)).as_ref(), stock)).unwrap_or(false);
     let report = |id: &str, r: StepResult| guard_log(&format!("[{mode}]   step {id}: {r:?}"));
-    if !apply_preset(0, !slot_ok, &report, &|| {}, &|| {}) {
-        guard_log(&format!("[{mode}] revert FAILED - the trial stays pending and is checked again at the next sign-in"));
-        return 1;
-    }
-    let mut done = t.clone();
-    done.status = "reverted".into();
-    done.reason = crash_text;
-    common::save_json(TRIAL_FILE, &done);
+    let applied = apply_preset(0, !slot_ok, false, &report, &|| {}, &|| {});
+    let startup_is_stock = || {
+        // give Afterburner a moment to save the profile it loaded as its startup settings
+        std::thread::sleep(Duration::from_secs(5));
+        live_verdict(gpu_live().as_ref(), stock) == Applied::Confirmed || Cfg::read().and_then(|c| find_preset(c.section("Startup").as_ref())) == Some(0)
+    };
+    let startup = applied == Applied::Unverified && startup_is_stock();
+    let done = revert_outcome(t, crash_text, applied, startup);
+    save_trial(&done);
+    let code = if matches!(applied, Applied::Failed | Applied::Mismatch) { 1 } else { 0 };
+    let what = if done.verified {
+        "GPU set back to Stock (confirmed)".to_string()
+    } else if done.gave_up {
+        format!("revert NOT confirmed after {} attempts ({}); giving up", done.attempts, done.last_error)
+    } else {
+        guard_log(&format!(
+            "[{mode}] revert NOT confirmed, attempt {}/{MAX_REVERT_ATTEMPTS} ({}); sign-in check kept to try again",
+            done.attempts, done.last_error
+        ));
+        return code;
+    };
     match unregister_task() {
-        Ok(()) => guard_log(&format!("[{mode}] GPU set back to Stock; sign-in check removed")),
-        Err(e) => guard_log(&format!("[{mode}] GPU set back to Stock; sign-in check NOT removed: {e}")),
+        Ok(()) => guard_log(&format!("[{mode}] {what}; sign-in check removed")),
+        Err(e) => guard_log(&format!("[{mode}] {what}; sign-in check NOT removed: {e}")),
     }
-    0
+    code
 }
 
 // ------------------------------------------------------------------ tab
@@ -764,7 +935,8 @@ enum After {
 
 enum Action {
     Apply { idx: usize, write: bool, after: After },
-    Restore(PathBuf),
+    /// `end_trial`: a safety trial is open and ends with the restore
+    Restore { path: PathBuf, end_trial: bool },
 }
 
 /// Trial bookkeeping for applying preset `idx`, given what the user confirmed and whether a trial is pending.
@@ -786,24 +958,26 @@ fn plan_after(idx: usize, confirmed: Option<&str>, trial_pending: bool) -> After
 fn run_apply(idx: usize, write: bool, after: &After, report: &dyn Fn(&str, StepResult)) {
     // A new trial is armed BEFORE Afterburner gets the preset: an unstable tune usually crashes the PC the
     // moment it is applied, and the sign-in check must already exist then.
-    let prior = load_trial().filter(|t| t.pending());
+    // an earlier trial the sign-in check still acts on (pending, or a crash revert not confirmed yet)
+    let prior = load_trial().filter(|t| t.armed());
     let arm = || {
         if let After::StartTrial { previous } = after {
             report(STEP_TRIAL, start_trial(PRESETS[idx].name, previous));
         }
     };
-    // Afterburner never got the preset: no trial for it. An earlier trial that is still pending stays as it was.
+    // Afterburner never got the preset: no trial for it. An earlier armed trial is written back as it was, and
+    // the sign-in check start_trial just (re)registered stays for it.
     let disarm = || {
         if let After::StartTrial { .. } = after {
             match &prior {
-                Some(t) => common::save_json(TRIAL_FILE, t),
+                Some(t) => save_trial(t),
                 None => {
                     let _ = end_trial();
                 }
             }
         }
     };
-    if !apply_preset(idx, write, report, &arm, &disarm) {
+    if apply_preset(idx, write, true, report, &arm, &disarm) == Applied::Failed {
         return;
     }
     match after {
@@ -862,23 +1036,31 @@ fn apply_window(kicker: &str, idx: usize, write: bool, after: &After) -> OpWindo
     w
 }
 
-fn restore_window(last: &Path) -> OpWindow {
+/// `trial`: the preset of a safety trial that is open (it ends with the restore).
+fn restore_window(last: &Path, trial: Option<&str>) -> OpWindow {
     let when = std::fs::metadata(last)
         .and_then(|m| m.modified())
         .map(|t| chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_default();
     let name = last.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let items = vec![
+    let mut items = vec![
         OpItem::new(STEP_COPY, "Close Afterburner and put the backup back", "").detail(name),
         OpItem::new(STEP_START, "Restart MSI Afterburner", ""),
     ];
+    if trial.is_some() {
+        items.push(OpItem::new(STEP_END_TRIAL, "End the safety trial (remove the sign-in check)", ""));
+    }
     let mut w = OpWindow::new("RESTORE LAST BACKUP", "run", "done", items).noun("step", "steps");
     w.show_steps = true;
     w.fail_phrase = "did not complete".into();
     w.preview_text = format!("Puts back the Afterburner profile file saved on {when}.");
     w.running_text = "Restoring the backup...".into();
     w.go_label = "Restore".into();
-    w.warning = Some("All Afterburner profile slots go back to what they held when this backup was made.".into());
+    let mut warn = "All Afterburner profile slots go back to what they held when this backup was made.".to_string();
+    if let Some(p) = trial {
+        warn.push_str(&format!("\nThe {p} trial ends: the restored profiles are not a trial tune."));
+    }
+    w.warning = Some(warn);
     w
 }
 
@@ -920,6 +1102,66 @@ enum Click {
     Keep,
     Revert,
     Dismiss,
+}
+
+/// The "Trial reverted" notice: says Stock is set only when the sign-in check confirmed it.
+fn reverted_text(t: &Trial) -> String {
+    if t.verified {
+        format!(
+            "Windows logged an unexpected shutdown during the {} trial, so the GPU was set back to Stock at sign-in. If it was not a power cut, try a milder preset.",
+            t.preset
+        )
+    } else if !t.sent {
+        let next = if t.gave_up { "the sign-in check has stopped" } else { "the sign-in check tries again next time" };
+        format!(
+            "Windows logged an unexpected shutdown during the {} trial. Stock could NOT be loaded into Afterburner at sign-in (see below), so the GPU may still run the {} preset; use Reset to stock ({next}). If it was not a power cut, try a milder preset.",
+            t.preset, t.preset
+        )
+    } else if t.gave_up {
+        let n = t.sends.max(1);
+        format!(
+            "Windows logged an unexpected shutdown during the {} trial. Stock was sent to Afterburner at {n} sign-in{} but never confirmed, so the sign-in check has stopped. Check the live readout under load, or use Reset to stock. If it was not a power cut, try a milder preset.",
+            t.preset,
+            if n == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "Windows logged an unexpected shutdown during the {} trial. Stock was sent to Afterburner at sign-in - not yet confirmed; check the live readout (the sign-in check tries again next time). If it was not a power cut, try a milder preset.",
+            t.preset
+        )
+    }
+}
+
+/// `t` confirmed by a live reading: Some(trial marked verified) when it is a revert not confirmed yet and the
+/// GPU runs at full clocks with the Stock memory offset.
+fn settled_revert(t: &Trial, live: Option<&Live>) -> Option<Trial> {
+    let stock = live.filter(|l| l.full_clocks).and_then(live_preset) == Some(0);
+    (t.revert_unverified() && stock).then(|| Trial { verified: true, last_error: String::new(), ..t.clone() })
+}
+
+/// Hero of "Currently applied": (name, unit, caption, colour). Without an Afterburner profile file nothing
+/// is managed and the card runs its factory settings - not "custom settings".
+fn hero_text(cfg_found: bool, saved: Option<usize>, current: Option<usize>) -> (&'static str, &'static str, String, egui::Color32) {
+    let caption = match (cfg_found, saved) {
+        (false, _) => "No Afterburner profile - the card runs its factory settings (confirmed under load)".to_string(),
+        (true, Some(i)) => format!("Afterburner saved settings: {}", PRESETS[i].name),
+        (true, None) => "Afterburner saved settings: custom, not a preset".to_string(),
+    };
+    match current {
+        Some(i) => (PRESETS[i].name, "preset", caption, theme::ACCENT),
+        None if !cfg_found => ("Not managed", "by Afterburner", caption, theme::DIM),
+        None => ("Custom", "settings", caption, theme::JUNK),
+    }
+}
+
+/// The live-check chip, from the one reading on screen: (text, colour).
+fn live_chip(live: Option<&Live>) -> (String, egui::Color32) {
+    match (live, live.and_then(live_preset)) {
+        (Some(_), Some(i)) => (format!("Live check: memory offset matches {}", PRESETS[i].name), theme::OK),
+        (Some(l), None) if l.full_clocks => ("Live check: memory offset matches no preset".into(), theme::JUNK),
+        (Some(l), None) => (format!("Live check: GPU idle in {} - confirms under load", l.pstate), theme::DIM),
+        (None, _) => ("Live check: nvidia-smi not available".into(), theme::DIM),
+    }
 }
 
 fn hhmm(unix: i64) -> String {
@@ -1002,7 +1244,8 @@ impl GpuTab {
             boot_time: 0,
             status: status.into(),
             reason: reason.into(),
-            unguarded: false,
+            verified: true,
+            ..Default::default()
         };
         match v.as_str() {
             "gpu:trial" => {
@@ -1043,6 +1286,11 @@ impl GpuTab {
         }
     }
 
+    /// The nvidia-smi reading on screen: the newest 1 s sample, else the last state refresh.
+    fn live_shown(&self) -> Option<&Live> {
+        self.history.back().or(self.state.as_ref().and_then(|s| s.live.as_ref()))
+    }
+
     fn reload_trial(&mut self) {
         if !self.demo {
             self.trial = load_trial();
@@ -1050,16 +1298,31 @@ impl GpuTab {
         }
     }
 
+    /// A crash revert the sign-in check could not confirm is settled once the tab sees Stock under load:
+    /// the notice then reads as confirmed and the sign-in check is removed.
+    fn settle_revert(&mut self) {
+        if self.demo || self.work.is_some() || !self.trial.as_ref().map(|t| t.revert_unverified()).unwrap_or(false) {
+            return;
+        }
+        // decide from the file on disk, which the sign-in check may have changed
+        let Some(done) = load_trial().and_then(|t| settled_revert(&t, self.history.back())) else { return };
+        save_trial(&done);
+        self.trial = Some(done);
+        if self.chore.is_none() {
+            self.chore = Some(Job::spawn(unregister_task));
+        }
+    }
+
     fn pump(&mut self) {
-        if let Some(j) = &self.refresh {
-            if let Some(s) = j.poll() {
-                if self.selected.is_none() {
-                    self.selected = s.live_preset.or(s.saved);
-                }
-                self.state = Some(s);
-                self.refresh = None;
-                self.next_refresh = Instant::now() + Duration::from_secs(3);
+        if let Some(s) = self.refresh.as_ref().and_then(|j| j.poll()) {
+            if self.selected.is_none() {
+                self.selected = s.live_preset.or(s.saved);
             }
+            self.state = Some(s);
+            self.refresh = None;
+            self.next_refresh = Instant::now() + Duration::from_secs(3);
+            // the sign-in check may have reverted the trial while the tab is open
+            self.reload_trial();
         }
         if self.refresh.is_none() && Instant::now() >= self.next_refresh {
             self.refresh = Some(Job::spawn(current_state));
@@ -1075,6 +1338,7 @@ impl GpuTab {
                     self.history.push_back(l);
                 }
                 self.sampler = None;
+                self.settle_revert();
             }
         }
         if self.sampler.is_none() && Instant::now() >= self.next_sample {
@@ -1127,6 +1391,8 @@ impl GpuTab {
 
     /// Open the operation window (preview) for applying preset `idx`.
     fn open_apply(&mut self, idx: usize, kicker: String) {
+        // plan from the file on disk: the sign-in check may have changed it
+        self.reload_trial();
         let p = &PRESETS[idx];
         let Some(cfg) = Cfg::read() else {
             self.error = Some(format!("No RTX 5080 profile file in {}\\Profiles. Open Afterburner once, close it, and retry.", ab_dir().display()));
@@ -1139,7 +1405,8 @@ impl GpuTab {
                 return;
             }
         }
-        let pending = self.trial.as_ref().map(|t| t.pending()).unwrap_or(false);
+        // a revert that is not confirmed yet also keeps the sign-in check: applying a preset settles it
+        let pending = self.trial.as_ref().map(|t| t.armed()).unwrap_or(false);
         let after = plan_after(idx, self.confirmed.as_deref(), pending);
         self.op = Some(apply_window(&kicker, idx, !slot_ok, &after));
         self.op_action = Some(Action::Apply { idx, write: !slot_ok, after });
@@ -1161,7 +1428,7 @@ impl GpuTab {
             };
             match action {
                 Action::Apply { idx, write, after } => run_apply(idx, write, &after, &report),
-                Action::Restore(path) => restore_backup(&path, &report),
+                Action::Restore { path, end_trial } => restore_backup(&path, end_trial, &report),
             }
         });
         self.work = Some(Work { rx, job });
@@ -1177,31 +1444,57 @@ impl GpuTab {
             Click::Restore => match last_backup() {
                 None => self.status = format!("No backups in {}.", backup_dir().display()),
                 Some(last) => {
-                    self.op = Some(restore_window(&last));
-                    self.op_action = Some(Action::Restore(last));
+                    self.reload_trial();
+                    let trial = self.trial.as_ref().filter(|t| t.armed()).map(|t| t.preset.clone());
+                    self.op = Some(restore_window(&last, trial.as_deref()));
+                    self.op_action = Some(Action::Restore { path: last, end_trial: trial.is_some() });
                 }
             },
             Click::Refresh => self.next_refresh = Instant::now(),
             Click::Keep => {
-                let Some(t) = self.trial.take() else { return };
-                self.status = format!("{} kept as your confirmed tune.", t.preset);
                 if self.demo {
+                    if let Some(t) = self.trial.take() {
+                        self.status = format!("{} kept as your confirmed tune.", t.preset);
+                    }
                     return;
                 }
-                common::save_json(CONFIRMED_FILE, &Confirmed { preset: t.preset.clone() });
-                self.confirmed = Some(t.preset);
-                delete_trial();
-                self.chore = Some(Job::spawn(unregister_task));
+                // decide from the file on disk, never from the copy on screen: the sign-in check may have reverted it
+                let shown = self.trial.clone();
+                self.reload_trial();
+                match keep_target(shown.as_ref(), self.trial.as_ref()) {
+                    Err(e) => self.status = e,
+                    Ok(t) => {
+                        self.status = format!("{} kept as your confirmed tune.", t.preset);
+                        common::save_json(CONFIRMED_FILE, &Confirmed { preset: t.preset.clone() });
+                        self.confirmed = Some(t.preset);
+                        self.trial = None;
+                        delete_trial();
+                        self.chore = Some(Job::spawn(unregister_task));
+                    }
+                }
             }
             Click::Revert => {
+                self.reload_trial();
                 let prev = self.trial.as_ref().map(|t| t.previous.clone()).unwrap_or_default();
                 let idx = PRESETS.iter().position(|p| p.name == prev).unwrap_or(0);
                 self.open_apply(idx, format!("REVERT TO {}", PRESETS[idx].name.to_uppercase()));
             }
             Click::Dismiss => {
+                if self.demo {
+                    self.trial = None;
+                    return;
+                }
+                // only a notice is dismissed: a trial that became pending again stays
+                self.reload_trial();
+                if self.trial.as_ref().map(|t| t.pending()).unwrap_or(false) {
+                    return;
+                }
+                let unverified = self.trial.as_ref().map(|t| t.revert_unverified()).unwrap_or(false);
                 self.trial = None;
-                if !self.demo {
-                    delete_trial();
+                delete_trial();
+                if unverified && self.chore.is_none() {
+                    // the sign-in check was kept for this revert; without the file it has nothing to do
+                    self.chore = Some(Job::spawn(unregister_task));
                 }
             }
         }
@@ -1244,15 +1537,12 @@ impl GpuTab {
                 ui.set_width(ui.available_width());
                 theme::section(ui, "Trial reverted");
                 ui.label(RichText::new(format!("Unexpected shutdown during the {} trial", t.preset)).size(18.0).strong().color(theme::TEXT));
-                ui.label(
-                    RichText::new(format!(
-                        "Windows logged an unexpected shutdown during the {} trial, so the GPU was set back to Stock at sign-in. If it was not a power cut, try a milder preset.",
-                        t.preset
-                    ))
-                    .color(theme::TEXT_DIM),
-                );
+                ui.label(RichText::new(reverted_text(t)).color(theme::TEXT_DIM));
                 if !t.reason.is_empty() {
                     ui.label(RichText::new(format!("Windows logged: {}", t.reason)).size(12.0).color(theme::TEXT_FAINT));
+                }
+                if !t.verified && !t.last_error.is_empty() {
+                    ui.label(RichText::new(format!("Last sign-in check: {}", t.last_error)).size(12.0).color(theme::TEXT_FAINT));
                 }
                 ui.add_space(2.0);
                 if ui.button("   Dismiss   ").clicked() {
@@ -1276,12 +1566,8 @@ impl GpuTab {
             };
             theme::section(ui, "Currently applied");
             ui.horizontal(|ui| {
-                let (name, c) = match current {
-                    Some(i) => (PRESETS[i].name, theme::ACCENT),
-                    None => ("Custom", theme::JUNK),
-                };
-                let saved = s.saved.map(|i| PRESETS[i].name).unwrap_or("custom, not a preset");
-                theme::hero(ui, name, if current.is_some() { "preset" } else { "settings" }, &format!("Afterburner saved settings: {saved}"), c);
+                let (name, unit, caption, c) = hero_text(s.cfg.is_some(), s.saved, current);
+                theme::hero(ui, name, unit, &caption, c);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if ui
                         .add_enabled(self.work.is_none(), theme::danger_button("⟲  Reset to stock"))
@@ -1293,14 +1579,11 @@ impl GpuTab {
                 });
             });
 
-            let live = self.history.back().or(s.live.as_ref());
+            // one reading for the hero, this chip and the memory chip, so they always agree
+            let live = self.live_shown();
             ui.horizontal_wrapped(|ui| {
-                match (live, s.live_preset) {
-                    (Some(_), Some(i)) => theme::chip(ui, &format!("Live check: memory offset matches {}", PRESETS[i].name), theme::OK),
-                    (Some(l), None) if l.full_clocks => theme::chip(ui, "Live check: memory offset matches no preset", theme::JUNK),
-                    (Some(l), None) => theme::chip(ui, &format!("Live check: GPU idle in {} - confirms under load", l.pstate), theme::DIM),
-                    (None, _) => theme::chip(ui, "Live check: nvidia-smi not available", theme::DIM),
-                }
+                let (text, c) = live_chip(live);
+                theme::chip(ui, &text, c);
                 if s.ab_running {
                     theme::chip(ui, "Afterburner running", theme::OK);
                 } else {
@@ -1362,7 +1645,7 @@ impl Tab for GpuTab {
             self.trial_banner(ui, can, &mut click);
 
             let st = self.state.as_ref();
-            let current = st.and_then(current_preset);
+            let current = st.and_then(|s| current_preset(s.saved, self.live_shown()));
             self.hero_card(ui, current, &mut click);
 
             ui.add_space(8.0);
@@ -1429,20 +1712,19 @@ mod tests {
         assert!(!idle.full_clocks);
     }
 
-    /// Read-only: parses the real Afterburner profile, builds every preset in memory (never written) and
-    /// prints the live nvidia-smi reading (`cargo test gpu -- --nocapture`).
+    /// Live check, read-only: parses the real Afterburner profile, builds every preset in memory (never
+    /// written) and prints the live nvidia-smi reading (`cargo test gpu_cfg_live -- --ignored --nocapture`).
+    /// Fails when there is no RTX 5080 profile file; the fixture tests below cover machines without one.
     #[test]
+    #[ignore]
     fn gpu_cfg_live() {
         println!("Afterburner: {}  (exe exists: {})", ab_dir().display(), ab_exe().exists());
         println!("backup dir:  {}", backup_dir().display());
-        let Some(cfg) = Cfg::read() else {
-            println!("no RTX 5080 profile file found - skipping cfg checks");
-            return;
-        };
+        let cfg = Cfg::read().expect("no RTX 5080 profile file found - this live check needs Afterburner's VEN_10DE&DEV_2C02*.cfg");
         println!("cfg: {}  ({} lines, CRLF: {})", cfg.path.display(), cfg.lines.len(), cfg.crlf);
         // the file must round-trip byte for byte when nothing is changed
         let orig = std::fs::read(&cfg.path).unwrap();
-        println!("unchanged re-serialisation identical: {}", orig == cfg.to_bytes());
+        assert_eq!(orig, cfg.to_bytes(), "unchanged re-serialisation differs from the file");
         for name in cfg.section_names() {
             let sec = cfg.section(&name);
             let s = sec.as_ref().unwrap();
@@ -1482,7 +1764,7 @@ mod tests {
                     assert_eq!(back, Some(i));
                     assert_eq!(back2, Some(i));
                 }
-                Err(e) => println!("  build {:<12} FAILED: {e}", p.name),
+                Err(e) => panic!("build {} FAILED: {e}", p.name),
             }
         }
         match gpu_live() {
@@ -1493,7 +1775,7 @@ mod tests {
     }
 
     fn trial(status: &str, boot: i64) -> Trial {
-        Trial { preset: "Performance".into(), previous: "Balanced".into(), applied_at: 1_800_000_000, boot_time: boot, status: status.into(), reason: String::new(), unguarded: false }
+        Trial { preset: "Performance".into(), previous: "Balanced".into(), applied_at: 1_800_000_000, boot_time: boot, status: status.into(), ..Default::default() }
     }
 
     #[test]
@@ -1501,7 +1783,11 @@ mod tests {
         let boot = 1_799_990_000;
         // no file, or a trial that is not pending
         assert_eq!(guard_decision(None, boot, true), Decision::NoTrial);
-        assert_eq!(guard_decision(Some(&trial("reverted", boot)), boot + 5000, true), Decision::NoTrial);
+        let confirmed_revert = Trial { verified: true, ..trial("reverted", boot) };
+        assert_eq!(guard_decision(Some(&confirmed_revert), boot + 5000, true), Decision::NoTrial);
+        // Stock was sent but not confirmed: the check sends it again, whatever the boot or event log says
+        assert_eq!(guard_decision(Some(&trial("reverted", boot)), boot + 5000, false), Decision::RetryRevert);
+        assert_eq!(guard_decision(Some(&trial("reverted", boot)), boot, true), Decision::RetryRevert);
         // same boot (small clock drift allowed): nothing to do, whatever the event log says
         assert_eq!(guard_decision(Some(&trial("pending", boot)), boot, false), Decision::StillSameBoot);
         assert_eq!(guard_decision(Some(&trial("pending", boot)), boot + 20, true), Decision::StillSameBoot);
@@ -1545,11 +1831,10 @@ mod tests {
 
         // under load the live reading alone decides what is "currently applied"
         let live = |line: &str| parse_smi(line).unwrap();
-        let state = |l: Option<Live>| State { cfg: None, saved: Some(2), slot_ok: vec![], live_preset: l.as_ref().and_then(live_preset), live: l, ab_running: true };
-        assert_eq!(current_preset(&state(Some(live("2895, 17001, 15001, 310, 61, P0, 97")))), Some(3));
-        assert_eq!(current_preset(&state(Some(live("2895, 15700, 15001, 310, 61, P0, 97")))), None);
-        assert_eq!(current_preset(&state(Some(live("210, 405, 15001, 25, 40, P8, 2")))), Some(2));
-        assert_eq!(current_preset(&state(None)), Some(2));
+        assert_eq!(current_preset(Some(2), Some(&live("2895, 17001, 15001, 310, 61, P0, 97"))), Some(3));
+        assert_eq!(current_preset(Some(2), Some(&live("2895, 15700, 15001, 310, 61, P0, 97"))), None);
+        assert_eq!(current_preset(Some(2), Some(&live("210, 405, 15001, 25, 40, P8, 2"))), Some(2));
+        assert_eq!(current_preset(Some(2), None), Some(2));
         // older trial files have no "unguarded" field: they count as armed
         assert!(!serde_json::from_str::<Trial>(r#"{"preset":"Balanced","status":"pending"}"#).unwrap().unguarded);
         let warn = w.warning.unwrap();
@@ -1575,5 +1860,349 @@ mod tests {
         // nothing can have crashed in the future
         assert_eq!(crash_event_after(chrono::Utc::now().timestamp() + 3600), Ok(None));
         println!("crash events in the last 30 days: {:?}", crash_event_after(chrono::Utc::now().timestamp() - 30 * 86400));
+    }
+
+    // ------------------------------------------------------------- fixtures (no Afterburner needed)
+
+    /// Points in the fixture curve and the trailing bytes after them (the real RTX 5080 blob is 3228 bytes for
+    /// 127 points: 12 + 127*12 = 1536 bytes of header and points, then 1692 bytes the writer must keep).
+    const N: usize = 127;
+    const TRAIL: usize = 1692;
+
+    fn trail_byte(i: usize) -> u8 {
+        (i * 7 + 3) as u8
+    }
+
+    /// A VFCurve hex string: header (version, count, reserved), points {mV, base MHz, offset MHz}, filler.
+    fn curve_hex_with(version: u32, n: usize, mv: &dyn Fn(usize) -> f32, base: &dyn Fn(usize) -> f32, ofs: &dyn Fn(usize) -> f32, trailing: usize) -> String {
+        let mut b = vec![];
+        b.extend_from_slice(&version.to_le_bytes());
+        b.extend_from_slice(&(n as u32).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        for k in 0..n {
+            b.extend_from_slice(&mv(k).to_le_bytes());
+            b.extend_from_slice(&base(k).to_le_bytes());
+            b.extend_from_slice(&ofs(k).to_le_bytes());
+        }
+        b.extend((0..trailing).map(trail_byte));
+        b.iter().map(|x| format!("{x:02X}")).collect()
+    }
+
+    /// 450 mV upward in 5 mV steps, base 2000 MHz rising to about 2820: every preset is within +300 MHz.
+    fn fixture_mv(k: usize) -> f32 {
+        450.0 + 5.0 * k as f32
+    }
+    fn fixture_base(k: usize) -> f32 {
+        2000.0 + 6.5 * k as f32
+    }
+    fn fixture_curve() -> String {
+        curve_hex_with(0x0002_0001, N, &fixture_mv, &fixture_base, &|_| 0.0, TRAIL)
+    }
+
+    /// A profile file with [Profile2] in the middle (followed by [Profile3] and another section).
+    fn fixture_text(vf: &str, nl: &str) -> String {
+        [
+            "[Settings]",
+            "LastUsed=1",
+            "[Startup]",
+            "Format=2",
+            &format!("VFCurve={vf}"),
+            "FanMode=1",
+            "FanSpeed=45",
+            "[Profile2]",
+            "Format=2",
+            "MemClkBoost=0",
+            "VFCurve=00",
+            "[Profile3]",
+            "Format=2",
+            "CoreClkBoost=0",
+            "[Defaults]",
+            "Foo=bar",
+        ]
+        .iter()
+        .map(|l| format!("{l}{nl}"))
+        .collect()
+    }
+
+    fn fixture_cfg() -> Cfg {
+        Cfg::parse(PathBuf::new(), fixture_text(&fixture_curve(), "\r\n").as_bytes())
+    }
+
+    fn cfg_with_startup(vf: &str) -> Cfg {
+        Cfg::parse(PathBuf::new(), format!("[Startup]\r\nVFCurve={vf}\r\n").as_bytes())
+    }
+
+    fn sec(pairs: &[(&str, &str)]) -> Section {
+        Section(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+    }
+
+    #[test]
+    fn gpu_decode_curve() {
+        let c = decode_curve(&fixture_curve()).expect("fixture decodes");
+        assert_eq!(c.points.len(), N);
+        assert_eq!(c.bytes.len(), 12 + N * 12 + TRAIL);
+        assert_eq!((c.points[0].mv, c.points[0].base, c.points[0].off), (450.0, 2000.0, 12));
+        assert_eq!(c.points[N - 1].off, 12 + (N - 1) * 12);
+        // lower-case hex and surrounding whitespace are fine
+        assert!(decode_curve(&format!("  {}\r\n", fixture_curve().to_lowercase())).is_some());
+
+        assert!(decode_curve("").is_none());
+        assert!(decode_curve("ABC").is_none(), "odd length");
+        assert!(decode_curve(&format!("{}Z", &fixture_curve()[..fixture_curve().len() - 1])).is_none(), "not hex");
+        assert!(decode_curve(&curve_hex_with(0x0001_0001, N, &fixture_mv, &fixture_base, &|_| 0.0, 0)).is_none(), "wrong version");
+        assert!(decode_curve(&curve_hex_with(0x0002_0001, 49, &fixture_mv, &fixture_base, &|_| 0.0, 0)).is_none(), "n=49");
+        assert!(decode_curve(&curve_hex_with(0x0002_0001, 50, &fixture_mv, &fixture_base, &|_| 0.0, 0)).is_some(), "n=50");
+        assert!(decode_curve(&curve_hex_with(0x0002_0001, 255, &fixture_mv, &fixture_base, &|_| 0.0, 0)).is_some(), "n=255");
+        assert!(decode_curve(&curve_hex_with(0x0002_0001, 256, &fixture_mv, &fixture_base, &|_| 0.0, 0)).is_none(), "n=256");
+        // header says 127 points, but the buffer stops one point short
+        let full = curve_hex_with(0x0002_0001, N, &fixture_mv, &fixture_base, &|_| 0.0, 0);
+        assert!(decode_curve(&full[..(12 + (N - 1) * 12) * 2]).is_none(), "short buffer");
+        assert!(decode_curve(&full[..16]).is_none(), "shorter than the header");
+    }
+
+    #[test]
+    fn gpu_preset_build_fixture() {
+        let cfg = fixture_cfg();
+        let input = decode_curve(&fixture_curve()).unwrap();
+        for (i, p) in PRESETS.iter().enumerate() {
+            let lines = preset_section_lines(&cfg, p).unwrap_or_else(|e| panic!("{}: {e}", p.name));
+            assert_eq!(lines[0], format!("[Profile{}]", p.slot));
+            let s = Section::from_lines(&lines[1..]);
+            assert_eq!(find_preset(Some(&s)), Some(i), "{} detected as itself", p.name);
+            assert_eq!(s.get("MemClkBoost"), Some((p.mem * 1000).to_string().as_str()));
+            assert_eq!(s.get("CoreClkBoost"), Some("0"));
+            assert_eq!(s.get("PowerLimit"), Some(p.power.to_string().as_str()));
+            // fan settings come from [Startup]
+            assert_eq!((s.get("FanMode"), s.get("FanSpeed")), (Some("1"), Some("45")));
+            let out = decode_curve(s.get("VFCurve").unwrap()).unwrap();
+            assert_eq!(out.bytes.len(), input.bytes.len());
+            assert_eq!(out.bytes[12 + N * 12..], input.bytes[12 + N * 12..], "{}: trailing bytes kept", p.name);
+            assert_eq!(out.bytes[..12], input.bytes[..12], "header kept");
+            for (a, b) in out.points.iter().zip(&input.points) {
+                assert_eq!((a.mv, a.base), (b.mv, b.base), "only offsets change");
+            }
+            if p.target_mhz == 0 {
+                assert!(out.points.iter().all(|pt| pt.ofs == 0.0), "Stock zeroes every offset");
+            } else {
+                let max_eff = out.points.iter().map(|pt| pt.base + pt.ofs).fold(f32::MIN, f32::max);
+                assert!((max_eff - p.target_mhz as f32).abs() < 0.01, "{}: flat at the target", p.name);
+                // the anchor is the first point at or above target_mv; from there on the curve is flat
+                let anchor = out.points.iter().position(|pt| pt.mv >= p.target_mv as f32).unwrap();
+                assert!(out.points[anchor..].iter().all(|pt| (pt.base + pt.ofs - p.target_mhz as f32).abs() < 0.01));
+                assert!(out.points[..anchor].iter().all(|pt| pt.base + pt.ofs <= p.target_mhz as f32 + 0.01));
+            }
+        }
+        // Stock leaves an existing offset curve at 0 again
+        let tuned = cfg_with_startup(&curve_hex_with(0x0002_0001, N, &fixture_mv, &fixture_base, &|_| 150.0, TRAIL));
+        let s = Section::from_lines(&preset_section_lines(&tuned, &PRESETS[0]).unwrap()[1..]);
+        assert!(decode_curve(s.get("VFCurve").unwrap()).unwrap().points.iter().all(|pt| pt.ofs == 0.0));
+    }
+
+    #[test]
+    fn gpu_preset_build_rejects() {
+        let eff = &PRESETS[1];
+        // stock curve too low: Efficiency would need far more than +300 MHz at 900 mV
+        let low = cfg_with_startup(&curve_hex_with(0x0002_0001, N, &fixture_mv, &|k| 1500.0 + 6.5 * k as f32, &|_| 0.0, TRAIL));
+        assert!(preset_section_lines(&low, eff).unwrap_err().contains("too aggressive"));
+        // Stock never lifts anything, so the same curve is fine for it
+        assert!(preset_section_lines(&low, &PRESETS[0]).is_ok());
+        // not a voltage/frequency table: first point under 300 mV, or a base clock above 5000 MHz
+        let low_mv = cfg_with_startup(&curve_hex_with(0x0002_0001, N, &|k| 250.0 + 5.0 * k as f32, &fixture_base, &|_| 0.0, 0));
+        assert!(preset_section_lines(&low_mv, eff).unwrap_err().contains("does not look like"));
+        let fast = cfg_with_startup(&curve_hex_with(0x0002_0001, N, &fixture_mv, &|k| if k == 10 { 6000.0 } else { fixture_base(k) }, &|_| 0.0, 0));
+        assert!(preset_section_lines(&fast, eff).unwrap_err().contains("does not look like"));
+        // every point below the preset's voltage
+        let short = cfg_with_startup(&curve_hex_with(0x0002_0001, N, &|k| 450.0 + k as f32, &fixture_base, &|_| 0.0, 0));
+        assert_eq!(preset_section_lines(&short, eff).unwrap_err(), "No curve point at or above 900 mV.");
+        // missing pieces
+        assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), b"[Settings]\r\n"), eff).unwrap_err().contains("No [Startup]"));
+        assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), b"[Startup]\r\nVFCurve=\r\n"), eff).unwrap_err().contains("No VFCurve"));
+        assert!(preset_section_lines(&cfg_with_startup("0102"), eff).unwrap_err().contains("Unexpected curve format"));
+    }
+
+    #[test]
+    fn gpu_section_is_preset_edges() {
+        let eff = &PRESETS[1];
+        // one point peaks at 2700 + x MHz, the rest stay far lower
+        let peak = |x: f32| curve_hex_with(0x0002_0001, N, &fixture_mv, &|k| if k == 100 { 2700.0 } else { 2000.0 }, &move |k| if k == 100 { x } else { 0.0 }, TRAIL);
+        let with = |vf: &str, mem: &str| sec(&[("VFCurve", vf), ("MemClkBoost", mem), ("PowerLimit", "100"), ("CoreClkBoost", "0")]);
+        assert!(section_is_preset(Some(&with(&peak(0.0), "1000000")), eff));
+        assert!(section_is_preset(Some(&with(&peak(CLOCK_TOLERANCE as f32), "1000000")), eff), "+tolerance accepted");
+        assert!(section_is_preset(Some(&with(&peak(-CLOCK_TOLERANCE as f32), "1000000")), eff), "-tolerance accepted");
+        assert!(!section_is_preset(Some(&with(&peak(CLOCK_TOLERANCE as f32 + 0.5), "1000000")), eff), "just over");
+        assert!(!section_is_preset(Some(&with(&peak(-CLOCK_TOLERANCE as f32 - 0.5), "1000000")), eff), "just under");
+        // MemClkBoost is in kHz: 1000000 = +1000 MHz; anything else, or text, is not this preset
+        assert!(!section_is_preset(Some(&with(&peak(0.0), "1500000")), eff));
+        assert!(!section_is_preset(Some(&with(&peak(0.0), "abc")), eff));
+        assert_eq!(find_preset(Some(&with(&peak(0.0), "1000000"))), Some(1));
+        // a different power limit
+        let pl = sec(&[("VFCurve", &peak(0.0)), ("MemClkBoost", "1000000"), ("PowerLimit", "90")]);
+        assert!(!section_is_preset(Some(&pl), eff));
+        // no VFCurve, or none at all
+        assert!(!section_is_preset(Some(&sec(&[("MemClkBoost", "1000000")])), eff));
+        assert!(!section_is_preset(None, eff));
+        // Stock: no offsets and no CoreClkBoost
+        let flat = curve_hex_with(0x0002_0001, N, &fixture_mv, &fixture_base, &|_| 0.0, TRAIL);
+        let stock = |core: &str| sec(&[("VFCurve", &flat), ("MemClkBoost", "0"), ("CoreClkBoost", core)]);
+        assert!(section_is_preset(Some(&stock("0")), &PRESETS[0]));
+        assert!(section_is_preset(Some(&stock("")), &PRESETS[0]), "missing CoreClkBoost counts as 0");
+        assert!(!section_is_preset(Some(&stock("50")), &PRESETS[0]));
+        let small_ofs = curve_hex_with(0x0002_0001, N, &fixture_mv, &fixture_base, &|k| if k == 3 { 1.5 } else { 0.0 }, TRAIL);
+        assert!(!section_is_preset(Some(&sec(&[("VFCurve", &small_ofs), ("MemClkBoost", "0")])), &PRESETS[0]));
+    }
+
+    #[test]
+    fn gpu_cfg_parse_round_trip() {
+        for nl in ["\r\n", "\n"] {
+            let text = fixture_text(&fixture_curve(), nl);
+            let c = Cfg::parse(PathBuf::new(), text.as_bytes());
+            assert_eq!(c.crlf, nl == "\r\n");
+            assert_eq!(c.to_bytes(), text.as_bytes(), "unchanged file round-trips byte for byte ({nl:?})");
+            assert_eq!(c.section_names(), vec!["Settings", "Startup", "Profile2", "Profile3", "Defaults"]);
+            assert_eq!(c.section("Profile3").unwrap().get("coreclkboost"), Some("0"), "keys are case-insensitive");
+        }
+        // pinned current behaviour: a UTF-8 BOM is dropped, a missing final newline is added
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice(b"[A]\r\nx=1\r\n");
+        assert_eq!(Cfg::parse(PathBuf::new(), &bom).to_bytes(), b"[A]\r\nx=1\r\n");
+        assert_eq!(Cfg::parse(PathBuf::new(), b"[A]\r\nx=1").to_bytes(), b"[A]\r\nx=1\r\n");
+        assert_eq!(Cfg::parse(PathBuf::new(), b"[A]\nx=1").to_bytes(), b"[A]\nx=1\n");
+        // one line without any newline is written with CRLF
+        assert_eq!(Cfg::parse(PathBuf::new(), b"[A]").to_bytes(), b"[A]\r\n");
+    }
+
+    #[test]
+    fn gpu_with_section_middle() {
+        let cfg = fixture_cfg();
+        let built = preset_section_lines(&cfg, &PRESETS[1]).unwrap();
+        let out = Cfg { path: PathBuf::new(), lines: with_section(&cfg, 2, built.clone()), crlf: cfg.crlf };
+        let re = Cfg::parse(PathBuf::new(), &out.to_bytes());
+        assert_eq!(re.lines.iter().filter(|l| *l == "[Profile2]").count(), 1, "old [Profile2] removed");
+        assert!(!re.lines.iter().any(|l| l == "VFCurve=00"), "old body dropped");
+        assert_eq!(re.section_names(), vec!["Settings", "Startup", "Profile3", "Defaults", "Profile2"]);
+        // the neighbours are untouched
+        assert_eq!(re.section("Profile3").unwrap().0, cfg.section("Profile3").unwrap().0);
+        assert_eq!(re.section("Defaults").unwrap().0, cfg.section("Defaults").unwrap().0);
+        assert_eq!(re.section("Startup").unwrap().0, cfg.section("Startup").unwrap().0);
+        assert_eq!(find_preset(re.section("Profile2").as_ref()), Some(1));
+        assert_eq!(find_preset(re.section("Startup").as_ref()), Some(0), "the stock [Startup] is Stock");
+        // a slot that does not exist yet is appended
+        let out = with_section(&cfg, 4, preset_section_lines(&cfg, &PRESETS[3]).unwrap());
+        assert_eq!(out.len(), cfg.lines.len() + built.len());
+        assert_eq!(find_preset(Cfg::parse(PathBuf::new(), &Cfg { path: PathBuf::new(), lines: out, crlf: true }.to_bytes()).section("Profile4").as_ref()), Some(3));
+    }
+
+    #[test]
+    fn gpu_keep_checks_the_file() {
+        let shown = trial("pending", 1);
+        // the sign-in check reverted the trial while the tab showed it as pending: Keep must not confirm it
+        let reverted = Trial { reason: "event 41".into(), ..trial("reverted", 1) };
+        assert!(keep_target(Some(&shown), Some(&reverted)).unwrap_err().contains("no longer pending"));
+        assert!(keep_target(Some(&shown), None).is_err(), "file gone");
+        // a different trial was started in the meantime
+        let newer = Trial { applied_at: shown.applied_at + 60, ..trial("pending", 1) };
+        assert!(keep_target(Some(&shown), Some(&newer)).unwrap_err().contains("changed"));
+        let other = Trial { preset: "Balanced".into(), ..trial("pending", 1) };
+        assert!(keep_target(Some(&shown), Some(&other)).is_err());
+        assert!(keep_target(None, Some(&shown)).is_err());
+        assert_eq!(keep_target(Some(&shown), Some(&shown)), Ok(shown.clone()));
+        // what still needs the sign-in check
+        assert!(trial("pending", 1).armed() && trial("reverted", 1).armed());
+        assert!(!Trial { verified: true, ..trial("reverted", 1) }.armed());
+    }
+
+    #[test]
+    fn gpu_revert_verification() {
+        // only a confirmed Stock (live, or saved as Afterburner's startup settings) removes the sign-in check
+        let crashed = trial("pending", 1);
+        let out = |t: &Trial, a: Applied, startup: bool| revert_outcome(t, "event 41".into(), a, startup);
+        let ok = out(&crashed, Applied::Confirmed, false);
+        assert!(ok.verified && !ok.armed() && ok.status == "reverted" && ok.reason == "event 41" && ok.last_error.is_empty());
+        assert!(out(&crashed, Applied::Unverified, true).verified);
+        // whatever happened after a crash, the trial is "reverted": Keep is never offered on the crashing preset
+        for a in [Applied::Unverified, Applied::Mismatch, Applied::Failed] {
+            let r = out(&crashed, a, false);
+            assert!(r.status == "reverted" && !r.verified && r.revert_unverified() && !r.last_error.is_empty(), "{a:?}");
+            assert!(keep_target(Some(&crashed), Some(&r)).is_err());
+            assert_eq!(guard_decision(Some(&r), 0, false), Decision::RetryRevert);
+        }
+        assert!(!out(&crashed, Applied::Mismatch, true).verified, "the GPU runs something else");
+        // the retry is bounded: after MAX_REVERT_ATTEMPTS sends the check gives up and says so
+        let mut t = crashed.clone();
+        for n in 1..=MAX_REVERT_ATTEMPTS {
+            t = out(&t, Applied::Unverified, false);
+            assert_eq!(t.attempts, n);
+            assert_eq!(t.armed(), n < MAX_REVERT_ATTEMPTS);
+        }
+        assert!(t.gave_up && !t.verified);
+        assert_eq!(guard_decision(Some(&t), 0, false), Decision::NoTrial, "a leftover task does nothing");
+        assert!(reverted_text(&t).contains("sign-in check has stopped") && reverted_text(&t).contains("at 3 sign-ins"));
+        // Stock never reached Afterburner: the notice must not say it was sent, before or after giving up
+        let failed = out(&crashed, Applied::Failed, false);
+        assert!(!failed.sent && failed.sends == 0 && failed.armed());
+        assert!(!reverted_text(&failed).contains("was sent") && reverted_text(&failed).contains("could NOT be loaded"));
+        let mut f = crashed.clone();
+        for _ in 0..MAX_REVERT_ATTEMPTS {
+            f = out(&f, Applied::Failed, false);
+        }
+        assert!(f.gave_up && !f.sent && f.attempts == MAX_REVERT_ATTEMPTS);
+        assert!(!reverted_text(&f).contains("was sent") && reverted_text(&f).contains("could NOT be loaded"));
+        // a failed attempt, one that reached Afterburner, another failed one: only the real send is counted
+        let mixed = out(&out(&out(&crashed, Applied::Failed, false), Applied::Unverified, false), Applied::Failed, false);
+        assert!(mixed.gave_up && mixed.sent && mixed.sends == 1);
+        assert!(reverted_text(&mixed).contains("at 1 sign-in but never confirmed"));
+        // a later confirmation still settles it
+        assert!(out(&Trial { attempts: 1, ..out(&crashed, Applied::Failed, false) }, Applied::Confirmed, false).verified);
+        let l = |line: &str| parse_smi(line).unwrap();
+        // the tab settles an unconfirmed revert only from a full-clocks Stock reading
+        let unv = out(&crashed, Applied::Unverified, false);
+        let settled = settled_revert(&unv, Some(&l("2895, 15001, 15001, 310, 61, P0, 97"))).unwrap();
+        assert!(settled.verified && !settled.armed() && settled.last_error.is_empty());
+        assert_eq!(settled_revert(&unv, Some(&l("210, 405, 15001, 25, 40, P8, 2"))), None, "idle");
+        assert_eq!(settled_revert(&unv, Some(&l("2895, 17001, 15001, 310, 61, P0, 97"))), None, "not Stock");
+        assert_eq!(settled_revert(&unv, None), None);
+        assert_eq!(settled_revert(&crashed, Some(&l("2895, 15001, 15001, 310, 61, P0, 97"))), None, "pending trials are not touched");
+        assert_eq!(live_verdict(Some(&l("2895, 15001, 15001, 310, 61, P0, 97")), &PRESETS[0]), Applied::Confirmed);
+        assert_eq!(live_verdict(Some(&l("2895, 17001, 15001, 310, 61, P0, 97")), &PRESETS[0]), Applied::Mismatch);
+        assert_eq!(live_verdict(Some(&l("210, 405, 15001, 25, 40, P8, 2")), &PRESETS[0]), Applied::Unverified);
+        assert_eq!(live_verdict(None, &PRESETS[0]), Applied::Unverified);
+        // the notice only states Stock as fact when it was confirmed
+        let t = Trial { sent: true, sends: 1, attempts: 1, ..trial("reverted", 1) };
+        assert!(reverted_text(&t).contains("not yet confirmed"));
+        assert!(reverted_text(&Trial { verified: true, ..t }).contains("was set back to Stock at sign-in"));
+        // older "reverted" files without the field read as unconfirmed
+        assert!(!serde_json::from_str::<Trial>(r#"{"preset":"Balanced","status":"reverted"}"#).unwrap().verified);
+    }
+
+    #[test]
+    fn gpu_hero_and_live_chip() {
+        // no Afterburner profile at idle: not "custom settings"
+        let (name, unit, cap, c) = hero_text(false, None, None);
+        assert_eq!((name, unit, c), ("Not managed", "by Afterburner", theme::DIM));
+        assert!(cap.starts_with("No Afterburner profile"));
+        // ... but a live P0 reading at stock memory still says Stock
+        assert_eq!(hero_text(false, None, Some(0)).0, "Stock");
+        let (name, _, cap, _) = hero_text(true, None, None);
+        assert_eq!((name, cap.as_str()), ("Custom", "Afterburner saved settings: custom, not a preset"));
+        assert_eq!(hero_text(true, Some(2), Some(2)).2, "Afterburner saved settings: Balanced");
+
+        // the chip, the memory chip and the hero all come from the same reading
+        let perf = parse_smi("2895, 17001, 15001, 310, 61, P0, 97").unwrap();
+        let (text, c) = live_chip(Some(&perf));
+        assert_eq!((text.as_str(), c), ("Live check: memory offset matches Performance", theme::OK));
+        assert_eq!(current_preset(None, Some(&perf)), Some(3));
+        assert_eq!(live_chip(Some(&parse_smi("2895, 15700, 15001, 310, 61, P0, 97").unwrap())).0, "Live check: memory offset matches no preset");
+        assert!(live_chip(Some(&parse_smi("210, 405, 15001, 25, 40, P8, 2").unwrap())).0.contains("idle in P8"));
+        assert!(live_chip(None).0.contains("not available"));
+    }
+
+    #[test]
+    fn gpu_restore_window_trial() {
+        let w = restore_window(Path::new("x.cfg"), None);
+        assert_eq!(w.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec![STEP_COPY, STEP_START]);
+        assert!(!w.warning.unwrap().contains("trial"));
+        let w = restore_window(Path::new("x.cfg"), Some("Performance"));
+        assert_eq!(w.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec![STEP_COPY, STEP_START, STEP_END_TRIAL]);
+        assert!(w.warning.unwrap().contains("The Performance trial ends"));
     }
 }

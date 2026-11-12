@@ -1,5 +1,5 @@
-SERVICE MANAGER - after-reinstall toolkit
-==========================================
+PC TUNER - after-reinstall gaming toolkit
+=========================================
 
 Trims Windows services and startup items while keeping everything that
 Xbox / Game Pass / Steam / Easy Anti-Cheat need. The presets are tailored
@@ -14,6 +14,12 @@ Files
   PostInstall-Tweaks.ps1 Script alternative: scheduled tasks, Edge background, OneDrive.
   Remove-Bloat.cmd/.ps1  Deep-removes bloat apps and blocks Windows from reinstalling them (menu, -Restore).
   Optimize-Services.ps1  Script version of the presets (no window), if you prefer.
+  Run-Recheck.cmd        Runs the Remove-Bloat re-check task now and shows the result.
+  TweakScheduler.cmd/.ps1 CPU scheduler (Win32PrioritySeparation) presets with undo.
+  USB-PortFinder.cmd/.ps1 Finds which USB ports sit closest to the CPU (no admin).
+  RTX5080\               RTX 5080 Profile Manager (MSI Afterburner presets).
+  PCTuner.exe            Everything above in one program (download from GitHub
+                         Releases, or build from pctuner\).
   README.txt             This file.
 
 
@@ -111,6 +117,13 @@ UNDO EVERYTHING
   Apps:     powershell -ExecutionPolicy Bypass -File .\Remove-Bloat.ps1 -Restore
   Tweaks:   powershell -ExecutionPolicy Bypass -File .\PostInstall-Tweaks.ps1 -Undo
             (OneDrive: reinstall from the Microsoft Store)
+            The first Apply saves the state of every task, the Edge / Teredo
+            policies and the Teredo type to %LOCALAPPDATA%\PCTuner\
+            tweaks-state.json; -Undo puts back exactly that (tasks that were
+            already off stay off, tasks the Startup Cleaner switched off stay
+            off) and deletes the file. Without that file (tweaks applied by an
+            older version) -Undo resets the tasks and policies to the Windows
+            defaults instead.
 
 KNOWN ISSUE: WIDGETS
 --------------------
@@ -177,8 +190,13 @@ OPTIONAL list: Widgets (works around the UCPD block), Teams + meeting add-in,
 NEVER touched: Xbox app, Gaming Services, Game Bar, Xbox sign-in, Halo, Store,
   winget, Windows Security, Claude, Edge/WebView2, Photos, Paint, Snipping
   Tool, Notepad, Calculator, Terminal, Media Player, codecs, system packages.
-Undo:  .\Remove-Bloat.ps1 -Restore   (reinstalls from the Store, reverts
-  registry/policy changes, removes the task). After it: set the Copilot key in
+Undo:  .\Remove-Bloat.ps1 -Restore   (reinstalls the apps that have a Store
+  id for the current user, only unblocks the ones without one - Bing Search,
+  Dev Home, MSN widgets, handwriting, Widgets runtime, Cross Device, Xbox
+  speech-to-text, Teams add-in - which you reinstall by hand; re-enables the
+  ShowFeedbackToast task, the Recall feature and the handwriting framework;
+  reverts registry/policy changes including the Default-user OneDrive Run
+  entry; removes the task). After it: set the Copilot key in
   Settings > Personalization > Text input if you want it to do something.
 
 USB PORT FINDER (USB-PortFinder.cmd)
@@ -213,16 +231,43 @@ Copy the whole RTX5080 folder to C:\Users\<you>\Documents\RTX5080-Balanced
 PC TUNER (PCTuner.exe) - everything above in one program
 --------------------------------------------------------
 Double-click PCTuner.exe (asks for admin). Tabs: Services, Startup Cleaner,
-Remove Bloat, Post-install Tweaks, CPU Scheduler, RTX 5080 Profiles, USB Port
-Finder - same lists, rules, safety checks and undo as the separate tools; it
-also imports their change history. Its own history: %LOCALAPPDATA%\PCTuner.
-Source code: pctuner\ (Rust). Rebuild: install Rust (rustup) + Visual Studio
-2022 Build Tools (C++), then in pctuner\ run:  cargo build --release
+Remove Bloat, Post-install Tweaks, Network, Performance, CPU Scheduler,
+RTX 5080 Profiles, Fan Tuner, USB Port Finder - same lists, rules, safety
+checks and undo as the separate tools; it also imports the Service Manager
+and Startup Cleaner change history. Its own history: %LOCALAPPDATA%\PCTuner.
+Source code: pctuner\ (Rust). Rebuild: install Rust (rustup, MSVC toolchain),
+Visual Studio 2022 Build Tools (C++) and the .NET 8 SDK (winget install
+Microsoft.DotNet.SDK.8), then in pctuner\ run:
+  powershell -ExecutionPolicy Bypass -File fanhelper\build.ps1
+and then  cargo build --release  (the fan helper is embedded into the exe;
+fan control needs the PawnIO driver).
 
-How it works: every change opens a window that first shows exactly what will
-change (with a warning if it is risky), then a progress bar, then each item
-ticking off with a count and an Undo button. Nothing is applied until you
-press the green button in that window.
+How it works: every system change (services, startup, bloat, tweaks,
+network, performance, CPU scheduler, GPU profiles) opens a window that first
+shows exactly what will change (with a warning if it is risky), then a
+progress bar, then each item ticking off with a count and an Undo button.
+Nothing is applied until you press the green button in that window.
+Remove Bloat confirms in that window, then shows the progress and each item
+in the page's Result card, with an "Undo (Restore everything)" button when a
+removal finishes.
+If you close PC Tuner while a change is being applied, it waits and closes
+by itself when the change has finished (so it is recorded and can be
+undone); "Close anyway" is there if you really need it.
+Scripts that run as administrator (Remove Bloat, Post-install Tweaks) are
+written to %ProgramData%\PCTuner, which only administrators can change.
+If a history file cannot be read, PC Tuner says so and keeps it as
+<name>.corrupt-<time> instead of overwriting it.
+Exceptions: Fan Tuner changes apply live (no preview window); BIOS mode or
+closing PC Tuner hands the fans back to the BIOS. Power / BIOS asks once,
+then restarts or shuts down.
+
+Power / BIOS (bottom of the sidebar, above "Reset GPU to stock"):
+- "Restart into BIOS" restarts straight into the motherboard's UEFI/BIOS
+  setup; "Shut down, BIOS on next start" turns the PC off so the next start opens it.
+  Uses Windows' own shutdown /fw - no need to press Del at the right moment.
+- Needs PC Tuner run as administrator and a UEFI-booted PC (otherwise the
+  buttons are disabled with the reason). It asks for confirmation, then every
+  open program closes immediately without saving. There is nothing to undo.
 
 Performance tab:
 - Built from researched evidence: most "gaming tweaks" online are placebo or
@@ -245,7 +290,8 @@ Performance tab:
 Fan Tuner tab:
 - Needs the PawnIO driver (already installed on this PC) and PC Tuner run as
   administrator. Without admin only the graphics card is shown and nothing
-  can be changed.
+  can be changed. A saved startup profile is shown but not applied until PC
+  Tuner runs as administrator.
 - Live RPM / duty per fan, CPU / GPU / board temperatures, graphs.
 - Per fan: BIOS (hands off), Manual (slider) or Curve (drag the points;
   follows the CPU, the GPU or the hotter of the two). Headers the library
@@ -257,15 +303,22 @@ Fan Tuner tab:
   new"). The last profile you picked is applied when PC Tuner starts.
   A fan you change yourself gets its own setting ("own setting" chip):
   switching profiles leaves it alone until you press "Follow profile".
+  "Give all fans back to BIOS" puts every fan on BIOS control, clears own
+  settings, and no profile is applied at startup until you pick one again.
+  "This is a pump" ticks are kept for the fan itself, the same in every
+  profile. "Save as new" refuses a name that is already used (pick that
+  profile and use Save changes instead).
   Saved in %LOCALAPPDATA%\PCTuner\fan-profiles.json.
 - Safety (inside the PCTunerFan helper, so it holds if the window freezes):
   never below 20 % (pumps 50 %, GPU fan 30 % = its driver minimum); CPU or
   GPU at 90 C -> every controlled fan 100 % until both are under 80 C; if
-  temperatures cannot be read for 5 s the fans go back to the BIOS; fans go
+  temperatures cannot be read for 5 s the fans go back to the BIOS until they
+  can be read again (your settings then come back by themselves; a banner
+  shows it); fans go
   back to the BIOS when PC Tuner closes, crashes, or stops talking for 10 s.
-- Limits: if both PC Tuner and its helper are force-killed, fans stay at
-  their last speed (never under the floor) until PC Tuner is opened again or
-  the PC restarts. GPU fans: turn off MSI Afterburner's fan control first.
+- Limits: if both PC Tuner and its PCTunerFan helper are force-killed
+  together (e.g. End process tree), fans stay at their last speed (never
+  under the floor) until the PC restarts. GPU fans: turn off MSI Afterburner's fan control first.
 - First-run checklist (run as administrator):
   1. The tab lists your motherboard fans; note which say "read-only".
   2. CPU Fan > Manual > move the slider: the RPM follows within a few seconds.
@@ -294,8 +347,15 @@ GPU safety:
 - Applying a preset you have not kept before starts a TRIAL. A yellow box asks
   "keep this tune?" with Keep / Revert now. While the trial is open, a sign-in
   task (\PCTuner\GpuTrialGuard) checks after every restart: if Windows logged
-  a crash or blue screen since the tune was applied, the GPU is set back to
-  Stock and PC Tuner tells you why next time it opens.
+  a crash or blue screen since the tune was applied, Stock is sent to MSI
+  Afterburner and PC Tuner tells you why next time it opens. The check is only
+  removed once Stock is confirmed (live memory offset, or Afterburner's saved
+  startup settings); otherwise the notice says "not yet confirmed" and the
+  check sends Stock again at the next sign-in.
+- Restore last backup also ends an open trial (it is listed as a step).
+- If a change fails after Afterburner was closed, PC Tuner starts it again
+  unchanged (the sign-in check leaves it closed instead, so the crashed
+  preset is not re-applied).
 - Limits: the revert happens at the next sign-in after a crash, not during a
   freeze. It needs MSI Afterburner installed. If you move PCTuner.exe, the
   task is re-created at the next trial. Log: %LOCALAPPDATA%\PCTuner\gpu-guard.log

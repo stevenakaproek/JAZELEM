@@ -9,6 +9,7 @@ mod gpu;
 mod network;
 mod opwin;
 mod perf;
+mod power;
 mod scheduler;
 mod services;
 mod startup;
@@ -44,6 +45,18 @@ struct App {
     switched_at: f64,
     /// PCTUNER_SELFTEST=1: visit every tab for a few seconds, write a log, then exit (used to test builds).
     selftest: Option<std::time::Instant>,
+    /// The Power window (restart / shut down into the BIOS) while it is open.
+    power: Option<power::PowerDialog>,
+    /// Self-test: the tab whose screenshot has been requested (one per tab).
+    selftest_shot: Option<usize>,
+    /// The tab the sidebar last scrolled into view.
+    nav_shown: Option<usize>,
+    /// The window was closed while a change was running: close as soon as it has finished.
+    close_pending: bool,
+    /// Close without waiting (self-test end, or "Close anyway").
+    force_close: bool,
+    /// Messages from background work (crashed task, unreadable history file, ...).
+    notice: Option<String>,
 }
 
 impl App {
@@ -66,7 +79,67 @@ impl App {
             admin: common::is_admin(),
             switched_at: 0.0,
             selftest: std::env::var_os("PCTUNER_SELFTEST").map(|_| std::time::Instant::now()),
+            // PCTUNER_DEMO=power opens the window for a screenshot (its buttons are never pressed)
+            power: std::env::var("PCTUNER_DEMO").ok().filter(|v| v.eq_ignore_ascii_case("power")).map(|_| power::PowerDialog::new()),
+            selftest_shot: None,
+            nav_shown: None,
+            close_pending: false,
+            force_close: false,
+            notice: None,
         }
+    }
+
+    /// A change is being applied right now (a tab says so, a PowerShell script is running, or an
+    /// operation window is in its working stage).
+    fn busy(&self, now: f64) -> bool {
+        self.tabs.iter().any(|t| t.busy()) || common::scripts_running() > 0 || opwin::running_recently(now)
+    }
+
+    /// Closing while busy: cancel the close and close by itself once the change has finished, so its
+    /// undo record is written first.
+    fn close_guard(&mut self, ctx: &egui::Context, now: f64) {
+        let busy = self.busy(now);
+        if ctx.input(|i| i.viewport().close_requested()) && !self.force_close && busy {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_pending = true;
+        }
+        if !self.close_pending {
+            return;
+        }
+        if !busy {
+            self.close_pending = false;
+            self.force_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        theme::dim_backdrop(ctx, "close-wait");
+        egui::Window::new("close-wait-dialog")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme::modal_frame(ctx))
+            .show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("A change is still being applied").size(20.0).strong());
+                });
+                ui.label(egui::RichText::new("PC Tuner will close when it finishes, so the change is recorded and can be undone.").color(theme::TEXT_DIM));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary_button("   Keep PC Tuner open   ")).clicked() {
+                        self.close_pending = false;
+                    }
+                    if ui.button("Close anyway (the change may not be recorded)").clicked() {
+                        self.close_pending = false;
+                        self.force_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
     }
 
     fn go_to(&mut self, i: usize, now: f64) {
@@ -112,26 +185,19 @@ impl eframe::App for App {
             .exact_width(216.0)
             .frame(egui::Frame::none().fill(theme::NAV).inner_margin(egui::Margin::symmetric(12.0, 16.0)))
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-                ui.horizontal(|ui| {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("PC").size(22.0).strong().color(theme::ACCENT));
-                    ui.label(egui::RichText::new("Tuner").size(22.0).strong().color(theme::TEXT));
-                });
-                ui.horizontal(|ui| {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("gaming-safe Windows tuning").size(11.5).color(theme::TEXT_FAINT));
-                });
-                ui.add_space(14.0);
-                for (i, t) in self.tabs.iter().enumerate() {
-                    if Self::nav_row(ui, tab_icon(t.title()), t.title(), self.active == i) {
-                        go = Some(i);
-                    }
-                }
-
-                // pinned at the bottom: safety button + admin state
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                // pinned at the bottom in its own area (drawn first so the tab list can never run under it)
+                egui::TopBottomPanel::bottom("nav_bottom").frame(egui::Frame::none()).show_separator_line(false).show_inside(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.separator();
+                    let p = egui::Button::new(egui::RichText::new("🖥  Power / BIOS").color(theme::TEXT)).min_size(egui::vec2(ui.available_width(), 34.0));
+                    if ui.add(p).on_hover_text("Restart into the BIOS, or shut down so the next start opens the BIOS.").clicked() {
+                        self.power = Some(power::PowerDialog::new());
+                    }
+                    let b = theme::danger_button("⟲  Reset GPU to stock").min_size(egui::vec2(ui.available_width(), 34.0));
+                    if ui.add(b).on_hover_text("Puts the RTX 5080 back on the Stock preset: no undervolt, no memory overclock.").clicked() {
+                        common::GPU_RESET_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
+                        go = gpu_index;
+                    }
                     ui.horizontal(|ui| {
                         ui.add_space(4.0);
                         if self.admin {
@@ -140,12 +206,36 @@ impl eframe::App for App {
                             theme::chip(ui, "View only (not admin)", theme::LOCKED);
                         }
                     });
-                    let b = theme::danger_button("⟲  Reset GPU to stock").min_size(egui::vec2(ui.available_width(), 34.0));
-                    if ui.add(b).on_hover_text("Puts the RTX 5080 back on the Stock preset: no undervolt, no memory overclock.").clicked() {
-                        common::GPU_RESET_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
-                        go = gpu_index;
+                });
+                // header + tabs scroll when the window is too short for all of them
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("PC").size(22.0).strong().color(theme::ACCENT));
+                        ui.label(egui::RichText::new("Tuner").size(22.0).strong().color(theme::TEXT));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("gaming-safe Windows tuning").size(11.5).color(theme::TEXT_FAINT));
+                    });
+                    ui.add_space(14.0);
+                    for (i, t) in self.tabs.iter().enumerate() {
+                        let top = ui.cursor().min;
+                        if Self::nav_row(ui, tab_icon(t.title()), t.title(), self.active == i) {
+                            go = Some(i);
+                        }
+                        // keep the active tab in view when it changes (e.g. opened by the Reset GPU button)
+                        if self.active == i && self.nav_shown != Some(i) {
+                            let clip = ui.clip_rect();
+                            if top.y >= clip.top() && top.y + 36.0 <= clip.bottom() {
+                                self.nav_shown = Some(i);
+                            } else {
+                                ui.scroll_to_rect(egui::Rect::from_min_size(top, egui::vec2(1.0, 36.0)), None);
+                                ui.ctx().request_repaint();
+                            }
+                        }
                     }
-                    ui.separator();
                 });
             });
         if let Some(i) = go {
@@ -162,6 +252,18 @@ impl eframe::App for App {
             self.tabs[self.active].ui(ui);
         });
 
+        if let Some(p) = &mut self.power {
+            if !p.show(ctx) {
+                self.power = None;
+            }
+        }
+
+        for n in common::take_notices() {
+            self.notice = Some(add_notice(self.notice.take(), &n));
+        }
+        common::message_ui(ctx, "PC Tuner", &mut self.notice);
+
+        self.close_guard(ctx, now);
         self.selftest_step(ctx);
     }
 
@@ -206,8 +308,10 @@ impl App {
             log(format!("screenshot: {name}"));
         }
         if idx >= self.tabs.len() {
+            log(format!("ok: {}", self.tabs[self.active].title()));
             log("selftest finished".into());
             self.selftest = None;
+            self.force_close = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -215,15 +319,50 @@ impl App {
             log(format!("ok: {}", self.tabs[self.active].title()));
             self.active = idx;
         }
-        // one screenshot near the end of each tab's slot
+        // one screenshot per tab, near the end of its slot (a slow frame past that point still gets it)
         let into = secs - idx as f32 * per_tab;
-        if into > per_tab - 2.0 && into < per_tab - 1.5 {
+        if into > per_tab - 2.0 && self.selftest_shot != Some(idx) {
+            self.selftest_shot = Some(idx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
         }
     }
 }
 
 /// Minimal 24-bit BMP writer (no image crate needed).
+/// The open notice text with `n` added as a new paragraph: a paragraph already shown is not
+/// repeated, and the whole text stays at most NOTICE_DIALOG_MAX characters.
+const NOTICE_DIALOG_MAX: usize = 8000;
+fn add_notice(old: Option<String>, n: &str) -> String {
+    let n = common::cap_text(n, common::NOTICE_MAX_CHARS);
+    let Some(old) = old else { return n };
+    if old.split("\n\n").any(|p| p == n) || (old.ends_with("...") && old.chars().count() >= NOTICE_DIALOG_MAX) {
+        return old;
+    }
+    common::cap_text(&format!("{old}\n\n{n}"), NOTICE_DIALOG_MAX)
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::add_notice;
+
+    #[test]
+    fn main_notice_dialog_deduplicates_and_caps() {
+        let a = add_notice(None, "file could not be read");
+        let b = add_notice(Some(a.clone()), "file could not be read");
+        assert_eq!(a, b);
+        let c = add_notice(Some(b), "other");
+        assert_eq!(c, "file could not be read\n\nother");
+        let mut t = None;
+        for i in 0..1000 {
+            t = Some(add_notice(t, &format!("notice number {i} {}", "x".repeat(50))));
+        }
+        let t = t.unwrap();
+        assert!(t.chars().count() <= super::NOTICE_DIALOG_MAX);
+        assert!(t.ends_with("..."));
+        assert!(add_notice(None, &"y".repeat(10_000)).chars().count() <= crate::common::NOTICE_MAX_CHARS);
+    }
+}
+
 fn save_bmp(path: &std::path::Path, img: &egui::ColorImage) -> std::io::Result<()> {
     let (w, h) = (img.size[0] as u32, img.size[1] as u32);
     let row = (w * 3 + 3) & !3;
@@ -248,6 +387,15 @@ fn save_bmp(path: &std::path::Path, img: &egui::ColorImage) -> std::io::Result<(
 
 fn main() -> eframe::Result<()> {
     // `PCTuner.exe --gpu-guard [--dry-run]`: the sign-in check of the GPU trial (no window).
+    // windows_subsystem = "windows" hides stderr: keep panic messages in %LOCALAPPDATA%\PCTuner\panic.log
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(common::data_dir().join("panic.log")).and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{} {info}", common::now())
+        });
+        default_hook(info);
+    }));
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--gpu-guard") {
         std::process::exit(gpu::guard_main(args.iter().any(|a| a == "--dry-run")));

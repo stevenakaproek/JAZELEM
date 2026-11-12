@@ -7,6 +7,8 @@ use crate::theme;
 use eframe::egui::{self, RichText};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PATH_REFRESH: &str = "$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')";
@@ -82,20 +84,21 @@ pub struct Tree {
 
 const TREE_SCRIPT: &str = r#"
 $all = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)
-$props = @($all | Get-PnpDeviceProperty -KeyName DEVPKEY_Device_Parent, DEVPKEY_Device_LocationInfo, DEVPKEY_Device_LocationPaths, DEVPKEY_Device_BusReportedDeviceDesc -ErrorAction SilentlyContinue)
-$parent = @{}; $locInfo = @{}; $locPath = @{}; $busDesc = @{}
-foreach ($p in $props) {
-    switch ($p.KeyName) {
-        'DEVPKEY_Device_Parent'               { $parent[$p.InstanceId] = [string]$p.Data }
-        'DEVPKEY_Device_LocationInfo'         { $locInfo[$p.InstanceId] = [string]$p.Data }
-        'DEVPKEY_Device_LocationPaths'        { $locPath[$p.InstanceId] = [string](@($p.Data)[0]) }
-        'DEVPKEY_Device_BusReportedDeviceDesc'{ $busDesc[$p.InstanceId] = [string]$p.Data }
-    }
-}
+# One CIM session and one GetDeviceProperties call per device: about 1.5 s for 200 devices, where piping
+# them into Get-PnpDeviceProperty took 12-30 s (it is slow per pipeline item). Same data.
+$keys = [string[]]@('DEVPKEY_Device_Parent', 'DEVPKEY_Device_LocationInfo', 'DEVPKEY_Device_LocationPaths', 'DEVPKEY_Device_BusReportedDeviceDesc')
+$sp = @{}
+try { $sp.CimSession = New-CimSession -ErrorAction Stop } catch {}
 foreach ($d in $all) {
+    $v = @{}
+    try {
+        $r = Invoke-CimMethod @sp -InputObject $d -MethodName GetDeviceProperties -Arguments @{ devicePropertyKeys = $keys } -ErrorAction Stop
+        foreach ($p in @($r.deviceProperties)) { if ($p -and $p.KeyName) { $v[[string]$p.KeyName] = $p.Data } }
+    } catch {}
     $i = $d.InstanceId
-    [pscustomobject]@{ Id = [string]$i; Name = [string]$d.FriendlyName; Class = [string]$d.Class; Parent = [string]$parent[$i]; LocInfo = [string]$locInfo[$i]; LocPath = [string]$locPath[$i]; BusDesc = [string]$busDesc[$i] }
+    [pscustomobject]@{ Id = [string]$i; Name = [string]$d.FriendlyName; Class = [string]$d.Class; Parent = [string]$v['DEVPKEY_Device_Parent']; LocInfo = [string]$v['DEVPKEY_Device_LocationInfo']; LocPath = [string](@($v['DEVPKEY_Device_LocationPaths'])[0]); BusDesc = [string]$v['DEVPKEY_Device_BusReportedDeviceDesc'] }
 }
+if ($sp.CimSession) { Remove-CimSession $sp.CimSession }
 "#;
 
 impl Tree {
@@ -111,7 +114,7 @@ impl Tree {
         Tree { nodes, by_id, children }
     }
 
-    /// One PowerShell call (~8 s): every present device plus parent / location / bus description.
+    /// One PowerShell call (2-4 s including PowerShell start-up): every present device plus parent / location / bus description.
     pub fn load() -> Result<Tree, String> {
         let raw: Vec<RawNode> = common::ps_json(&format!("{PATH_REFRESH}\n{TREE_SCRIPT}"))?;
         let nodes: Vec<Node> = raw
@@ -168,19 +171,20 @@ fn has_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| t.contains(&n.to_lowercase()))
 }
 
-/// Case-insensitive "word\b" match: the needle followed by a non-word character or the end.
-fn has_word_end(text: &str, needle: &str) -> bool {
+/// Case-insensitive whole-word match: a non-word character (or the start / end) on both sides of the needle.
+fn has_word(text: &str, needle: &str) -> bool {
     let t = text.to_lowercase();
     let n = needle.to_lowercase();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
     let mut start = 0;
     while let Some(p) = t[start..].find(&n) {
-        let end = start + p + n.len();
-        match t[end..].chars().next() {
-            None => return true,
-            Some(c) if !(c.is_alphanumeric() || c == '_') => return true,
-            _ => {}
+        let at = start + p;
+        let left_ok = t[..at].chars().next_back().map_or(true, |c| !is_word(c));
+        let right_ok = t[at + n.len()..].chars().next().map_or(true, |c| !is_word(c));
+        if left_ok && right_ok {
+            return true;
         }
-        start = start + p + 1;
+        start = at + 1;
         while !t.is_char_boundary(start) {
             start += 1;
         }
@@ -189,12 +193,12 @@ fn has_word_end(text: &str, needle: &str) -> bool {
 }
 
 pub fn get_kind(text: &str) -> &'static str {
-    if has_any(text, &["Xbox", "Controller", "Gamepad", "XINPUT", "DualSense", "DualShock", "8BitDo", "Joystick", "Wireless Adapter"]) {
+    // Specific words only: a bare "Controller" also matched "HID-compliant system controller" (mice, keyboards)
+    // and "Wireless Adapter" matched Wi-Fi dongles.
+    if has_any(text, &["Xbox", "Game Controller", "Wireless Controller", "Gamepad", "XINPUT", "DualSense", "DualShock", "8BitDo", "Joystick"]) {
         return "GAME CONTROLLER";
     }
-    if has_any(text, &["Audio", "Headset", "Headphone", "Arctis", "DAC", "Speaker", "Sound", "Microphone", "HyperX", "Astro", "SteelSeries", "Logitech G"])
-        || has_word_end(text, "Mic")
-    {
+    if has_any(text, &["Audio", "Headset", "Headphone", "Arctis", "Speaker", "Sound", "Microphone"]) || has_word(text, "Mic") || has_word(text, "DAC") {
         return "AUDIO";
     }
     if has(text, "Mouse") {
@@ -203,7 +207,11 @@ pub fn get_kind(text: &str) -> &'static str {
     if has(text, "Keyboard") {
         return "keyboard";
     }
-    if has_any(text, &["Mass Storage", "Disk", "Flash", "Card Reader", "UAS"]) {
+    // Brand-only hints come after mouse / keyboard: HyperX and SteelSeries also make mice and keyboards.
+    if has_any(text, &["HyperX", "SteelSeries", "Logitech G"]) || has_word(text, "Astro") {
+        return "AUDIO";
+    }
+    if has_any(text, &["Mass Storage", "Disk", "Flash", "Card Reader"]) || has_word(text, "UAS") {
         return "storage";
     }
     if has(text, "Bluetooth") {
@@ -252,6 +260,12 @@ pub fn controllers(tree: &Tree) -> Vec<Controller> {
         })
         .map(|n| Controller { id: n.id.clone(), name: n.name.clone(), tier: controller_tier(tree, &n.id), path: n.loc_path.clone() })
         .collect()
+}
+
+/// A USB4 host router is not a place devices plug into: USB devices on the USB4 ports enumerate under the
+/// add-on chip's own xHCI controller, so the router itself always has 0 devices.
+pub fn is_router(c: &Controller) -> bool {
+    has(&c.name, "Host Router")
 }
 
 #[derive(Clone, Debug)]
@@ -359,18 +373,21 @@ pub fn verdict(d: &UsbDevice) -> String {
 
 // ------------------------------------------------------------------ plug-in test
 
-/// Present USB\VID_* ids (no &MI_ interfaces), upper-cased.
-fn present_usb_ids() -> Result<HashSet<String>, String> {
+/// Present USB\VID_* ids (no &MI_ interfaces), upper-cased, each with its parent (hub / root hub) at this moment.
+/// The parent is recorded at detection time so a device that is moved while its port is being read is noticed.
+fn present_usb_ids() -> Result<HashMap<String, String>, String> {
     #[derive(Deserialize)]
     struct Id {
         #[serde(rename = "Id", default)]
         id: Option<String>,
+        #[serde(rename = "Parent", default)]
+        parent: Option<String>,
     }
     let script = format!(
-        "{PATH_REFRESH}\nGet-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {{ $_.InstanceId -like 'USB\\VID_*' -and $_.InstanceId -notmatch '&MI_' }} | ForEach-Object {{ [pscustomobject]@{{ Id = [string]$_.InstanceId }} }}"
+        "{PATH_REFRESH}\n$sp = @{{}}; try {{ $sp.CimSession = New-CimSession -ErrorAction Stop }} catch {{}}\nGet-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {{ $_.InstanceId -like 'USB\\VID_*' -and $_.InstanceId -notmatch '&MI_' }} | ForEach-Object {{ $par = ''; try {{ $r = Invoke-CimMethod @sp -InputObject $_ -MethodName GetDeviceProperties -Arguments @{{ devicePropertyKeys = [string[]]@('DEVPKEY_Device_Parent') }} -ErrorAction Stop; $par = [string](@($r.deviceProperties)[0].Data) }} catch {{}}; [pscustomobject]@{{ Id = [string]$_.InstanceId; Parent = $par }} }}\nif ($sp.CimSession) {{ Remove-CimSession $sp.CimSession }}"
     );
     let v: Vec<Id> = common::ps_json(&script)?;
-    Ok(v.into_iter().filter_map(|i| i.id).map(|s| s.to_uppercase()).collect())
+    Ok(v.into_iter().filter_map(|i| Some((i.id?.to_uppercase(), i.parent.unwrap_or_default().to_uppercase()))).collect())
 }
 
 struct LogEntry {
@@ -391,31 +408,76 @@ struct TickResult {
     error: Option<String>,
 }
 
-/// One watch tick: compare the present ids with `seen`; for new ones wait, rebuild the tree and report them.
-fn watch_tick(mut seen: HashSet<String>, first: bool) -> TickResult {
+/// What a tick does with a fresh id snapshot: either it is finished, or it has new ids (with their parent at
+/// detection time) whose port must be read. Pure, so it can be tested without real devices.
+enum Step {
+    Done(TickResult),
+    Lookup { seen: HashSet<String>, new: Vec<(String, String)> },
+}
+
+fn snapshot_step(mut seen: HashSet<String>, now: HashMap<String, String>, first: bool) -> Step {
+    let done = |seen, error: Option<&str>| Step::Done(TickResult { seen, found: vec![], map: None, error: error.map(String::from) });
+    if now.is_empty() {
+        // The device being tested is always plugged in somewhere, so an empty read is a glitch, not "everything
+        // was unplugged". On the first tick it must not become the baseline (every device would then look new).
+        return if first { done(seen, Some("No USB devices were found yet - retrying the snapshot...")) } else { done(seen, None) };
+    }
+    if first {
+        return done(now.into_keys().collect(), None);
+    }
+    let mut new: Vec<(String, String)> = now.iter().filter(|(i, _)| !seen.contains(*i)).map(|(i, p)| (i.clone(), p.clone())).collect();
+    new.sort();
+    seen.retain(|k| now.contains_key(k)); // unplugged -> forget, so re-plugging is detected
+    if new.is_empty() {
+        return done(seen, None);
+    }
+    Step::Lookup { seen, new }
+}
+
+/// Match new ids against a freshly read tree. Returns the devices to report and the ids that are settled.
+/// An id is settled only when the tree shows it under the same parent it had when it was detected; one that is
+/// gone (unplugged in transit) or sits under a different parent (moved while the tree was read) is left out, so
+/// the next tick tries it again and its row gets the port it is really in.
+fn resolve_hits(new: &[(String, String)], tree: &Tree, map: &Map) -> (Vec<UsbDevice>, Vec<String>) {
+    let mut found = vec![];
+    let mut settled = vec![];
+    for (id, parent) in new {
+        let Some(node) = tree.get(id) else { continue };
+        if !parent.is_empty() && !node.parent.eq_ignore_ascii_case(parent) {
+            continue;
+        }
+        settled.push(id.clone());
+        if let Some(d) = map.devices.iter().find(|d| d.id.eq_ignore_ascii_case(id)) {
+            found.push(d.clone());
+        }
+    }
+    (found, settled)
+}
+
+/// One watch tick: compare the present ids with `seen`; for new ones wait, read the tree and report them.
+/// `reading` is raised while the port of a new device is being read, so the UI can say so.
+fn watch_tick(seen: HashSet<String>, first: bool, reading: Arc<AtomicBool>) -> TickResult {
     let now = match present_usb_ids() {
         Ok(n) => n,
         Err(e) => return TickResult { seen, found: vec![], map: None, error: Some(e) },
     };
-    if first {
-        return TickResult { seen: now, found: vec![], map: None, error: None };
-    }
-    let new: Vec<String> = now.iter().filter(|i| !seen.contains(*i)).cloned().collect();
-    seen.retain(|k| now.contains(k)); // unplugged -> forget, so re-plugging is detected
-    if new.is_empty() {
-        return TickResult { seen, found: vec![], map: None, error: None };
-    }
+    let (mut seen, new) = match snapshot_step(seen, now, first) {
+        Step::Done(r) => return r,
+        Step::Lookup { seen, new } => (seen, new),
+    };
+    reading.store(true, Ordering::Relaxed);
     std::thread::sleep(Duration::from_millis(800)); // let Windows finish enumerating the device
-    let (found, map, error) = match Tree::load() {
+    let r = match Tree::load() {
         Ok(tree) => {
             let map = build_map(&tree);
-            let found: Vec<UsbDevice> = map.devices.iter().filter(|d| new.contains(&d.id.to_uppercase())).cloned().collect();
-            (found, Some(map), None)
+            let (found, settled) = resolve_hits(&new, &tree, &map);
+            seen.extend(settled);
+            TickResult { seen, found, map: Some(map), error: None }
         }
-        Err(e) => (vec![], None, Some(e)),
+        Err(e) => TickResult { seen, found: vec![], map: None, error: Some(e) },
     };
-    seen.extend(new);
-    TickResult { seen, found, map, error }
+    reading.store(false, Ordering::Relaxed);
+    r
 }
 
 struct Watch {
@@ -424,6 +486,8 @@ struct Watch {
     job: Option<Job<TickResult>>,
     next: Instant,
     count: usize,
+    /// Set by the tick thread while it reads the port of a device that was just plugged in.
+    reading: Arc<AtomicBool>,
 }
 
 // ------------------------------------------------------------------ tab
@@ -431,6 +495,8 @@ struct Watch {
 pub struct UsbTab {
     map: Option<Map>,
     map_job: Option<Job<Result<Map, String>>>,
+    /// When the running full scan started (drives the live seconds in the hero card).
+    scan_started: Option<Instant>,
     error: Option<String>,
     watch: Option<Watch>,
     log: Vec<LogEntry>,
@@ -472,7 +538,7 @@ fn key_devices(m: &Map) -> Vec<&UsbDevice> {
 
 impl UsbTab {
     pub fn new() -> Self {
-        let mut tab = UsbTab { map: None, map_job: None, error: None, watch: None, log: vec![], watch_error: None };
+        let mut tab = UsbTab { map: None, map_job: None, scan_started: None, error: None, watch: None, log: vec![], watch_error: None };
         if crate::opwin::demo_stage("usb").is_some() {
             // sample plug-in test hits for screenshots (the newest one stays highlighted)
             let ctl = "AMD USB 3.10 eXtensible Host Controller - 1.20 (Microsoft)";
@@ -484,6 +550,7 @@ impl UsbTab {
 
     fn start_scan(&mut self) {
         self.error = None;
+        self.scan_started = Some(Instant::now());
         self.map_job = Some(Job::spawn(load_map));
     }
 
@@ -502,7 +569,10 @@ impl UsbTab {
             if let Some(r) = j.poll() {
                 w.job = None;
                 w.seen = r.seen;
-                w.seeded = true;
+                // only a valid snapshot becomes the baseline; after an error the next tick takes it again
+                if r.error.is_none() {
+                    w.seeded = true;
+                }
                 w.next = Instant::now() + Duration::from_millis(1500);
                 self.watch_error = r.error;
                 for d in r.found {
@@ -517,7 +587,8 @@ impl UsbTab {
         if w.job.is_none() && Instant::now() >= w.next {
             let seen = w.seen.clone();
             let first = !w.seeded;
-            w.job = Some(Job::spawn(move || watch_tick(seen, first)));
+            let reading = w.reading.clone();
+            w.job = Some(Job::spawn(move || watch_tick(seen, first, reading)));
         }
     }
 
@@ -530,7 +601,9 @@ impl UsbTab {
                     theme::hero(ui, "?", "controller and headset", "The USB tree could not be read", theme::LOCKED);
                     ui.colored_label(theme::LOCKED, e);
                 } else {
-                    theme::hero(ui, "...", "controller and headset", "Reading the USB tree... (about 8 seconds)", theme::TEXT_FAINT);
+                    // live elapsed seconds, so the hint can never be wrong (the read usually takes 2-4 s)
+                    let secs = self.scan_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                    theme::hero(ui, "...", "controller and headset", &format!("Reading the USB tree... {secs} s (usually a few seconds)"), theme::TEXT_FAINT);
                     theme::sweep(ui, ui.available_width());
                 }
                 return;
@@ -569,7 +642,7 @@ impl UsbTab {
                 for d in key.iter().take(2) {
                     stat_fit(ui, 22.0, &format!("Tier {}", d.tier), &shorten(&d.name, 24), tier_color(d.tier));
                 }
-                stat_fit(ui, 22.0, &m.controllers.len().to_string(), "USB controllers", theme::TEXT);
+                stat_fit(ui, 22.0, &m.controllers.iter().filter(|c| !is_router(c)).count().to_string(), "USB controllers", theme::TEXT);
                 stat_fit(ui, 22.0, &m.devices.len().to_string(), "USB devices", theme::TEXT);
             });
         });
@@ -580,7 +653,7 @@ impl UsbTab {
         theme::card(ui, |ui| {
             ui.set_width(ui.available_width());
             theme::section(ui, "Plug-in test");
-            ui.label(RichText::new("Find out which physical socket is which tier: plug any USB device (a flash drive or your controller) into a port, wait 2 seconds, then move it to the next port.").color(theme::TEXT_DIM));
+            ui.label(RichText::new("Find out which physical socket is which tier: plug any USB device (a flash drive or your controller) into a port, wait until its row appears below, then move it to the next port.").color(theme::TEXT_DIM));
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 let watching = self.watch.is_some();
@@ -591,13 +664,20 @@ impl UsbTab {
                     } else {
                         self.log.clear();
                         self.watch_error = None;
-                        self.watch = Some(Watch { seen: HashSet::new(), seeded: false, job: None, next: Instant::now(), count: 0 });
+                        self.watch = Some(Watch { seen: HashSet::new(), seeded: false, job: None, next: Instant::now(), count: 0, reading: Arc::new(AtomicBool::new(false)) });
                     }
                 }
                 match &self.watch {
                     Some(w) => {
                         ui.add(egui::Spinner::new().size(14.0));
-                        ui.label(RichText::new(if w.seeded { "Watching for new devices..." } else { "Taking a snapshot of the connected devices..." }).color(theme::TEXT_DIM));
+                        let text = if !w.seeded {
+                            "Taking a snapshot of the connected devices..."
+                        } else if w.reading.load(Ordering::Relaxed) {
+                            "New device found - reading its port... keep it plugged in"
+                        } else {
+                            "Watching for new devices..."
+                        };
+                        ui.label(RichText::new(text).color(theme::TEXT_DIM));
                     }
                     None if !self.log.is_empty() => {
                         ui.label(RichText::new(format!("{} port(s) tested", self.log.len())).color(theme::TEXT_DIM));
@@ -666,8 +746,13 @@ impl UsbTab {
                 let n = m.devices.iter().filter(|d| d.ctl_id.eq_ignore_ascii_case(&c.id)).count();
                 ui.horizontal(|ui| {
                     chip_col(ui, 150.0, tier_short(c.tier), tier_color(c.tier));
-                    ui.label(RichText::new(&c.name).color(theme::TEXT));
-                    ui.label(RichText::new(if n == 1 { "1 device".to_string() } else { format!("{n} devices") }).color(if n == 0 { theme::TEXT_FAINT } else { theme::TEXT_DIM }));
+                    if is_router(c) {
+                        ui.label(RichText::new(&c.name).color(theme::TEXT_DIM));
+                        ui.label(RichText::new("USB4 router - devices on these ports appear under the add-on chip's USB controller").color(theme::TEXT_FAINT));
+                    } else {
+                        ui.label(RichText::new(&c.name).color(theme::TEXT));
+                        ui.label(RichText::new(if n == 1 { "1 device".to_string() } else { format!("{n} devices") }).color(if n == 0 { theme::TEXT_FAINT } else { theme::TEXT_DIM }));
+                    }
                 })
                 .response
                 .on_hover_text(format!("{}\n{}", c.id, c.path));
@@ -774,6 +859,114 @@ mod tests {
         assert_eq!(get_kind("Generic USB Hub"), "hub");
         assert_eq!(get_kind("SanDisk Flash"), "storage");
         assert_eq!(get_kind("thing"), "");
+        // false positives found in testing
+        assert_eq!(get_kind("Microsoft Ergonomic Keyboard"), "keyboard");
+        assert_eq!(get_kind("HyperX Pulsefire Haste HID-compliant mouse"), "mouse");
+        assert_eq!(get_kind("SteelSeries Apex 7 HID Keyboard Device"), "keyboard");
+        assert_eq!(get_kind("TP-Link Wireless Adapter 802.11ac"), "");
+        assert_ne!(get_kind("USB Input Device HID-compliant system controller"), "GAME CONTROLLER");
+        assert_eq!(get_kind("USB Input Device HID-compliant system controller"), "");
+        assert_eq!(get_kind("USB Input Device HID-compliant game controller"), "GAME CONTROLLER");
+        assert_eq!(get_kind("Xbox Wireless Adapter for Windows"), "GAME CONTROLLER");
+        assert_eq!(get_kind("Sony Wireless Controller"), "GAME CONTROLLER");
+        assert_eq!(get_kind("HyperX Cloud Alpha Wireless"), "AUDIO");
+        assert_eq!(get_kind("Astro A50 Voice"), "AUDIO");
+        assert_eq!(get_kind("FiiO K5 Pro DAC"), "AUDIO");
+        assert_eq!(get_kind("Dacia thing"), "");
+        assert_eq!(get_kind("USB Attached SCSI (UAS) Device"), "storage");
+        assert_eq!(get_kind("Guaspari"), "");
+    }
+
+    #[test]
+    fn word_boundaries() {
+        assert!(has_word("USB Mic", "mic"));
+        assert!(has_word("Mic (Arctis)", "Mic"));
+        assert!(!has_word("Ergonomic", "Mic"));
+        assert!(!has_word("Microsoft", "Mic"));
+        assert!(has_word("ergonomic mic", "Mic")); // a later whole-word hit after a partial one
+    }
+
+    fn node(id: &str, name: &str, class: &str, parent: &str, loc_info: &str, loc_path: &str) -> Node {
+        Node { id: id.into(), name: name.into(), class: class.into(), parent: parent.into(), loc_info: loc_info.into(), loc_path: loc_path.into(), bus_desc: String::new() }
+    }
+
+    /// Two xHCI controllers (one CPU, one chipset), a USB4 host router and one flash drive.
+    fn sample_tree(drive_parent: &str) -> Tree {
+        Tree::from_nodes(vec![
+            node("PCI\\ROOT", "PCI root", "System", "", "", "PCIROOT(0)"),
+            node("PCI\\VEN_1022&DEV_15B6\\CPU", "AMD USB 3.10 eXtensible Host Controller - 1.10 (Microsoft)", "USB", "PCI\\ROOT", "", "PCIROOT(0)#PCI(0801)#PCI(0003)"),
+            node("PCI\\VEN_1022&DEV_43F4\\UP", "Promontory upstream", "System", "PCI\\ROOT", "", "PCIROOT(0)#PCI(0201)"),
+            node("PCI\\VEN_1022&DEV_43FD\\CHIP", "AMD USB 3.20 eXtensible Host Controller - 1.20 (Microsoft)", "USB", "PCI\\VEN_1022&DEV_43F4\\UP", "", "PCIROOT(0)#PCI(0201)#PCI(0000)#PCI(0C00)#PCI(0000)"),
+            node("PCI\\VEN_8086&DEV_ROUTER\\R", "USB4(TM) Host Router (Microsoft)", "System", "PCI\\ROOT", "", "PCIROOT(0)#PCI(0101)#PCI(0000)"),
+            node("USB\\ROOT_HUB30\\A", "USB Root Hub (USB 3.0)", "USB", "PCI\\VEN_1022&DEV_15B6\\CPU", "", ""),
+            node("USB\\ROOT_HUB30\\B", "USB Root Hub (USB 3.0)", "USB", "PCI\\VEN_1022&DEV_43FD\\CHIP", "", ""),
+            node("USB\\VID_0781&PID_5581\\SERIAL1", "USB Mass Storage Device", "USB", drive_parent, "Port_#0002.Hub_#0001", ""),
+        ])
+    }
+
+    #[test]
+    fn router_is_not_counted_as_a_place_to_plug_in() {
+        let m = build_map(&sample_tree("USB\\ROOT_HUB30\\A"));
+        assert_eq!(m.controllers.len(), 3);
+        assert_eq!(m.controllers.iter().filter(|c| !is_router(c)).count(), 2);
+        assert_eq!(m.devices.len(), 1);
+        assert_eq!(m.devices[0].tier, 1);
+    }
+
+    #[test]
+    fn hit_is_settled_only_where_it_was_detected() {
+        let id = "USB\\VID_0781&PID_5581\\SERIAL1".to_string();
+        // still on the port it was detected on -> reported and settled
+        let t = sample_tree("USB\\ROOT_HUB30\\A");
+        let m = build_map(&t);
+        let (found, settled) = resolve_hits(&[(id.clone(), "USB\\ROOT_HUB30\\A".into())], &t, &m);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].tier, 1);
+        assert_eq!(settled, vec![id.clone()]);
+        // moved to the chipset port while the tree was read -> not reported, retried next tick
+        let t = sample_tree("USB\\ROOT_HUB30\\B");
+        let m = build_map(&t);
+        let (found, settled) = resolve_hits(&[(id.clone(), "USB\\ROOT_HUB30\\A".into())], &t, &m);
+        assert!(found.is_empty() && settled.is_empty());
+        // unplugged in transit -> not reported, not settled
+        let (found, settled) = resolve_hits(&[("USB\\VID_1234&PID_0001\\GONE".into(), String::new())], &t, &m);
+        assert!(found.is_empty() && settled.is_empty());
+    }
+
+    #[test]
+    fn snapshot_rules() {
+        let ids = |v: &[&str]| -> HashMap<String, String> { v.iter().map(|s| (s.to_string(), "P".to_string())).collect() };
+        // an empty first snapshot is an error and does not become the baseline
+        match snapshot_step(HashSet::new(), HashMap::new(), true) {
+            Step::Done(r) => assert!(r.error.is_some() && r.seen.is_empty()),
+            _ => panic!("expected Done"),
+        }
+        // a valid first snapshot is the baseline
+        let seen = match snapshot_step(HashSet::new(), ids(&["A", "B"]), true) {
+            Step::Done(r) => {
+                assert!(r.error.is_none());
+                r.seen
+            }
+            _ => panic!("expected Done"),
+        };
+        assert_eq!(seen.len(), 2);
+        // an empty read mid-run keeps the baseline instead of clearing it
+        let seen = match snapshot_step(seen, HashMap::new(), false) {
+            Step::Done(r) => {
+                assert!(r.error.is_none());
+                r.seen
+            }
+            _ => panic!("expected Done"),
+        };
+        assert_eq!(seen.len(), 2);
+        // A unplugged, C plugged in -> C is looked up, A forgotten
+        match snapshot_step(seen, ids(&["B", "C"]), false) {
+            Step::Lookup { seen, new } => {
+                assert_eq!(new, vec![("C".to_string(), "P".to_string())]);
+                assert!(seen.contains("B") && !seen.contains("A") && !seen.contains("C"));
+            }
+            _ => panic!("expected Lookup"),
+        }
     }
 
     /// Read-only: builds the real device tree and prints it (`cargo test usb -- --nocapture`).
@@ -801,5 +994,14 @@ mod tests {
             println!("  {}: {} -> {}", d.kind, d.name, verdict(d));
         }
         assert!(!m.controllers.is_empty());
+        // the plug-in test's snapshot: same ids as the tree, each with the parent the tree has
+        let t0 = Instant::now();
+        let ids = present_usb_ids().expect("ids");
+        println!("\nsnapshot of {} USB ids in {:.1} s", ids.len(), t0.elapsed().as_secs_f32());
+        assert!(!ids.is_empty());
+        for (id, parent) in &ids {
+            let n = tree.get(id).expect("id in tree");
+            assert!(n.parent.eq_ignore_ascii_case(parent), "{id}: {parent} vs {}", n.parent);
+        }
     }
 }

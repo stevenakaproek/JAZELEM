@@ -143,8 +143,49 @@ struct State {
     hz_max: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
+    /// name of the monitor whose refresh rate is shown (filled in by `read_state`)
     monitor: String,
+    /// device interface id of the active monitor on the primary display, as EnumDisplayDevices gives it
+    display_id: String,
+    /// every monitor WMI knows about
+    monitors: Vec<Monitor>,
     error: Option<String>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+struct Monitor {
+    /// WmiMonitorID InstanceName, e.g. `DISPLAY\AUS274F\5&148b3217&1&UID4353_0`
+    instance: String,
+    name: String,
+    active: bool,
+}
+
+/// `\\?\DISPLAY#AUS274F#5&148b3217&1&UID4353#{e6f07b5f-...}` -> `DISPLAY\AUS274F\5&148B3217&1&UID4353`.
+fn display_key(id: &str) -> Option<String> {
+    let s = id.trim();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(s);
+    let s = match s.rfind("#{") {
+        Some(i) => &s[..i],
+        None => s,
+    };
+    let key = s.replace('#', "\\").to_ascii_uppercase();
+    key.starts_with("DISPLAY\\").then_some(key)
+}
+
+/// Name of the monitor on the measured display. Falls back to an active PG27AQWP (so its 540 Hz
+/// note can still show), otherwise empty - never an unrelated first monitor.
+fn pick_monitor(display_id: &str, monitors: &[Monitor]) -> String {
+    if let Some(key) = display_key(display_id) {
+        let hit = monitors.iter().find(|m| {
+            let inst = m.instance.to_ascii_uppercase();
+            inst.strip_prefix(&key).is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+        });
+        if let Some(m) = hit {
+            return m.name.clone();
+        }
+    }
+    monitors.iter().find(|m| m.active && m.name.to_ascii_uppercase().contains("PG27AQWP")).map(|m| m.name.clone()).unwrap_or_default()
 }
 
 /// Value of one `Key=Value;` pair in the DirectX settings string.
@@ -253,6 +294,14 @@ Add-Type -Namespace PCTRead -Name Native -MemberDefinition @'
   public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
   public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight; }
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplaySettings(string dev, int mode, ref DEVMODE dm);
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct DISPLAY_DEVICE {
+  public int cb;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+  public int StateFlags;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey; }
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplayDevices(string dev, uint i, ref DISPLAY_DEVICE dd, uint flags);
 '@
 $o = [ordered]@{}
 $o.dx = RegS 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' 'DirectXUserGlobalSettings'
@@ -291,26 +340,45 @@ $o.pcie_aspm = AcIndex '501a4d13-42af-4429-9fd1-a8218c268e20' 'ee12f906-d277-404
 $dm = New-Object PCTRead.Native+DEVMODE; $dm.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($dm)
 # [NullString]::Value: PowerShell would pass $null as "" (no such display)
 $nodev = [NullString]::Value
-if ([PCTRead.Native]::EnumDisplaySettings($nodev, -1, [ref]$dm)) {
+# the primary display (attached 0x1 + primary 0x4): its refresh rate and its monitor come from one device
+$disp = $nodev; $o.display_id = ''
+$dd = New-Object PCTRead.Native+DISPLAY_DEVICE; $dd.cb = [Runtime.InteropServices.Marshal]::SizeOf($dd)
+for ($a = 0; $a -lt 64 -and [PCTRead.Native]::EnumDisplayDevices($nodev, [uint32]$a, [ref]$dd, 0); $a++) {
+  if (($dd.StateFlags -band 5) -eq 5) { $disp = $dd.DeviceName; break }
+}
+if ($disp -is [string] -and $disp) {
+  $md = New-Object PCTRead.Native+DISPLAY_DEVICE; $md.cb = $dd.cb
+  # EDD_GET_DEVICE_INTERFACE_NAME = 1; the first active (0x1) monitor on that output
+  for ($j = 0; $j -lt 16 -and [PCTRead.Native]::EnumDisplayDevices($disp, [uint32]$j, [ref]$md, 1); $j++) {
+    if ($md.StateFlags -band 1) { $o.display_id = [string]$md.DeviceID; break }
+  }
+}
+if ([PCTRead.Native]::EnumDisplaySettings($disp, -1, [ref]$dm)) {
   $o.hz_now = $dm.dmDisplayFrequency; $o.width = $dm.dmPelsWidth; $o.height = $dm.dmPelsHeight
   $max = 0; $i = 0; $m = New-Object PCTRead.Native+DEVMODE; $m.dmSize = $dm.dmSize
-  while ([PCTRead.Native]::EnumDisplaySettings($nodev, $i, [ref]$m)) {
+  while ([PCTRead.Native]::EnumDisplaySettings($disp, $i, [ref]$m)) {
     if ($m.dmPelsWidth -eq $dm.dmPelsWidth -and $m.dmPelsHeight -eq $dm.dmPelsHeight -and $m.dmDisplayFrequency -gt $max) { $max = $m.dmDisplayFrequency }
     $i++; if ($i -gt 2000) { break }
   }
   $o.hz_max = $max
 }
-$o.monitor = ''
+# every monitor; Rust picks the one whose InstanceName matches display_id
+$o.monitors = @()
 try {
-  $mon = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop | Where-Object Active | Select-Object -First 1
-  if ($mon) { $o.monitor = (($mon.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ }) -join '').Trim() }
+  $o.monitors = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop | ForEach-Object {
+    [pscustomobject]@{ instance = [string]$_.InstanceName; active = [bool]$_.Active; name = (($_.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ }) -join '').Trim() }
+  })
 } catch { }
 [pscustomobject]$o
 "#;
 
 fn read_state() -> State {
     match common::ps_json::<State>(READ_SCRIPT) {
-        Ok(v) => v.into_iter().next().unwrap_or_else(|| State { error: Some("The settings could not be read.".into()), ..Default::default() }),
+        Ok(v) => {
+            let mut s = v.into_iter().next().unwrap_or_else(|| State { error: Some("The settings could not be read.".into()), ..Default::default() });
+            s.monitor = pick_monitor(&s.display_id, &s.monitors);
+            s
+        }
         Err(e) => State { error: Some(format!("The settings could not be read: {e}")), ..Default::default() },
     }
 }
@@ -548,8 +616,21 @@ pub struct PerfTab {
     pending: Option<(Vec<Change>, Option<usize>)>,
     run: Option<Run>,
     explorer: Option<Job<Result<String, String>>>,
+    /// `op` is the "Restart Explorer" preview, not a settings change
+    explorer_preview: bool,
     demo: bool,
     note: Option<String>,
+}
+
+/// Preview window for restarting Explorer (same wording as the Startup tab).
+fn explorer_window() -> OpWindow {
+    let items = vec![OpItem::new("explorer", "Windows Explorer", "Explorer").detail("taskbar, desktop and folder windows")];
+    let mut win = OpWindow::new("Restart Explorer", "restart", "restarted", items).noun("program", "programs");
+    win.preview_text = "Shows taskbar and right-click changes.".into();
+    win.warning = Some("The taskbar blinks and open folder windows close. Not during a game.".into());
+    win.go_label = "Restart now".into();
+    win.running_text = "Restarting Explorer...".into();
+    win
 }
 
 fn open_uri(uri: &'static str) {
@@ -569,6 +650,7 @@ impl PerfTab {
             pending: None,
             run: None,
             explorer: None,
+            explorer_preview: false,
             demo: false,
             note: None,
         };
@@ -754,24 +836,42 @@ impl PerfTab {
 
     fn window(&mut self, ctx: &egui::Context) {
         let Some(op) = &mut self.op else { return };
-        let can = common::is_admin() && self.run.is_none() && !self.demo;
+        // restarting Explorer never needed admin; settings changes do
+        let can = if self.explorer_preview {
+            self.run.is_none() && self.explorer.is_none() && !self.demo
+        } else {
+            common::is_admin() && self.run.is_none() && !self.demo
+        };
         match op.show(ctx, can) {
+            Some(OpEvent::Go) if self.explorer_preview => {
+                if can {
+                    self.restart_explorer();
+                }
+                self.close_window();
+            }
             Some(OpEvent::Go) => {
                 if let Some((changes, undo_of)) = self.pending.take() {
                     self.start(changes, undo_of);
                 }
             }
             Some(OpEvent::Undo) => self.open_undo(true),
-            Some(OpEvent::Extra(_)) => {
-                self.restart_explorer();
-                self.op = None;
-            }
-            Some(OpEvent::Close) => {
-                self.op = None;
-                self.pending = None;
-            }
+            Some(OpEvent::Extra(_)) => self.open_explorer_preview(),
+            Some(OpEvent::Close) => self.close_window(),
             None => {}
         }
+    }
+
+    fn close_window(&mut self) {
+        self.op = None;
+        self.pending = None;
+        self.explorer_preview = false;
+    }
+
+    /// Restart Explorer: shows a preview first (open folder windows close).
+    fn open_explorer_preview(&mut self) {
+        self.op = Some(explorer_window());
+        self.pending = None;
+        self.explorer_preview = true;
     }
 
     fn restart_explorer(&mut self) {
@@ -961,8 +1061,9 @@ impl PerfTab {
                 if ui.button("Tick recommended only").clicked() {
                     self.selected = TWEAKS.iter().map(|t| !t.optional).collect();
                 }
-                if ui.add_enabled(self.explorer.is_none(), egui::Button::new("Restart Explorer")).on_hover_text("Shows taskbar and right-click changes. Not during a game: the taskbar disappears for a moment.").clicked() {
-                    self.restart_explorer();
+                let explorer_ok = self.explorer.is_none() && self.run.is_none() && self.op.is_none();
+                if ui.add_enabled(explorer_ok, egui::Button::new("Restart Explorer")).on_hover_text("Shows taskbar and right-click changes. Shows a preview first. Not during a game: the taskbar disappears for a moment.").clicked() {
+                    self.open_explorer_preview();
                 }
             });
             if let Some(n) = &self.note {
@@ -1144,5 +1245,58 @@ mod tests {
         let rr = checks(&other).into_iter().find(|r| r.name == "Refresh rate").unwrap();
         assert_eq!(rr.state, Check::Look);
         assert!(rr.note.contains("165 Hz"));
+    }
+
+    fn two_monitors() -> Vec<Monitor> {
+        vec![
+            Monitor { instance: r"DISPLAY\SAM7350\5&148b3217&1&UID4352_0".into(), name: "S90H".into(), active: true },
+            Monitor { instance: r"DISPLAY\AUS274F\5&148b3217&1&UID4353_0".into(), name: "PG27AQWP-W".into(), active: true },
+        ]
+    }
+
+    #[test]
+    fn perf_monitor_matches_measured_display() {
+        let mons = two_monitors();
+        let asus = r"\\?\DISPLAY#AUS274F#5&148b3217&1&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        assert_eq!(display_key(asus).as_deref(), Some(r"DISPLAY\AUS274F\5&148B3217&1&UID4353"));
+        assert_eq!(pick_monitor(asus, &mons), "PG27AQWP-W", "the TV listed first is not picked");
+        let tv = r"\\?\DISPLAY#SAM7350#5&148b3217&1&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        assert_eq!(pick_monitor(tv, &mons), "S90H");
+        // no match: fall back to an active PG27AQWP, never an unrelated first monitor
+        assert_eq!(pick_monitor("", &mons), "PG27AQWP-W");
+        assert_eq!(pick_monitor("", &mons[..1]), "");
+        // UID4353 must not match UID43530
+        let near = vec![Monitor { instance: r"DISPLAY\AUS274F\5&148b3217&1&UID43530_0".into(), name: "Other".into(), active: true }];
+        assert_eq!(pick_monitor(asus, &near), "");
+
+        let mut s = State { hz_now: Some(500), hz_max: Some(500), display_id: asus.into(), monitors: mons, ..Default::default() };
+        s.monitor = pick_monitor(&s.display_id, &s.monitors);
+        let rr = checks(&s).into_iter().find(|r| r.name == "Refresh rate").unwrap();
+        assert_eq!(rr.state, Check::Look);
+        assert!(rr.now.contains("PG27AQWP-W"), "{}", rr.now);
+        assert!(rr.note.contains("UHBR20"));
+    }
+
+    #[test]
+    fn perf_explorer_needs_preview() {
+        let mut tab = PerfTab {
+            state: None,
+            loading: None,
+            selected: vec![],
+            history: vec![],
+            op: None,
+            pending: None,
+            run: None,
+            explorer: None,
+            explorer_preview: false,
+            demo: true,
+            note: None,
+        };
+        tab.open_explorer_preview();
+        assert!(tab.op.is_some() && tab.explorer_preview, "a preview opens first");
+        assert!(tab.explorer.is_none(), "nothing runs before Go");
+        assert!(tab.op.as_ref().unwrap().warning.as_deref().unwrap_or("").contains("folder windows close"));
+        tab.close_window();
+        assert!(tab.op.is_none() && !tab.explorer_preview);
     }
 }

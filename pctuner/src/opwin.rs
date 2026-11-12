@@ -104,6 +104,20 @@ pub struct OpWindow {
 
 const REVEAL_PER_SEC: f64 = 20.0;
 
+/// UI time (f64 bits) when a window was last drawn in the Running stage; u64::MAX = never.
+static RUNNING_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// True when an operation window was in the Running stage within the last half second, i.e. a
+/// change is being applied right now (closing PC Tuner waits for it).
+pub fn running_recently(now: f64) -> bool {
+    let bits = RUNNING_AT.load(std::sync::atomic::Ordering::Relaxed);
+    bits != u64::MAX && ran_within(f64::from_bits(bits), now)
+}
+
+fn ran_within(at: f64, now: f64) -> bool {
+    (now - at).abs() < 0.5
+}
+
 /// How many result rows are visible `elapsed` seconds into the reveal.
 pub fn revealed(count: usize, elapsed: f64) -> usize {
     ((elapsed.max(0.0) * REVEAL_PER_SEC) as usize + 1).min(count)
@@ -264,6 +278,10 @@ impl OpWindow {
                         });
                     }
                     Stage::Running => {
+                        // demo screenshots show this stage without any work behind it
+                        if std::env::var_os("PCTUNER_DEMO").is_none() {
+                            RUNNING_AT.store(now.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                        }
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label(RichText::new(&self.running_text).size(26.0).strong());
@@ -466,5 +484,13 @@ mod tests {
         assert_eq!(OpWindow::new("TEST", "clean", "cleaned", vec![]).stage, Stage::Done);
         assert_eq!(plural(1, &w.noun), "item");
         assert_eq!(plural(2, &w.noun), "items");
+    }
+
+    #[test]
+    fn opwin_running_window_counts_as_busy() {
+        assert!(ran_within(10.0, 10.2));
+        assert!(!ran_within(10.0, 11.0));
+        // a new app run starts its UI clock at 0 again
+        assert!(!ran_within(10.0, 0.0));
     }
 }

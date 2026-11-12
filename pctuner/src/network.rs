@@ -228,30 +228,50 @@ fn fmt(kind: Kind, v: Option<&str>) -> String {
 }
 
 /// PowerShell statement that sets `kind` to `value` (`None` removes the value / policy).
+/// Removing is idempotent: a value, key or policy that is already gone counts as done.
+/// `guid` is the interface GUID for the per-interface TCP values; when it is empty the statement
+/// uses `$ifGuid` (resolved by `build_script` from the adapter name) and throws if that is empty
+/// too, so nothing is ever written to the Interfaces parent key.
 fn set_stmt(kind: Kind, value: Option<&str>, adapter: &str, guid: &str) -> String {
     let q = common::psq;
+    // `path` is a PowerShell expression (a quoted literal or a parenthesised string expression)
     let dword = |path: String, name: &str| match value {
         Some(v) => format!(
             "New-ItemProperty -LiteralPath {} -Name {} -PropertyType DWord -Value ([int32]{}) -Force -ErrorAction Stop | Out-Null",
-            q(&path), q(name), v.parse::<u32>().unwrap_or(0) as i32
+            path, q(name), v.parse::<u32>().unwrap_or(0) as i32
         ),
-        None => format!("Remove-ItemProperty -LiteralPath {} -Name {} -ErrorAction Stop", q(&path), q(name)),
+        None => format!(
+            "if ((Get-Item -LiteralPath {p} -ErrorAction SilentlyContinue) -and ($null -ne (Get-ItemProperty -LiteralPath {p} -Name {n} -ErrorAction SilentlyContinue))) {{ Remove-ItemProperty -LiteralPath {p} -Name {n} -ErrorAction Stop }}",
+            p = path, n = q(name)
+        ),
     };
-    let iface = format!(r"HKLM:\{IF_KEY}\{guid}");
+    let iface_dword = |name: &str| {
+        if guid.is_empty() {
+            format!(
+                "if (-not $ifGuid) {{ throw 'The network adapter could not be found, so its TCP settings were not changed.' }}; {}",
+                dword(format!("({} + $ifGuid)", q(&format!(r"HKLM:\{IF_KEY}\"))), name)
+            )
+        } else {
+            dword(q(&format!(r"HKLM:\{IF_KEY}\{guid}")), name)
+        }
+    };
     match kind {
         Kind::Adv(kw) => format!(
             "Set-NetAdapterAdvancedProperty -Name {} -RegistryKeyword {} -RegistryValue {} -NoRestart -ErrorAction Stop",
             q(adapter), q(kw), q(value.unwrap_or("0"))
         ),
-        Kind::Throttle => dword(format!(r"HKLM:\{THROTTLE_KEY}"), "NetworkThrottlingIndex"),
-        Kind::Ack => dword(iface, "TcpAckFrequency"),
-        Kind::NoDelay => dword(iface, "TCPNoDelay"),
+        Kind::Throttle => dword(q(&format!(r"HKLM:\{THROTTLE_KEY}")), "NetworkThrottlingIndex"),
+        Kind::Ack => iface_dword("TcpAckFrequency"),
+        Kind::NoDelay => iface_dword("TCPNoDelay"),
         Kind::Qos => match value {
             Some(_) => format!(
                 "if (-not (Get-NetQosPolicy -Name {n} -ErrorAction SilentlyContinue)) {{ New-NetQosPolicy -Name {n} -AppPathNameMatchCondition 'HaloInfinite.exe' -IPProtocolMatchCondition Both -DSCPAction 46 -NetworkProfile All -ErrorAction Stop | Out-Null }}",
                 n = q(QOS_NAME)
             ),
-            None => format!("Remove-NetQosPolicy -Name {} -Confirm:$false -ErrorAction Stop", q(QOS_NAME)),
+            None => format!(
+                "if (Get-NetQosPolicy -Name {n} -ErrorAction SilentlyContinue) {{ Remove-NetQosPolicy -Name {n} -Confirm:$false -ErrorAction Stop }}",
+                n = q(QOS_NAME)
+            ),
         },
         Kind::Uro => {
             let v = if value == Some("disabled") { "disabled" } else { "enabled" };
@@ -271,14 +291,27 @@ struct Change {
 struct HistEntry {
     time: String,
     adapter: String,
+    /// Interface GUID of `adapter` when the change was made (empty in older history files).
+    #[serde(default)]
+    guid: String,
     changes: Vec<Change>,
     undone: bool,
 }
 
 /// One script for a batch of changes: one RESULT line per change, then one adapter restart if any
 /// adapter property changed (properties are written with -NoRestart).
+/// An empty `guid` is resolved from the adapter name at run time (`$ifGuid`).
 fn build_script(changes: &[(String, Kind, Option<String>)], adapter: &str, guid: &str) -> String {
     let mut s = String::from("$advChanged = $false\n");
+    if guid.is_empty() && changes.iter().any(|c| matches!(c.1, Kind::Ack | Kind::NoDelay)) {
+        s.push_str("$ifGuid = ''\n");
+        if !adapter.is_empty() {
+            s.push_str(&format!(
+                "try {{ $ifGuid = [string](Get-NetAdapter -Name {} -ErrorAction Stop).InterfaceGuid }} catch {{ }}\n",
+                common::psq(adapter)
+            ));
+        }
+    }
     for (id, kind, value) in changes {
         let stmt = set_stmt(*kind, value.as_deref(), adapter, guid);
         let mark = if matches!(kind, Kind::Adv(_)) { "; $advChanged = $true" } else { "" };
@@ -307,27 +340,52 @@ fn parse_result(line: &str) -> Option<(String, Result<String, String>)> {
 
 // ------------------------------------------------------------------ latency test
 
-/// Milliseconds from one ping.exe reply line ("time=12ms", "time<1ms", "Zeit=9ms"); None for anything else.
-fn parse_ping_ms(line: &str) -> Option<f32> {
-    let l = line.to_ascii_lowercase();
-    if !l.contains("ttl=") {
-        return None;
-    }
-    let b = l.as_bytes();
-    let mut from = 0;
-    while let Some(off) = l[from..].find("ms") {
-        let end = from + off;
-        let mut start = end;
-        while start > 0 && (b[start - 1].is_ascii_digit() || b[start - 1] == b'.') {
-            start -= 1;
+/// Latency test script: echoes through System.Net.NetworkInformation.Ping, one per second, and prints
+/// language-neutral lines ("PING|ok|<ms>", "PING|lost|<IPStatus>", "PING|nohost|") instead of the
+/// localized text of ping.exe (works the same on any Windows language, for IPv4 and IPv6).
+fn ping_script(target: &str) -> String {
+    format!(
+        r#"$t = {t}
+$addr = $null
+try {{ $addr = @([System.Net.Dns]::GetHostAddresses($t))[0] }} catch {{ }}
+if (-not $addr) {{ Write-Output 'PING|nohost|'; exit }}
+$p = New-Object System.Net.NetworkInformation.Ping
+for ($i = 0; $i -lt {n}; $i++) {{
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  try {{
+    $r = $p.Send($addr, 1000)
+    if ($r.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {{ Write-Output ('PING|ok|' + $r.RoundtripTime) }}
+    else {{ Write-Output ('PING|lost|' + $r.Status) }}
+  }} catch {{ Write-Output ('PING|lost|' + ($_.Exception.Message -replace '\s+', ' ')) }}
+  if ($i -lt {n} - 1) {{ $left = 1000 - $sw.ElapsedMilliseconds; if ($left -gt 0) {{ Start-Sleep -Milliseconds $left }} }}
+}}
+"#,
+        t = common::psq(target),
+        n = PINGS
+    )
+}
+
+#[derive(Debug, PartialEq)]
+enum PingLine {
+    /// Round trip in ms (a sub-millisecond reply, reported as 0, counts as 0.5 like ping.exe's "<1ms").
+    Reply(f32),
+    Lost,
+    NoHost,
+}
+
+/// One line of `ping_script` output; None for anything else (stderr noise, blank lines).
+fn parse_ping_line(line: &str) -> Option<PingLine> {
+    let rest = line.trim().strip_prefix("PING|")?;
+    let mut p = rest.splitn(2, '|');
+    match p.next()? {
+        "ok" => {
+            let v: f32 = p.next()?.trim().parse().ok()?;
+            Some(PingLine::Reply(if v <= 0.0 { 0.5 } else { v }))
         }
-        if start < end && start > 0 && (b[start - 1] == b'=' || b[start - 1] == b'<') {
-            let v: f32 = l[start..end].parse().ok()?;
-            return Some(if b[start - 1] == b'<' { v * 0.5 } else { v });
-        }
-        from = end + 2;
+        "lost" => Some(PingLine::Lost),
+        "nohost" => Some(PingLine::NoHost),
+        _ => None,
     }
-    None
 }
 
 /// (average ms, jitter ms = mean change between consecutive replies, loss %).
@@ -364,7 +422,9 @@ struct Ping {
 impl Ping {
     fn start(&mut self, target: &str) {
         *self = Ping { target: target.to_string(), ..Default::default() };
-        self.stream = Some(Stream::run("ping.exe", vec!["-n".into(), PINGS.to_string(), "-w".into(), "1000".into(), target.to_string()]));
+        // Read-only measurement: it must not count as a running change, so closing PC Tuner
+        // during a latency test does not wait for it.
+        self.stream = Some(common::ps_stream_readonly(&ping_script(target)));
     }
 
     fn running(&self) -> bool {
@@ -377,19 +437,17 @@ impl Ping {
         let new: Vec<String> = s.lines[self.seen..].to_vec();
         self.seen = s.lines.len();
         for l in &new {
-            let low = l.to_ascii_lowercase();
-            if let Some(ms) = parse_ping_ms(l) {
-                self.samples.push(ms);
-            } else if low.contains("timed out") || low.contains("unreachable") || low.contains("general failure") || low.contains("transmit failed") {
-                self.lost += 1;
-            } else if low.contains("could not find host") {
-                self.error = Some(format!("{} could not be found.", self.target));
+            match parse_ping_line(l) {
+                Some(PingLine::Reply(ms)) => self.samples.push(ms),
+                Some(PingLine::Lost) => self.lost += 1,
+                Some(PingLine::NoHost) => self.error = Some(format!("{} could not be found.", self.target)),
+                None => {}
             }
         }
         if !running {
             self.stream = None;
             if self.samples.is_empty() && self.lost == 0 && self.error.is_none() {
-                self.error = Some("ping did not return any replies.".into());
+                self.error = Some("The latency test did not return any results.".into());
             }
         }
     }
@@ -402,8 +460,41 @@ struct Run {
     seen: usize,
     changes: Vec<Change>,
     adapter: String,
+    guid: String,
     /// Some(history index) when this run undoes that entry.
     undo_of: Option<usize>,
+    /// Result of the adapter restart step (not a setting, so it is not an OpItem).
+    restart: Option<Result<String, String>>,
+}
+
+/// (adapter name, interface GUID) a run works on. An undo goes back to the adapter and interface
+/// the change was made on, not whichever adapter is shown now; an old entry without a GUID gets
+/// it resolved from the adapter name inside the script (never the current adapter's GUID).
+fn run_target(state: &State, history: &[HistEntry], undo_of: Option<usize>) -> (String, String) {
+    match undo_of.and_then(|i| history.get(i)) {
+        Some(h) => (h.adapter.clone(), h.guid.clone()),
+        None => (state.adapter().to_string(), state.info.as_ref().map(|i| i.guid.clone()).unwrap_or_default()),
+    }
+}
+
+/// True when any change is an adapter property (those are written with -NoRestart, then one restart).
+fn has_adapter_change(changes: &[Change]) -> bool {
+    changes.iter().any(|c| tweak(&c.id).map(|t| matches!(t.kind, Kind::Adv(_))).unwrap_or(false))
+}
+
+/// Puts the outcome of the adapter restart step under the result chips. The restart is a step,
+/// not a setting, so it is kept out of the window's items and their "N settings changed" count.
+fn show_restart(op: &mut OpWindow, adapter: &str, r: Option<&Result<String, String>>) {
+    match r {
+        Some(Ok(note)) if note.starts_with("Not needed") => {}
+        Some(Ok(_)) => op.notes.insert(0, format!("\"{adapter}\" was restarted and is back online.")),
+        Some(Err(e)) => {
+            op.footer = Some((format!("Restarting \"{adapter}\" failed - restart it or reboot to finish. {e}").trim().to_string(), theme::LOCKED))
+        }
+        None => {
+            op.footer = Some((format!("\"{adapter}\" may not have been restarted - restart it or reboot to finish."), theme::LOCKED))
+        }
+    }
 }
 
 pub struct NetworkTab {
@@ -459,6 +550,7 @@ impl NetworkTab {
                 Stage::Done => {
                     w.can_undo = true;
                     w.finish(|it| Some(if it.id == "dscp" { Err("Access is denied.".into()) } else { Ok(String::new()) }));
+                    show_restart(&mut w, "Ethernet", Some(&Ok("Back online.".into())));
                 }
             }
             tab.op = Some(w);
@@ -484,13 +576,11 @@ impl NetworkTab {
                     .optional(t.optional),
             );
         }
-        let adapter_change = changes.iter().any(|c| tweak(&c.id).map(|t| matches!(t.kind, Kind::Adv(_))).unwrap_or(false));
-        if adapter_change {
-            items.push(OpItem::new("restart", format!("Restart \"{adapter}\""), "Finish").detail("offline for a few seconds"));
-        }
+        // the adapter restart is a step, not a setting: it is not an item (keeps the headline count
+        // honest) - the warning below announces it and `show_restart` reports how it went
+        let adapter_change = has_adapter_change(changes);
         let (kicker, verb, done_word) = if undo { ("UNDO NETWORK CHANGE", "undo", "undone") } else { ("NETWORK", "change", "changed") };
         let mut w = OpWindow::new(kicker, verb, done_word, items).noun("setting", "settings");
-        // the restart step is not a setting: keep the headline count honest
         w.show_steps = true;
         w.fail_phrase = "could not be changed".into();
         w.preview_text = format!("Adapter: {adapter}. Each change is saved so it can be undone.");
@@ -498,7 +588,7 @@ impl NetworkTab {
         w.go_label = if undo { "Undo".into() } else { "Apply".into() };
         w.reassure = if undo { "Restores the values from before that change.".into() } else { "\"Undo last change\" puts every value back.".into() };
         if adapter_change {
-            w.warning = Some("Your connection drops for about 5 seconds while the adapter restarts. Don't apply this during a match.".into());
+            w.warning = Some(format!("\"{adapter}\" restarts at the end: your connection drops for about 5 seconds. Don't do this during a match."));
         }
         if !undo {
             w.notes.push("Run the latency test again to compare.".into());
@@ -508,12 +598,11 @@ impl NetworkTab {
 
     fn start(&mut self, changes: Vec<Change>, undo_of: Option<usize>) {
         let Some(state) = &self.state else { return };
-        let adapter = state.adapter().to_string();
-        let guid = state.info.as_ref().map(|i| i.guid.clone()).unwrap_or_default();
+        let (adapter, guid) = run_target(state, &self.history, undo_of);
         let batch: Vec<(String, Kind, Option<String>)> =
             changes.iter().filter_map(|c| tweak(&c.id).map(|t| (c.id.clone(), t.kind, c.new.clone()))).collect();
         let script = build_script(&batch, &adapter, &guid);
-        self.run = Some(Run { stream: common::ps_stream(&script), seen: 0, changes, adapter, undo_of });
+        self.run = Some(Run { stream: common::ps_stream(&script), seen: 0, changes, adapter, guid, undo_of, restart: None });
         if let Some(op) = &mut self.op {
             op.stage = Stage::Running;
         }
@@ -549,7 +638,18 @@ impl NetworkTab {
     fn open_undo(&mut self, start_now: bool) {
         let Some((changes, i)) = self.undo_changes() else { return };
         let adapter = self.history[i].adapter.clone();
-        self.op = Some(Self::op_window(&changes, true, &adapter));
+        let mut w = Self::op_window(&changes, true, &adapter);
+        let current = self.state.as_ref().map(|s| s.adapter().to_string()).unwrap_or_default();
+        if !adapter.is_empty() && adapter != current {
+            let shown = if current.is_empty() { "No adapter is connected now".to_string() } else { format!("The adapter shown now is \"{current}\"") };
+            let restart = if has_adapter_change(&changes) { ", but its adapter settings and restart may fail if it is not present" } else { "" };
+            let note = format!("This change was made on \"{adapter}\". {shown}. The old values are put back on \"{adapter}\"{restart}.");
+            w.warning = Some(match w.warning.take() {
+                Some(old) => format!("{note} {old}"),
+                None => note,
+            });
+        }
+        self.op = Some(w);
         if start_now {
             self.start(changes, Some(i));
         } else {
@@ -572,10 +672,14 @@ impl NetworkTab {
         while run.seen < run.stream.lines.len() {
             let line = run.stream.lines[run.seen].clone();
             run.seen += 1;
-            if let (Some((id, r)), Some(op)) = (parse_result(&line), &mut self.op) {
-                if let Some(it) = op.items.iter_mut().find(|i| i.id == id) {
-                    it.result = Some(r);
+            match (parse_result(&line), &mut self.op) {
+                (Some((id, r)), _) if id == "restart" => run.restart = Some(r),
+                (Some((id, r)), Some(op)) => {
+                    if let Some(it) = op.items.iter_mut().find(|i| i.id == id) {
+                        it.result = Some(r);
+                    }
                 }
+                _ => {}
             }
         }
         if running {
@@ -595,19 +699,23 @@ impl NetworkTab {
                 }
             }
         }
+        if let Some(op) = &mut self.op {
+            if has_adapter_change(&run.changes) {
+                show_restart(op, &run.adapter, run.restart.as_ref());
+            }
+        }
         let mut can_undo = false;
         match run.undo_of {
             None => {
                 let changes: Vec<Change> = run.changes.into_iter().filter(|c| ok_ids.contains(&c.id)).collect();
                 if !changes.is_empty() {
-                    self.history.push(HistEntry { time: common::now(), adapter: run.adapter, changes, undone: false });
+                    self.history.push(HistEntry { time: common::now(), adapter: run.adapter, guid: run.guid, changes, undone: false });
                     common::save_json(HISTORY, &self.history);
                     can_undo = true;
                 }
             }
             Some(i) => {
                 // only what was really put back leaves the history; failed parts can be undone again
-                // ("restart" is the adapter restart step, not a stored change)
                 if let Some(h) = self.history.get_mut(i) {
                     h.changes.retain(|c| !ok_ids.contains(&c.id));
                     h.undone = h.changes.is_empty();
@@ -666,8 +774,11 @@ fn ping_column(ui: &mut egui::Ui, title: &str, p: &Ping, id: &str, width: f32) {
             return;
         }
         let (avg, jitter, loss) = ping_stats(&p.samples, p.lost);
+        let n = p.samples.len() + p.lost;
         ui.horizontal(|ui| {
-            if p.samples.is_empty() {
+            if p.samples.is_empty() && !p.running() && p.lost > 0 {
+                ui.label(RichText::new("No replies").size(24.0).strong().color(theme::LOCKED));
+            } else if p.samples.is_empty() {
                 ui.label(RichText::new(if p.running() { "..." } else { "-" }).size(34.0).strong().color(theme::TEXT_FAINT));
             } else {
                 let v = theme::count_up(ui.ctx(), ("ping", id), avg);
@@ -679,14 +790,15 @@ fn ping_column(ui: &mut egui::Ui, title: &str, p: &Ping, id: &str, width: f32) {
                 });
             }
             ui.add_space(14.0);
-            if !p.samples.is_empty() {
+            if p.samples.len() >= 2 {
                 theme::stat(ui, &format!("{jitter:.1} ms"), "jitter", theme::TEXT);
                 ui.add_space(10.0);
+            }
+            if n > 0 {
                 theme::stat(ui, &format!("{loss:.0} %"), "packet loss", if loss > 0.0 { theme::LOCKED } else { theme::TEXT });
             }
         });
         theme::sparkline(ui, &p.samples, egui::vec2(width - 10.0, 34.0), theme::ACCENT);
-        let n = p.samples.len() + p.lost;
         let status = if p.running() { format!("{n} of {PINGS} pings to {}", p.target) } else if n > 0 { format!("{n} pings to {}", p.target) } else { p.target.clone() };
         ui.label(RichText::new(status).size(12.0).color(theme::TEXT_FAINT));
     });
@@ -789,16 +901,18 @@ impl NetworkTab {
                 ui.add_space(20.0);
                 ping_column(ui, "Your router (local link)", &self.ping_gw, "gw", w);
             });
-            let n = self.ping_net.samples.len();
-            if !self.ping_net.running() && n >= 5 {
+            // heavy or total loss still gets a verdict (grade() says "Unstable" from 2 % loss)
+            let n = self.ping_net.samples.len() + self.ping_net.lost;
+            if !self.ping_net.running() && self.ping_net.error.is_none() && n >= 5 {
                 let (_, jitter, loss) = ping_stats(&self.ping_net.samples, self.ping_net.lost);
                 let (text, c) = grade(jitter, loss);
                 ui.add_space(6.0);
                 ui.colored_label(c, RichText::new(text).strong());
             }
-            if !self.ping_gw.running() && !self.ping_gw.samples.is_empty() {
+            let gw_n = self.ping_gw.samples.len() + self.ping_gw.lost;
+            if !self.ping_gw.running() && self.ping_gw.error.is_none() && gw_n > 0 {
                 let (avg, _, loss) = ping_stats(&self.ping_gw.samples, self.ping_gw.lost);
-                if avg > 2.0 || loss > 0.0 {
+                if (!self.ping_gw.samples.is_empty() && avg > 2.0) || loss > 0.0 {
                     ui.colored_label(theme::GAMING, "The link to your router should be under 1 ms with no loss - check the cable and the router port.");
                 }
             }
@@ -916,12 +1030,71 @@ mod tests {
 
     #[test]
     fn net_parse_ping_lines() {
-        assert_eq!(parse_ping_ms("Reply from 1.1.1.1: bytes=32 time=12ms TTL=57"), Some(12.0));
-        assert_eq!(parse_ping_ms("Reply from 192.168.1.1: bytes=32 time<1ms TTL=64"), Some(0.5));
-        assert_eq!(parse_ping_ms("Antwort von 1.1.1.1: Bytes=32 Zeit=9ms TTL=57"), Some(9.0));
-        assert_eq!(parse_ping_ms("Request timed out."), None);
-        assert_eq!(parse_ping_ms("Reply from 192.168.1.1: Destination host unreachable."), None);
-        assert_eq!(parse_ping_ms("    Minimum = 11ms, Maximum = 14ms, Average = 12ms"), None);
+        assert_eq!(parse_ping_line("PING|ok|12"), Some(PingLine::Reply(12.0)));
+        assert_eq!(parse_ping_line("PING|ok|0"), Some(PingLine::Reply(0.5)));
+        assert_eq!(parse_ping_line("PING|lost|TimedOut"), Some(PingLine::Lost));
+        assert_eq!(parse_ping_line("PING|lost|DestinationHostUnreachable"), Some(PingLine::Lost));
+        assert_eq!(parse_ping_line("PING|lost|Eine Ausnahme ist aufgetreten."), Some(PingLine::Lost));
+        assert_eq!(parse_ping_line("PING|nohost|"), Some(PingLine::NoHost));
+        assert_eq!(parse_ping_line("PING|ok|"), None);
+        // the localized ping.exe text is no longer read at all
+        assert_eq!(parse_ping_line("Reply from ::1: time<1ms "), None);
+        assert_eq!(parse_ping_line("Réponse de 8.8.8.8 : octets=32 temps=13 ms TTL=117"), None);
+        assert_eq!(parse_ping_line("    Minimum = 0ms, Maximum = 0ms, Average = 0ms"), None);
+        // the target is quoted, IPv6 is allowed, and every echo has a 1 s timeout
+        let s = ping_script("2606:4700:4700::1111");
+        assert!(s.contains("$t = '2606:4700:4700::1111'") && s.contains("Send($addr, 1000)") && s.contains(&format!("-lt {PINGS}")));
+        assert!(ping_script("a'b").contains("'a''b'"));
+    }
+
+    /// Parses (does not run) the generated scripts with the PowerShell parser.
+    #[test]
+    #[ignore]
+    fn net_scripts_parse() {
+        let all = [(String::from("eee"), Kind::Adv("*EEE"), Some("0".to_string())), ("ack".into(), Kind::Ack, None), ("nodelay".into(), Kind::NoDelay, Some("1".into())), ("throttle".into(), Kind::Throttle, None), ("dscp".into(), Kind::Qos, None), ("dscp".into(), Kind::Qos, Some("on".into())), ("uro".into(), Kind::Uro, Some("enabled".into()))];
+        for script in [ping_script("1.1.1.1"), build_script(&all, "Ethernet", "{G}"), build_script(&all, "Ethernet", ""), READ_SCRIPT.to_string()] {
+            let check = format!(
+                "$e = $null; $null = [System.Management.Automation.Language.Parser]::ParseInput({}, [ref]$null, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}",
+                common::psq(&script)
+            );
+            if let Err(e) = common::ps(&check) {
+                panic!("script does not parse: {e}\n{script}");
+            }
+        }
+    }
+
+    #[test]
+    fn net_restart_is_not_a_setting() {
+        let changes: Vec<Change> = ["eee", "im", "fc"].iter().map(|id| Change { id: id.to_string(), prev: Some("1".into()), new: Some("0".into()) }).collect();
+        let w = NetworkTab::op_window(&changes, false, "Ethernet");
+        assert_eq!(w.items.len(), 3, "headline counts 3 settings");
+        assert!(w.items.iter().all(|i| i.id != "restart"));
+        assert!(w.warning.as_deref().unwrap_or("").contains("\"Ethernet\" restarts"));
+        let mut w = NetworkTab::op_window(&changes, false, "Ethernet");
+        show_restart(&mut w, "Ethernet", Some(&Err("Access is denied.".into())));
+        assert!(w.footer.as_ref().unwrap().0.contains("failed"));
+        let mut w = NetworkTab::op_window(&changes, false, "Ethernet");
+        show_restart(&mut w, "Ethernet", Some(&Ok("Not needed - no adapter setting changed.".into())));
+        assert!(w.footer.is_none() && !w.notes.iter().any(|n| n.contains("restarted")));
+    }
+
+    #[test]
+    fn net_history_without_guid_loads() {
+        let h: Vec<HistEntry> = serde_json::from_str(r#"[{"time":"t","adapter":"Ethernet","changes":[],"undone":false}]"#).unwrap();
+        assert_eq!(h[0].guid, "");
+    }
+
+    #[test]
+    fn net_undo_targets_the_changed_adapter() {
+        let state = State { info: Some(AdapterInfo { name: "Wi-Fi".into(), guid: "{WIFI}".into(), ..Default::default() }), ..Default::default() };
+        let history = vec![
+            HistEntry { adapter: "Ethernet".into(), guid: "{ETH}".into(), ..Default::default() },
+            HistEntry { adapter: "Ethernet".into(), guid: String::new(), ..Default::default() },
+        ];
+        assert_eq!(run_target(&state, &history, None), ("Wi-Fi".into(), "{WIFI}".into()));
+        assert_eq!(run_target(&state, &history, Some(0)), ("Ethernet".into(), "{ETH}".into()));
+        // old entry without a GUID: resolved from "Ethernet" in the script, not the Wi-Fi GUID
+        assert_eq!(run_target(&state, &history, Some(1)), ("Ethernet".into(), String::new()));
     }
 
     #[test]
@@ -946,12 +1119,23 @@ mod tests {
     fn net_statements() {
         let s = set_stmt(Kind::Throttle, Some("4294967295"), "Ethernet", "{G}");
         assert!(s.contains("[int32]-1") && s.contains("NetworkThrottlingIndex") && s.contains("DWord"));
+        // removing is idempotent: an absent value / policy is not an error
         let s = set_stmt(Kind::Ack, None, "Ethernet", "{G}");
-        assert!(s.starts_with("Remove-ItemProperty") && s.contains(r"Interfaces\{G}"));
+        assert!(s.contains("Remove-ItemProperty") && s.contains(r"Interfaces\{G}"));
+        assert!(s.starts_with("if ((Get-Item -LiteralPath") && s.contains("Get-ItemProperty -LiteralPath") && s.contains("SilentlyContinue"));
+        let s = set_stmt(Kind::NoDelay, None, "Ethernet", "{G}");
+        assert!(s.starts_with("if ((Get-Item") && s.contains("'TCPNoDelay'"));
+        let s = set_stmt(Kind::Qos, None, "", "");
+        assert!(s.starts_with("if (Get-NetQosPolicy") && s.contains("Remove-NetQosPolicy"));
+        // no GUID: never the Interfaces parent key, the script's $ifGuid or a throw instead
+        let s = set_stmt(Kind::Ack, Some("1"), "Ethernet", "");
+        assert!(s.starts_with("if (-not $ifGuid) { throw") && s.contains("+ $ifGuid)") && !s.contains(r"Interfaces'"));
         let s = set_stmt(Kind::Adv("*EEE"), Some("0"), "Ether'net", "");
         assert!(s.contains("'Ether''net'") && s.contains("-NoRestart"));
         assert!(set_stmt(Kind::Uro, Some("disabled"), "", "").contains("uro=disabled"));
-        assert!(set_stmt(Kind::Qos, None, "", "").starts_with("Remove-NetQosPolicy"));
+        let script = build_script(&[("ack".into(), Kind::Ack, None)], "Ethernet", "");
+        assert!(script.contains("Get-NetAdapter -Name 'Ethernet'") && script.contains("InterfaceGuid"));
+        assert!(!build_script(&[("ack".into(), Kind::Ack, None)], "Ethernet", "{G}").contains("$ifGuid"));
         let script = build_script(&[("eee".into(), Kind::Adv("*EEE"), Some("0".into())), ("ack".into(), Kind::Ack, Some("1".into()))], "Ethernet", "{G}");
         assert!(script.contains("RESULT|eee|ok|") && script.contains("RESULT|ack|ok|") && script.contains("Restart-NetAdapter"));
         let script = build_script(&[("ack".into(), Kind::Ack, Some("1".into()))], "Ethernet", "{G}");
