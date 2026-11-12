@@ -24,12 +24,6 @@ impl Choice {
             Choice::ShutdownToBios => "The PC turns off. The next time you press the power button it goes straight into the BIOS.",
         }
     }
-    fn go(self) -> &'static str {
-        match self {
-            Choice::RestartToBios => "   Restart now   ",
-            Choice::ShutdownToBios => "   Shut down now   ",
-        }
-    }
     /// Arguments for shutdown.exe. /fw = next boot goes to the firmware setup; /t 0 = no waiting.
     pub fn args(self) -> [&'static str; 4] {
         match self {
@@ -41,7 +35,6 @@ impl Choice {
 
 enum Stage {
     Choose,
-    Confirm(Choice),
     /// The choice and the UI time the command was sent.
     Working(Choice, f64),
 }
@@ -134,11 +127,14 @@ impl PowerDialog {
                         for c in [Choice::RestartToBios, Choice::ShutdownToBios] {
                             let picked = choice_card(ui, c, blocked.is_none() && self.uefi.is_some());
                             if picked {
+                                // no second window: the click is the confirmation
                                 self.error = None;
-                                self.stage = Stage::Confirm(c);
+                                self.stage = Stage::Working(c, ctx.input(|i| i.time));
+                                self.job = Some(Job::spawn(move || common::run("shutdown.exe", &c.args())));
                             }
                             ui.add_space(6.0);
                         }
+                        ui.label(RichText::new("Clicking one acts at once: every open program closes without saving.").size(12.0).color(theme::GAMING));
                         if self.uefi.is_none() {
                             ui.horizontal(|ui| {
                                 ui.spinner();
@@ -149,22 +145,6 @@ impl PowerDialog {
                         if ui.button("Cancel").clicked() {
                             keep = false;
                         }
-                    }
-                    Stage::Confirm(c) => {
-                        ui.label(RichText::new(format!("{}?", c.title())).size(24.0).strong());
-                        ui.label(RichText::new(c.text()).color(theme::TEXT_DIM));
-                        ui.add_space(8.0);
-                        theme::banner(ui, theme::GAMING, "Save your work first: every open program closes right away. Fans go back to the BIOS.");
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            if ui.add(theme::danger_button(c.go()).min_size(egui::vec2(0.0, 32.0))).clicked() {
-                                self.stage = Stage::Working(c, ctx.input(|i| i.time));
-                                self.job = Some(Job::spawn(move || common::run("shutdown.exe", &c.args())));
-                            }
-                            if ui.button("Back").clicked() {
-                                self.stage = Stage::Choose;
-                            }
-                        });
                     }
                     Stage::Working(c, started) if working_timed_out(started, ctx.input(|i| i.time)) => {
                         let t = match c {

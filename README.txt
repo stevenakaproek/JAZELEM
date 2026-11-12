@@ -369,3 +369,18 @@ First-run checklist (these could only be tested without admin rights so far):
    Then press Reset GPU to stock and confirm the tab shows Stock.
 5. In Task Scheduler, \PCTuner\GpuTrialGuard should exist only while a trial
    is open.
+
+Tray, Power and extra Performance options (1.3.1):
+- Minimizing PC Tuner hides it to the system tray. Right-click the tray icon
+  for Show PC Tuner, Restart into BIOS, Shut down (BIOS on next start), Quit.
+  Closing with X still quits (fans go back to the BIOS).
+- Power / BIOS acts on one click - every open program closes without saving.
+- Performance > VBS off (optional): turns off virtualization-based security
+  (DeviceGuard + Windows Hello enhanced sign-in). Restart needed. Lowers
+  security; small gain because Memory Integrity is already off. Exact undo.
+- Performance > Background apps off (optional): Store apps cannot run in the
+  background (policy); Xbox app, Game Bar, Xbox sign-in, Gaming Services and
+  the Store are exempt. Desktop programs are not affected. Exact undo.
+- Performance > Defender: game folders: excludes Steam / XboxGames / Epic /
+  EA / Battle.net (and folders you add) from Defender scans. Undo removes only
+  the exclusions PC Tuner added. Needs administrator.

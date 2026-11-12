@@ -8,8 +8,10 @@ mod fan;
 mod gpu;
 mod network;
 mod opwin;
+mod defender;
 mod perf;
 mod power;
+mod tray;
 mod scheduler;
 mod services;
 mod startup;
@@ -47,6 +49,8 @@ struct App {
     selftest: Option<std::time::Instant>,
     /// The Power window (restart / shut down into the BIOS) while it is open.
     power: Option<power::PowerDialog>,
+    /// Tray icon (minimize hides PC Tuner to the tray). None if the tray could not be created.
+    tray: Option<tray::Tray>,
     /// Self-test: the tab whose screenshot has been requested (one per tab).
     selftest_shot: Option<usize>,
     /// The tab the sidebar last scrolled into view.
@@ -80,6 +84,7 @@ impl App {
             switched_at: 0.0,
             selftest: std::env::var_os("PCTUNER_SELFTEST").map(|_| std::time::Instant::now()),
             // PCTUNER_DEMO=power opens the window for a screenshot (its buttons are never pressed)
+            tray: None,
             power: std::env::var("PCTUNER_DEMO").ok().filter(|v| v.eq_ignore_ascii_case("power")).map(|_| power::PowerDialog::new()),
             selftest_shot: None,
             nav_shown: None,
@@ -170,6 +175,11 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // minimize = hide to the tray (the tray menu brings it back)
+        if self.tray.is_some() && ctx.input(|i| i.viewport().minimized) == Some(true) && !tray::HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
+            tray::HIDDEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         // Background jobs report through channels; keep the UI polling them.
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
 
@@ -414,7 +424,12 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             // Dark theme, accent colour, fonts, spacing (pinned: does not follow the Windows light theme).
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            let mut app = App::new();
+            // no tray icon during self-tests (screenshots)
+            if std::env::var_os("PCTUNER_SELFTEST").is_none() {
+                app.tray = tray::create(&cc.egui_ctx);
+            }
+            Ok(Box::new(app))
         }),
     )
 }

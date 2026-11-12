@@ -39,6 +39,12 @@ enum Kind {
     Epp,
     /// Hibernation and its hiberfil.sys (powercfg /hibernate).
     Hibernate,
+    /// Virtualization-based security: "vbs|hello" = DeviceGuard EnableVirtualizationBasedSecurity and
+    /// Scenarios\WindowsHello\Enabled (Enhanced Sign-in Security keeps VBS running). Restart needed.
+    Vbs,
+    /// Background apps (Store apps): policy AppPrivacy LetAppsRunInBackground + _ForceAllowTheseApps.
+    /// Value "policy|app;app;..." (an empty part = absent).
+    BgApps,
 }
 
 impl Kind {
@@ -85,6 +91,10 @@ const TWEAKS: &[Tweak] = &[
         why: "'Enhance pointer precision' off: the cursor moves 1:1 with your hand. A preference - Halo uses raw input and is not affected. You may want a higher mouse DPI." },
     Tweak { id: "hibernate", name: "Hibernation off (frees disk space)", group: G_POWER, kind: Kind::Hibernate, target: "0", optional: true,
         why: "Deletes hiberfil.sys (about 40 % of your RAM in size). Hibernate disappears from the power menu; Fast Startup is already off on this PC. Disk space only, not speed." },
+    Tweak { id: "bgapps", name: "Background apps off (Xbox apps allowed)", group: G_POWER, kind: Kind::BgApps, target: BG_TARGET, optional: true,
+        why: "Store apps (Weather, Photos, Phone Link, Teams...) can no longer run in the background. The Xbox app, Game Bar, Xbox sign-in, Gaming Services and the Store are exempt, so invites, Game Pass downloads and sign-in keep working. Normal desktop programs are not affected. Small gain: less background activity and RAM." },
+    Tweak { id: "vbs", name: "Virtualization-based security (VBS) off", group: G_POWER, kind: Kind::Vbs, target: "0|0", optional: true,
+        why: "Stops Windows running its security layer in a hidden virtual machine. Memory Integrity is already off here, so the gain is small (0-5 % in some games). Costs security: Windows Hello enhanced sign-in, Credential Guard-style protection and Memory Integrity stop working. Restart needed. Hyper-V / WSL keep working." },
 ];
 
 /// Popular tweaks this tab does not offer, and why (from the research).
@@ -128,6 +138,12 @@ struct State {
     /// Settings > Power mode overlay GUID; empty = Balanced (no overlay)
     overlay: String,
     hibernate: Option<u32>,
+    /// "vbs|hello" (an empty part = absent)
+    vbs: Option<String>,
+    /// Win32_DeviceGuard VirtualizationBasedSecurityStatus: 0 off, 1 configured, 2 running
+    vbs_status: Option<u32>,
+    /// "policy|app;app" (an empty part = absent)
+    bgapps: Option<String>,
     hiberfil_gb: Option<f32>,
     // checks (read only)
     game_mode: Option<u32>,
@@ -207,6 +223,8 @@ impl State {
             // "plan-guid:value" so undo goes back to the same power plan
             Kind::Epp => self.epp.map(|v| if self.scheme.is_empty() { v.to_string() } else { format!("{}:{v}", self.scheme) }),
             Kind::Hibernate => self.hibernate.map(|v| v.to_string()),
+            Kind::Vbs => self.vbs.clone(),
+            Kind::BgApps => self.bgapps.clone(),
         }
     }
 
@@ -224,6 +242,8 @@ impl State {
         match kind {
             Kind::Epp => self.epp.is_some() && !self.overlay_active(),
             Kind::Mouse => self.mouse.is_some(),
+            // only when the VBS state could be read (it is HKLM; nothing to compare otherwise)
+            Kind::Vbs => self.vbs_status.is_some(),
             _ => true,
         }
     }
@@ -328,6 +348,13 @@ if ($null -eq $o.hibernate) { $o.hibernate = RegD 'HKLM:\SYSTEM\CurrentControlSe
 # list the folder instead of opening the (locked) file
 $hf = Get-ChildItem -LiteralPath 'C:\' -Force -Filter 'hiberfil.sys' -ErrorAction SilentlyContinue | Select-Object -First 1
 $o.hiberfil_gb = if ($hf) { [math]::Round($hf.Length / 1GB, 1) } else { $null }
+$dgk = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'
+$v1 = RegD $dgk 'EnableVirtualizationBasedSecurity'; $v2 = RegD "$dgk\Scenarios\WindowsHello" 'Enabled'
+$o.vbs = '{0}|{1}' -f $v1, $v2
+$bgk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'
+$bp = RegD $bgk 'LetAppsRunInBackground'; $ba = RegV $bgk 'LetAppsRunInBackground_ForceAllowTheseApps'
+$o.bgapps = '{0}|{1}' -f $bp, ((@($ba) | Where-Object { $_ }) -join ';')
+try { $o.vbs_status = [uint32](Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop).VirtualizationBasedSecurityStatus } catch { $o.vbs_status = $null }
 $o.game_mode = RegD 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled'
 $o.hags = RegD 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode'
 $o.app_capture = RegD 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled'
@@ -412,6 +439,17 @@ fn fmt(kind: Kind, v: Option<&str>) -> String {
         (Kind::ClassicMenu, None) => "Windows 11 menu".into(),
         (Kind::Epp, Some(v)) => epp_number(v).to_string(),
         (Kind::Epp, None) => "-".into(),
+        (Kind::Vbs, Some(p)) => match split_pair(p) {
+            (Some("0"), Some("0") | None) => "Off".into(),
+            _ => "On".into(),
+        },
+        (Kind::Vbs, None) => "On (default)".into(),
+        (Kind::BgApps, Some(p)) => match split_pair(p).0 {
+            Some("2") => "Off (Xbox apps allowed)".into(),
+            Some("1") => "Always on (policy)".into(),
+            _ => "On (Windows default)".into(),
+        },
+        (Kind::BgApps, None) => "On (Windows default)".into(),
         (Kind::Hibernate, Some("0")) => "Off".into(),
         (Kind::Hibernate, _) => "On".into(),
         (_, Some(x)) => x.to_string(),
@@ -493,8 +531,50 @@ $left = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue; if ($left -and $
             let onoff = if value == Some("0") { "off" } else { "on" };
             format!("$o = powercfg /hibernate {onoff}; if ($LASTEXITCODE -ne 0) {{ throw (($o | Out-String).Trim()) }}")
         }
+        Kind::Vbs => {
+            // "vbs|hello": each value set, or removed when its part is empty (exact undo)
+            let (vbs, hello) = value.map(split_pair).unwrap_or((None, None));
+            let one = |key: &str, name: &str, v: Option<&str>| match v {
+                Some(n) => format!(
+                    "$k = {k}; if (-not (Test-Path -LiteralPath $k)) {{ New-Item -Path $k -Force | Out-Null }}; Set-ItemProperty -LiteralPath $k -Name {name} -Type DWord -Value {n} -ErrorAction Stop",
+                    k = q(key),
+                    n = num(Some(n), 0)
+                ),
+                None => format!("Remove-ItemProperty -LiteralPath {} -Name {name} -ErrorAction SilentlyContinue", q(key)),
+            };
+            format!(
+                "{}; {}",
+                one(VBS_KEY, "EnableVirtualizationBasedSecurity", vbs),
+                one(&format!(r"{VBS_KEY}\Scenarios\WindowsHello"), "Enabled", hello)
+            )
+        }
+        Kind::BgApps => {
+            // "policy|app;app": each value set, or removed when its part is empty (exact undo)
+            let (pol, apps) = value.map(split_pair).unwrap_or((None, None));
+            let p = match pol {
+                Some(n) => format!("Set-ItemProperty -LiteralPath $k -Name LetAppsRunInBackground -Type DWord -Value {} -ErrorAction Stop", num(Some(n), 0)),
+                None => "Remove-ItemProperty -LiteralPath $k -Name LetAppsRunInBackground -ErrorAction SilentlyContinue".to_string(),
+            };
+            let a = match apps {
+                Some(list) => {
+                    let items: Vec<String> = list.split(';').map(str::trim).filter(|s| !s.is_empty()).map(q).collect();
+                    format!("Set-ItemProperty -LiteralPath $k -Name LetAppsRunInBackground_ForceAllowTheseApps -Type MultiString -Value @({}) -ErrorAction Stop", items.join(", "))
+                }
+                None => "Remove-ItemProperty -LiteralPath $k -Name LetAppsRunInBackground_ForceAllowTheseApps -ErrorAction SilentlyContinue".to_string(),
+            };
+            format!(
+                "$k = {k}; if (-not (Test-Path -LiteralPath $k)) {{ New-Item -Path $k -Force | Out-Null }}; {p}; {a}; \
+$left = Get-Item -LiteralPath $k -ErrorAction SilentlyContinue; if ($left -and $left.ValueCount -eq 0 -and $left.SubKeyCount -eq 0) {{ Remove-Item -LiteralPath $k -ErrorAction SilentlyContinue }}",
+                k = q(BG_KEY)
+            )
+        }
     }
 }
+
+const VBS_KEY: &str = r"HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard";
+const BG_KEY: &str = r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy";
+/// Force Deny (2), with the Xbox / gaming / Store apps allowed to keep running in the background.
+const BG_TARGET: &str = "2|Microsoft.GamingApp_8wekyb3d8bbwe;Microsoft.XboxGamingOverlay_8wekyb3d8bbwe;Microsoft.XboxIdentityProvider_8wekyb3d8bbwe;Microsoft.Xbox.TCUI_8wekyb3d8bbwe;Microsoft.XboxSpeechToTextOverlay_8wekyb3d8bbwe;Microsoft.GamingServices_8wekyb3d8bbwe;Microsoft.WindowsStore_8wekyb3d8bbwe";
 
 const SPI_TYPE: &str = "Add-Type -Namespace PCT -Name Spi -MemberDefinition '[DllImport(\"user32.dll\", SetLastError = true)] public static extern bool SystemParametersInfo(uint a, uint u, IntPtr p, uint f); [DllImport(\"user32.dll\", SetLastError = true)] public static extern bool SystemParametersInfo(uint a, uint u, int[] p, uint f);'\n";
 
@@ -620,6 +700,8 @@ pub struct PerfTab {
     explorer_preview: bool,
     demo: bool,
     note: Option<String>,
+    /// Defender exclusions for game folders (its own card and history)
+    defender: crate::defender::DefenderCard,
 }
 
 /// Preview window for restarting Explorer (same wording as the Startup tab).
@@ -653,6 +735,7 @@ impl PerfTab {
             explorer_preview: false,
             demo: false,
             note: None,
+            defender: crate::defender::DefenderCard::new(),
         };
         if let Some(stage) = opwin::demo_stage("perf") {
             let changes = vec![
@@ -704,6 +787,10 @@ impl PerfTab {
         let kinds: Vec<Kind> = changes.iter().filter_map(|c| tweak(&c.id).map(|t| t.kind)).collect();
         if kinds.iter().any(|k| matches!(k, Kind::Hibernate)) {
             w.warning = Some("Hibernation changes delete or re-create C:\\hiberfil.sys.".into());
+        }
+        if kinds.iter().any(|k| matches!(k, Kind::Vbs)) {
+            w.warning = Some("VBS off lowers Windows security (Windows Hello enhanced sign-in and Memory Integrity stop working). Only the restart applies it.".into());
+            w.notes.push("Restart the PC for the VBS change to take effect. System Information then shows 'Virtualization-based security: Not enabled'.".into());
         }
         if kinds.iter().any(|k| k.needs_explorer()) {
             w.notes.push("Taskbar and right-click changes show after Explorer restarts (or after signing out).".into());
@@ -887,9 +974,14 @@ impl Tab for PerfTab {
         "Performance"
     }
 
+    fn busy(&self) -> bool {
+        self.run.is_some() || self.defender.busy()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.pump();
         self.window(ui.ctx());
+        self.defender.pump(ui.ctx());
         if self.loading.is_some() || self.run.is_some() || self.explorer.is_some() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -1072,6 +1164,8 @@ impl PerfTab {
         });
         ui.add_space(6.0);
 
+        self.defender.card(ui);
+
         // ---- left alone
         theme::card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1152,6 +1246,20 @@ mod tests {
         assert!(set_stmt(Kind::Epp, Some("10")).contains(&format!("{SUB_PROCESSOR} {PERFEPP} 10")));
         assert!(set_stmt(Kind::Epp, Some("250")).contains(" 100;"), "EPP is clamped to 100");
         assert!(set_stmt(Kind::Hibernate, Some("0")).contains("/hibernate off"));
+        // VBS: both values set; undo restores each one (an empty part = remove it)
+        let s = set_stmt(Kind::Vbs, Some("0|0"));
+        assert!(s.contains("-Name EnableVirtualizationBasedSecurity -Type DWord -Value 0") && s.contains(r"Scenarios\WindowsHello") && s.contains("-Name Enabled -Type DWord -Value 0"));
+        let s = set_stmt(Kind::Vbs, Some("1|"));
+        assert!(s.contains("EnableVirtualizationBasedSecurity -Type DWord -Value 1") && s.contains("Remove-ItemProperty") && s.contains("-Name Enabled"));
+        assert_eq!(fmt(Kind::Vbs, Some("1|1")), "On");
+        assert_eq!(fmt(Kind::Vbs, Some("0|0")), "Off");
+        // background apps: Force Deny with the Xbox apps exempt; undo removes what was absent
+        let s = set_stmt(Kind::BgApps, Some(BG_TARGET));
+        assert!(s.contains("LetAppsRunInBackground -Type DWord -Value 2") && s.contains("-Type MultiString -Value @('Microsoft.GamingApp_8wekyb3d8bbwe'"));
+        assert!(BG_TARGET.contains("Microsoft.GamingServices_8wekyb3d8bbwe") && BG_TARGET.contains("Microsoft.XboxIdentityProvider_8wekyb3d8bbwe"));
+        let s = set_stmt(Kind::BgApps, Some("|"));
+        assert!(s.matches("Remove-ItemProperty").count() == 2 && s.contains("ValueCount -eq 0"));
+        assert_eq!(fmt(Kind::BgApps, Some("|")), "On (Windows default)");
         assert!(set_stmt(Kind::Hibernate, None).contains("/hibernate on"));
         // EPP: apply on the active plan; undo on the plan that was changed, without switching plans
         let g = "381b4222-f694-41f0-9685-ff5bb260df2e";
@@ -1291,6 +1399,7 @@ mod tests {
             explorer_preview: false,
             demo: true,
             note: None,
+            defender: crate::defender::DefenderCard::new(),
         };
         tab.open_explorer_preview();
         assert!(tab.op.is_some() && tab.explorer_preview, "a preview opens first");
