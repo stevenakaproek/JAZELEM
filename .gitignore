@@ -1,0 +1,14 @@
+# build output
+pctuner/target/
+
+# binaries and packages (publish PCTuner.exe as a GitHub Release instead)
+*.exe
+*.zip
+
+# personal data from this PC
+services-backup-*.csv
+screenshots/
+ServiceManager/
+GamingNetTweak/
+RTX5080/backups/
+*.log

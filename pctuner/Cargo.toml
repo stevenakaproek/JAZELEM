@@ -1,0 +1,24 @@
+[package]
+name = "pctuner"
+version = "1.0.0"
+edition = "2021"
+description = "PC Tuner - services, startup, scheduler, bloat removal, USB port finder and RTX 5080 profiles in one app"
+
+[dependencies]
+eframe = "0.29"
+egui_extras = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+winreg = "0.52"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Shell"] }
+
+[build-dependencies]
+embed-manifest = "1.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
