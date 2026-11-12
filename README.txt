@@ -224,6 +224,24 @@ change (with a warning if it is risky), then a progress bar, then each item
 ticking off with a count and an Undo button. Nothing is applied until you
 press the green button in that window.
 
+Performance tab:
+- Built from researched evidence: most "gaming tweaks" online are placebo or
+  harmful on Windows 11; the tab lists those under "Left alone on purpose".
+- Checks (read only): Game Mode, GPU scheduling (HAGS), background recording,
+  refresh rate (flags a 540 Hz PG27AQWP-W running at 500 Hz: needs a DP 2.1
+  UHBR20 cable), animations, transparency, USB suspend, PCIe power saving,
+  Do Not Disturb while gaming (opens the setting).
+- Recommended: Optimizations for windowed games (flip model for DX10/11
+  borderless games), faster submenus (400 -> 100 ms, applies at once).
+- Optional: Windows VRR for old DX11 games, faster tooltips, taskbar
+  animations off, faster taskbar thumbnails, no startup-app delay, classic
+  right-click menu, CPU energy preference 25 -> 10, mouse acceleration off,
+  hibernation off (frees hiberfil.sys, ~12.6 GB here).
+- Taskbar / right-click changes need "Restart Explorer" (not during a game).
+- Every change is saved in %LOCALAPPDATA%\PCTuner\perf-history.json and
+  "Undo last change" restores the exact previous values (failed parts stay
+  in the history so they can be undone again).
+
 Fan Tuner tab:
 - Needs the PawnIO driver (already installed on this PC) and PC Tuner run as
   administrator. Without admin only the graphics card is shown and nothing

@@ -31,6 +31,10 @@ Game Pass, Steam, Easy Anti-Cheat, the Store, Windows Security or Edge depends o
 - **RTX 5080 Profiles** - live clock / temperature / power / load graphs, presets, an always-visible
   **Reset GPU to stock**, and a safety trial that puts the GPU back on Stock at the next sign-in
   if Windows logs a crash while a new tune is being tested.
+- **Performance** - evidence-based settings for games and a snappier desktop (flip model for
+  windowed DX10/11 games, faster menus, optional taskbar / mouse / power tweaks), read-only checks
+  (Game Mode, HAGS, refresh rate, power saving) and a list of popular tweaks left alone because
+  they are placebo or harmful.
 - **Fan Tuner** - live fan RPM / duty and CPU / GPU / board temperatures; per fan: BIOS, Manual
   (slider) or Curve (draggable points, follows CPU, GPU or the hotter of the two); Silent / Balanced /
   Performance profiles plus your own, the last one applied at startup. Safety: never below 20 %

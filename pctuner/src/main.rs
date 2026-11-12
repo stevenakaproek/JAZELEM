@@ -8,6 +8,7 @@ mod fan;
 mod gpu;
 mod network;
 mod opwin;
+mod perf;
 mod scheduler;
 mod services;
 mod startup;
@@ -26,6 +27,7 @@ fn tab_icon(title: &str) -> &'static str {
         "Remove Bloat" => "🗑",
         "Post-install Tweaks" => "🔧",
         "Network" => "🌐",
+        "Performance" => "⚡",
         "CPU Scheduler" => "⏱",
         "RTX 5080 Profiles" => "🎮",
         "Fan Tuner" => "🌀",
@@ -53,13 +55,14 @@ impl App {
                 Box::new(bloat::BloatTab::new()),
                 Box::new(tweaks::TweaksTab::new()),
                 Box::new(network::NetworkTab::new()),
+                Box::new(perf::PerfTab::new()),
                 Box::new(scheduler::SchedulerTab::new()),
                 Box::new(gpu::GpuTab::new()),
                 Box::new(fan::FanTab::new()),
                 Box::new(usb::UsbTab::new()),
             ],
             // PCTUNER_TAB=<index> opens on that tab (used with the self-test to screenshot one tab)
-            active: std::env::var("PCTUNER_TAB").ok().and_then(|v| v.parse::<usize>().ok()).filter(|i| *i < 9).unwrap_or(0),
+            active: std::env::var("PCTUNER_TAB").ok().and_then(|v| v.parse::<usize>().ok()).filter(|i| *i < 10).unwrap_or(0),
             admin: common::is_admin(),
             switched_at: 0.0,
             selftest: std::env::var_os("PCTUNER_SELFTEST").map(|_| std::time::Instant::now()),
@@ -252,7 +255,8 @@ fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PC Tuner")
-            .with_inner_size([1250.0, 780.0])
+            // PCTUNER_HEIGHT=<px>: taller window for self-test screenshots of long pages
+            .with_inner_size([1250.0, std::env::var("PCTUNER_HEIGHT").ok().and_then(|v| v.parse::<f32>().ok()).filter(|h| (520.0..=4000.0).contains(h)).unwrap_or(780.0)])
             .with_min_inner_size([950.0, 520.0]),
         ..Default::default()
     };

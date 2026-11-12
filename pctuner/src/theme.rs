@@ -188,12 +188,18 @@ pub fn stat(ui: &mut egui::Ui, value: &str, label: &str, color: Color32) {
 
 /// Rounded pill label.
 pub fn chip(ui: &mut egui::Ui, text: &str, c: Color32) {
+    chip_response(ui, text, c);
+}
+
+/// `chip` that returns its response (for a hover tooltip).
+pub fn chip_response(ui: &mut egui::Ui, text: &str, c: Color32) -> egui::Response {
     // Painted at its natural size: never stretches to a tall row and never wraps inside the pill.
     let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(12.5), c);
     let size = galley.size() + Vec2::new(20.0, 8.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
     ui.painter().rect_filled(rect, size.y / 2.0, tint(c, 30));
     ui.painter().galley(rect.min + Vec2::new(10.0, 4.0), galley, c);
+    resp
 }
 
 // ------------------------------------------------------------------ buttons and bars

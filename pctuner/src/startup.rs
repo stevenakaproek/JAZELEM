@@ -347,6 +347,11 @@ pub struct Entry {
     loc: Loc,
 }
 
+/// A scheduled task of Windows itself (path under \Microsoft\). Many of these are protected.
+fn is_windows_task(e: &Entry) -> bool {
+    e.kind == Kind::Task && e.loc.task_path.as_deref().unwrap_or(&e.location).to_lowercase().starts_with(r"\microsoft\")
+}
+
 /// One history record (same shape as the PS tool's history.json).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Hist {
@@ -720,7 +725,7 @@ foreach ($l in $__lines) {
 }
 "#;
 
-const EXPLORER_SCRIPT: &str = "Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force\nStart-Sleep -Seconds 2\nif (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }";
+pub const EXPLORER_SCRIPT: &str ="Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force\nStart-Sleep -Seconds 2\nif (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }";
 
 // ------------------------------------------------------------------ scanners
 
@@ -997,8 +1002,15 @@ fn fill_publishers(raw: &mut Raw, warnings: &mut Vec<String>) {
             Some(p) => company.get(&p.to_lowercase()).cloned().unwrap_or_default(),
         };
         if e.publisher == "(file missing)" && e.category != "Keep" && matches!(e.kind, Kind::Run | Kind::StartupFolder | Kind::Task) {
-            e.category = "Junk";
-            e.advice = "Junk - points to a file that no longer exists";
+            if is_windows_task(e) {
+                // e.g. \Microsoft\Windows\UpdateOrchestrator\USO_UxBroker -> MusNotification.exe on newer builds:
+                // Windows protects these tasks (switching off fails even as admin) and they cannot run anyway
+                e.category = "Windows";
+                e.advice = "Windows task - its file no longer exists, so it cannot run; protected by Windows (harmless, leave it)";
+            } else {
+                e.category = "Junk";
+                e.advice = "Junk - points to a file that no longer exists";
+            }
         }
     }
 }
@@ -1132,7 +1144,7 @@ fn explain(op: &Op, err: &str) -> String {
     if op.kind == Kind::Tweak && (low.contains("unauthorized") || low.contains("denied")) {
         let mut why = "Windows' UCPD protection blocks this value from scripts. Set it with Group Policy instead (gpedit.msc).".to_string();
         if op.name.starts_with("Widgets") {
-            why.push_str("\n    Computer Configuration > Administrative Templates > Windows Components > Widgets > 'Allow widgets' = Disabled, then sign out.");
+            why.push_str("\n    Computer Configuration > Administrative Templates > Windows Components > Widgets: 'Allow widgets' = Disabled and 'Disable widgets on the lock screen' = Enabled, then sign out.");
         }
         return why;
     }
@@ -2213,6 +2225,15 @@ mod tests {
         assert_eq!(ids, ["h2", "h0"]);
         assert_eq!(u.win.items[0].detail, "back on");
         assert!(matches!(&u.what, What::Undo { idx } if idx == &vec![2, 0]));
+    }
+
+    #[test]
+    fn startup_windows_tasks_detected() {
+        let loc = |p: &str| Loc { task_path: Some(p.into()), task_name: Some("USO_UxBroker".into()), ..Default::default() };
+        let uso = new_entry(Kind::Task, "USO_UxBroker", r"\Microsoft\Windows\UpdateOrchestrator\", r"%systemroot%\system32\MusNotification.exe", true, loc(r"\Microsoft\Windows\UpdateOrchestrator\"), "");
+        assert!(is_windows_task(&uso), "Windows' own tasks are recognised (they are protected)");
+        let brave = new_entry(Kind::Task, "BraveSoftwareUpdateTask", r"\", r"C:\gone\updater.exe", true, loc(r"\"), "");
+        assert!(!is_windows_task(&brave), "a third-party task with a missing file is still junk");
     }
 
     #[test]

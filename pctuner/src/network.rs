@@ -606,8 +606,12 @@ impl NetworkTab {
                 }
             }
             Some(i) => {
+                // only what was really put back leaves the history; failed parts can be undone again
+                // ("restart" is the adapter restart step, not a stored change)
                 if let Some(h) = self.history.get_mut(i) {
-                    h.undone = true;
+                    h.changes.retain(|c| !ok_ids.contains(&c.id));
+                    h.undone = h.changes.is_empty();
+                    can_undo = !h.undone;
                 }
                 common::save_json(HISTORY, &self.history);
             }

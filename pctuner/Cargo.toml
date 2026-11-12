@@ -1,6 +1,6 @@
 [package]
 name = "pctuner"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 description = "PC Tuner - services, startup, scheduler, bloat removal, network, fan control, USB port finder and RTX 5080 profiles in one app"
 
