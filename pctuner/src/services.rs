@@ -826,6 +826,8 @@ pub struct ServicesTab {
     /// History batch written by the operation shown in the result stage (for its Undo button).
     op_batch: Option<u64>,
     show_history: bool,
+    /// The Backups window while it is open.
+    backups: Option<crate::svcbackup::BackupsWindow>,
     hist_sel: HashSet<usize>,
 }
 
@@ -864,6 +866,7 @@ impl ServicesTab {
             op_kind: None,
             op_batch: None,
             show_history: false,
+            backups: None,
             hist_sel: HashSet::new(),
         }
     }
@@ -948,6 +951,8 @@ impl ServicesTab {
         let info: HashMap<String, (String, bool)> = self.list.iter().map(|s| (s.name.clone(), (s.display.clone(), s.state == "Running"))).collect();
         self.last_action = "Applying...".into();
         self.job = Some(Job::spawn(move || {
+            // a full backup first, if there is none yet (one of the ways back)
+            let _ = crate::svcbackup::ensure_backup();
             let outcome = apply_plan(&System, plan, batch, stop, info);
             JobResult::Applied { outcome, verb, preset }
         }));
@@ -1329,7 +1334,7 @@ impl Tab for ServicesTab {
 
     /// A service change is running: closing PC Tuner waits for it.
     fn busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.backups.as_ref().map(|b| b.busy()).unwrap_or(false)
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
@@ -1353,7 +1358,16 @@ impl Tab for ServicesTab {
         let ctx = ui.ctx().clone();
         let can = common::is_admin() && !self.busy();
         self.op_window(&ctx, can);
-        if self.op.is_none() {
+        if let Some(b) = &mut self.backups {
+            let (keep, changed) = b.show(&ctx);
+            if !keep {
+                self.backups = None;
+            }
+            if changed {
+                self.start_load();
+            }
+        }
+        if self.op.is_none() && self.backups.is_none() {
             self.history_window(&ctx);
         }
 
@@ -1362,10 +1376,13 @@ impl Tab for ServicesTab {
         let right = ui.max_rect().right();
         theme::page_header(ui, "Services", "Change startup types with full undo. Gaming dependencies warn first; core Windows services are locked.");
         {
-            let r = egui::Rect::from_min_max(egui::pos2(right - 280.0, top.y), egui::pos2(right, top.y + 32.0));
+            let r = egui::Rect::from_min_max(egui::pos2(right - 380.0, top.y), egui::pos2(right, top.y + 32.0));
             let mut bar = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::right_to_left(egui::Align::Center)));
             if bar.add_enabled(self.load_job.is_none(), egui::Button::new("Refresh")).on_hover_text("Read the service list again.").clicked() {
                 self.start_load();
+            }
+            if bar.button("Backups").on_hover_text("Save or restore the startup type of every service.").clicked() {
+                self.backups = Some(crate::svcbackup::BackupsWindow::new());
             }
             if bar.button("History").on_hover_text("Every change made here, with undo per entry.").clicked() {
                 self.show_history = true;

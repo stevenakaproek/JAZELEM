@@ -384,3 +384,14 @@ Tray, Power and extra Performance options (1.3.1):
 - Performance > Defender: game folders: excludes Steam / XboxGames / Epic /
   EA / Battle.net (and folders you add) from Defender scans. Undo removes only
   the exclusions PC Tuner added. Needs administrator.
+
+Services backups (1.3.2):
+- Services > Backups > Create backup now saves the startup type of every
+  service to Documents\PCTuner-Backups\Services. PC Tuner also makes one by
+  itself before the first service change.
+- Restore this backup (in the app) shows which services differ, then puts
+  them back: sc.exe config, then a registry write, then - for services
+  Windows protects - the same write as SYSTEM. Restart afterwards.
+- Every backup also has RESTORE-services-<time>.cmd (right-click > Run as
+  administrator; works in Safe Mode; skips services that already match) and
+  services-<time>.reg (full export of the services registry key).

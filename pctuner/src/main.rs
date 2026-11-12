@@ -10,6 +10,7 @@ mod network;
 mod opwin;
 mod defender;
 mod perf;
+mod svcbackup;
 mod power;
 mod tray;
 mod scheduler;
