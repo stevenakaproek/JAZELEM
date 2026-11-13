@@ -328,6 +328,64 @@ pub fn as_system<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R
 mod tests {
     use super::*;
 
+    /// Opt-in, needs an elevated prompt (`cargo test winsvc_admin -- --ignored --nocapture`).
+    /// Round trip on AxInstSV (ActiveX Installer - Manual, stopped, harmless): Disabled, Automatic (Delayed),
+    /// back; start and stop; a registry write as SYSTEM. Its original startup type and state are always put back.
+    #[test]
+    #[ignore]
+    fn winsvc_admin_round_trip() {
+        const S: &str = "AxInstSV";
+        let key = || winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).open_subkey(format!(r"SYSTEM\CurrentControlSet\Services\{S}")).unwrap();
+        let read = || -> (u32, Option<u32>) { let k = key(); (k.get_value("Start").unwrap(), k.get_value("DelayedAutostart").ok()) };
+        let orig = read();
+        let was_running = is_running(S) == Some(true);
+        println!("{S} before: Start={} Delayed={:?} running={was_running}", orig.0, orig.1);
+        let result = std::panic::catch_unwind(|| {
+            set_start(S, 4, None).expect("set Disabled");
+            assert_eq!(read().0, 4);
+            println!("ok: Disabled");
+            set_start(S, 2, Some(true)).expect("set Automatic (Delayed)");
+            assert_eq!(read(), (2, Some(1)));
+            println!("ok: Automatic (Delayed)");
+            set_start(S, 3, None).expect("set Manual");
+            start(S).expect("start");
+            std::thread::sleep(Duration::from_secs(2));
+            assert_eq!(is_running(S), Some(true));
+            println!("ok: started");
+            stop(S).expect("stop");
+            assert_eq!(is_running(S), Some(false));
+            println!("ok: stopped");
+            as_system(|| {
+                let k = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+                    .open_subkey_with_flags(format!(r"SYSTEM\CurrentControlSet\Services\{S}"), winreg::enums::KEY_SET_VALUE)
+                    .unwrap();
+                k.set_value("Start", &4u32).unwrap();
+            })
+            .expect("as SYSTEM");
+            assert_eq!(read().0, 4);
+            println!("ok: registry write as SYSTEM");
+        });
+        // always put it back as it was
+        let back = match orig.1 {
+            Some(1) if orig.0 == 2 => set_start(S, 2, Some(true)),
+            _ => set_start(S, orig.0, if orig.0 == 2 { Some(false) } else { None }),
+        };
+        let k = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(format!(r"SYSTEM\CurrentControlSet\Services\{S}"), winreg::enums::KEY_SET_VALUE)
+            .unwrap();
+        match orig.1 {
+            Some(d) => k.set_value("DelayedAutostart", &d).unwrap(),
+            None => { let _ = k.delete_value("DelayedAutostart"); }
+        }
+        if was_running { let _ = start(S); } else { let _ = stop(S); }
+        back.expect("put back");
+        assert_eq!(read(), orig, "{S} is back as it was");
+        println!("{S} put back: Start={} Delayed={:?}", orig.0, orig.1);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
     /// Opt-in (`cargo test -- --ignored winsvc_same_as`): the native list against what PowerShell's
     /// Win32_Service returned before - same services, same states. Read-only; PowerShell is used only here.
     #[test]
