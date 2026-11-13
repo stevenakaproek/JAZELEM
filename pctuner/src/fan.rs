@@ -1004,6 +1004,54 @@ pub struct FanTab {
     pin_dirty: Option<Instant>,
     /// The fan whose curve is open in the large editor.
     editor: Option<String>,
+    /// PCTUNER_FAN=rust: the Rust sensor reader in place of the C# helper (read-only, stage 2).
+    rust: Option<RustReader>,
+}
+
+/// PCTUNER_FAN=rust selects the Rust hardware backend (read-only while it is being proven).
+fn rust_mode() -> bool {
+    std::env::var("PCTUNER_FAN").map(|v| v.eq_ignore_ascii_case("rust")).unwrap_or(false)
+}
+
+/// Reads the sensors in Rust (crate::hw) once a second into the same Shared the helper's reader thread fills.
+/// Never controls a fan. Stops when dropped.
+struct RustReader {
+    stop: Arc<AtomicBool>,
+    /// Parts that could not be opened (e.g. the board chip without administrator rights).
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
+impl RustReader {
+    fn start(shared: Arc<Mutex<Shared>>) -> RustReader {
+        let stop = Arc::new(AtomicBool::new(false));
+        let errors = Arc::new(Mutex::new(vec![]));
+        let (s, e) = (stop.clone(), errors.clone());
+        std::thread::spawn(move || {
+            let sensors = crate::hw::Sensors::open();
+            if let Ok(mut e) = e.lock() {
+                *e = sensors.errors.clone();
+            }
+            while !s.load(Ordering::Relaxed) {
+                let st = sensors.read();
+                if let Ok(mut sh) = shared.lock() {
+                    sh.exited = false;
+                    sh.take_status(st);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+        RustReader { stop, errors }
+    }
+
+    fn errors(&self) -> Vec<String> {
+        self.errors.lock().map(|e| e.clone()).unwrap_or_default()
+    }
+}
+
+impl Drop for RustReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl FanTab {
@@ -1042,6 +1090,7 @@ impl FanTab {
             note: None,
             pin_dirty: None,
             editor: None,
+            rust: None,
         };
         // apply the last profile at startup (only as administrator: otherwise nothing can be controlled)
         if startup && !demo {
@@ -1144,6 +1193,32 @@ impl FanTab {
             sh.status = None;
             sh.last = None;
         }
+        if rust_mode() {
+            // stage 2: sensors read in Rust, no C# helper and no fan control
+            self.rust = Some(RustReader::start(self.shared.clone()));
+            self.error = None;
+            // nothing is applied in this mode: never claim a startup profile was
+            if self.note.as_deref().is_some_and(|n| n.contains("applied")) {
+                self.note = Some("Saved fan settings are kept but not applied: fan control is off in the Rust sensor preview.".into());
+            }
+        } else {
+            self.start_helper(launch);
+        }
+        if !first {
+            // the Afterburner check below is already running
+            return;
+        }
+        // is MSI Afterburner running? (it may also be driving the GPU fans)
+        let flag = Arc::downgrade(&self.afterburner);
+        std::thread::spawn(move || loop {
+            let Some(f) = flag.upgrade() else { break };
+            f.store(crate::winsvc::process_pid("MSIAfterburner.exe").is_some(), Ordering::Relaxed);
+            drop(f);
+            std::thread::sleep(Duration::from_secs(5));
+        });
+    }
+
+    fn start_helper(&mut self, launch: Launch) {
         match Helper::start(self.shared.clone(), launch) {
             Ok(h) => {
                 self.helper = Some(h);
@@ -1157,21 +1232,6 @@ impl FanTab {
             }
             Err(e) => self.error = Some(e),
         }
-        if !first {
-            // the Afterburner check below is already running
-            return;
-        }
-        // is MSI Afterburner running? (it may also be driving the GPU fans)
-        let flag = Arc::downgrade(&self.afterburner);
-        std::thread::spawn(move || loop {
-            let Some(f) = flag.upgrade() else { break };
-            let running = common::run("tasklist", &["/FI", "IMAGENAME eq MSIAfterburner.exe", "/NH"])
-                .map(|(_, out)| out.to_ascii_lowercase().contains("msiafterburner.exe"))
-                .unwrap_or(false);
-            f.store(running, Ordering::Relaxed);
-            drop(f);
-            std::thread::sleep(Duration::from_secs(5));
-        });
     }
 
     /// Send every setting / pump choice that changed since it was last sent.
@@ -1522,7 +1582,7 @@ impl FanTab {
         match self.shared.lock() {
             Ok(sh) => {
                 let age = sh.last.map(|t| t.elapsed());
-                let stale = sh.exited || self.helper.is_none() || age.is_some_and(|a| a > STALE_AFTER);
+                let stale = sh.exited || (self.helper.is_none() && self.rust.is_none()) || age.is_some_and(|a| a > STALE_AFTER);
                 let stale_for = (sh.status.is_some() && stale).then(|| age.unwrap_or_default());
                 (sh.status.clone(), sh.rpm.clone(), sh.cpu.clone(), sh.gpu.clone(), stale_for)
             }
@@ -1574,7 +1634,8 @@ impl Tab for FanTab {
         }
         self.watch();
         ui.ctx().request_repaint_after(Duration::from_millis(500));
-        let can = common::is_admin() || self.demo;
+        // the Rust reader (stage 2) only reads: no fan is controlled in that mode
+        let can = (common::is_admin() || self.demo) && self.rust.is_none();
 
         let mut give_back = false;
         ui.horizontal(|ui| {
@@ -1600,6 +1661,14 @@ impl Tab for FanTab {
         if let Some(e) = &self.error {
             theme::banner(ui, theme::LOCKED, e);
         }
+        if let Some(r) = &self.rust {
+            let mut text = "Rust sensor reader (preview): readings come from PC Tuner itself, without the fan helper. Fan control is off in this mode - your saved settings are kept, not applied.".to_string();
+            let errs = r.errors();
+            if !errs.is_empty() {
+                text.push_str(&format!(" Not available: {}.", errs.join("; ")));
+            }
+            theme::banner(ui, theme::GAMING, &text);
+        }
         let (status, rpm_hist, cpu_hist, gpu_hist, stale_for) = self.snapshot();
         let avg = self.averages();
         // the large editor needs live data; it is never drawn over stale numbers
@@ -1608,7 +1677,7 @@ impl Tab for FanTab {
         let mut actions: Vec<(String, f32, CardAction)> = vec![];
         let mut dismiss = None;
         // a detached (hung) helper may still own fans: never "BIOS control" while it runs
-        let helper_gone = !self.demo && self.helper.is_none() && self.detached.is_none();
+        let helper_gone = !self.demo && self.helper.is_none() && self.detached.is_none() && self.rust.is_none();
         let stuck = !self.demo && self.stuck;
         egui::ScrollArea::vertical().id_salt("fan-page").auto_shrink([false, false]).show(ui, |ui| {
             if let Some(age) = stale_for {

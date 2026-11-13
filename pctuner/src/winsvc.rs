@@ -273,8 +273,8 @@ fn enable_debug_privilege() -> Result<(), String> {
     Ok(())
 }
 
-/// Process id of winlogon.exe (it always runs as SYSTEM).
-fn winlogon_pid() -> Option<u32> {
+/// Process id of the first running process with this executable name (case-insensitive).
+pub fn process_pid(exe: &str) -> Option<u32> {
     let snap = Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) });
     if snap.0 == INVALID_HANDLE_VALUE {
         return None;
@@ -284,7 +284,7 @@ fn winlogon_pid() -> Option<u32> {
     let mut more = unsafe { Process32FirstW(snap.0, &mut e) } != 0;
     while more {
         let n = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
-        if String::from_utf16_lossy(&e.szExeFile[..n]).eq_ignore_ascii_case("winlogon.exe") {
+        if String::from_utf16_lossy(&e.szExeFile[..n]).eq_ignore_ascii_case(exe) {
             return Some(e.th32ProcessID);
         }
         more = unsafe { Process32NextW(snap.0, &mut e) } != 0;
@@ -294,7 +294,7 @@ fn winlogon_pid() -> Option<u32> {
 
 fn system_token() -> Result<Handle, String> {
     enable_debug_privilege()?;
-    let pid = winlogon_pid().ok_or("winlogon.exe was not found")?;
+    let pid = process_pid("winlogon.exe").ok_or("winlogon.exe was not found")?;
     let proc = Handle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });
     if proc.0.is_null() {
         return Err(format!("cannot open winlogon.exe: {}", last_error()));
