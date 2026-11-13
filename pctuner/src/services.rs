@@ -456,6 +456,11 @@ fn live_preset_plan(b: &dyn Backend, include_optional: bool) -> Vec<(String, Str
         .collect()
 }
 
+/// The plan without the services unticked in the preview (preview item ids are service names).
+fn picked_plan(plan: Vec<(String, String)>, unpicked: &HashSet<String>) -> Vec<(String, String)> {
+    plan.into_iter().filter(|(n, _)| !unpicked.contains(n)).collect()
+}
+
 struct Work {
     name: String,
     from: String,
@@ -709,8 +714,10 @@ fn preset_window(include_optional: bool, work: &[Work]) -> OpWindow {
     } else {
         "Telemetry, printing, remote desktop host, unused networking and consumer extras.".into()
     };
-    win.reassure = "No Xbox / Steam services are included. 'Undo last change' reverts the whole preset.".into();
-    win.go_label = "Apply preset".into();
+    win.reassure = "No Xbox / Steam services are included. 'Undo last change' reverts everything this applies.".into();
+    win.go_label = "Apply".into();
+    // every service the preset would change is ticked; untick any to leave it as it is
+    win.pickable = true;
     win.running_text = format!("Applying the {name} preset...");
     win.empty_title = "Already applied".into();
     win.empty_text = format!("The {name} preset is already fully applied.");
@@ -1287,7 +1294,12 @@ impl ServicesTab {
         let Some(op) = self.op.as_mut() else { return };
         match op.show(ctx, can) {
             Some(OpEvent::Go) => match self.op_kind.take() {
-                Some(OpKind::Apply { plan, verb, preset }) => self.start_apply(plan, verb, preset),
+                Some(OpKind::Apply { plan, verb, preset }) => {
+                    // services the user unticked in the preview are left as they are
+                    let unpicked = self.op.as_ref().map(|o| o.unpicked.clone()).unwrap_or_default();
+                    let plan = picked_plan(plan, &unpicked);
+                    self.start_apply(plan, verb, preset)
+                }
                 Some(OpKind::Undo(idx)) => self.start_undo(idx),
                 Some(OpKind::Demo) => {
                     if let Some(op) = self.op.as_mut() {
@@ -1524,6 +1536,26 @@ impl Tab for ServicesTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn services_preset_preview_is_pickable() {
+        let work = vec![
+            Work { name: "DiagTrack".into(), from: "Automatic".into(), to: "Disabled".into() },
+            Work { name: "Spooler".into(), from: "Automatic".into(), to: "Manual".into() },
+        ];
+        for opt in [false, true] {
+            let w = preset_window(opt, &work);
+            assert!(w.pickable && w.unpicked.is_empty(), "every preset service starts ticked");
+            assert_eq!(w.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec!["DiagTrack", "Spooler"]);
+        }
+        // a manual "set to" change stays all-or-nothing
+        assert!(!change_window("Manual", &["Spooler".into()], &[], &work[1..], false, 0).pickable);
+        // unticked services are left out of the plan, the rest keep their order and targets
+        let plan: Vec<(String, String)> = vec![("DiagTrack".into(), "Disabled".into()), ("Spooler".into(), "Manual".into()), ("Fax".into(), "Disabled".into())];
+        let un: HashSet<String> = ["Spooler".to_string()].into();
+        assert_eq!(picked_plan(plan.clone(), &un), vec![plan[0].clone(), plan[2].clone()]);
+        assert_eq!(picked_plan(plan.clone(), &HashSet::new()), plan);
+    }
 
     #[test]
     fn services_base_name() {

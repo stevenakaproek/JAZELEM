@@ -99,6 +99,11 @@ pub struct OpWindow {
     pub fail_phrase: String,
     /// Running stage: bar position 0..=1 for script-driven work (overrides results / items).
     pub progress: Option<f32>,
+    /// Preview: every item gets a tick box (all ticked to start) and Go applies only the ticked ones.
+    pub pickable: bool,
+    /// Ids of the items the user unticked. On Go they are removed from `items`, so the running and
+    /// result stages only show what was really done.
+    pub unpicked: std::collections::HashSet<String>,
     t_done: Option<f64>,
 }
 
@@ -173,7 +178,22 @@ impl OpWindow {
             empty_ok: true,
             fail_phrase: "could not be changed".into(),
             progress: None,
+            pickable: false,
+            unpicked: Default::default(),
             t_done: None,
+        }
+    }
+
+    /// How many items Go will act on (all of them unless the window is pickable and some are unticked).
+    pub fn picked_count(&self) -> usize {
+        self.items.iter().filter(|i| !self.unpicked.contains(&i.id)).count()
+    }
+
+    /// Go was pressed: drop the unticked items so the running / result stages list only what is done.
+    fn keep_picked(&mut self) {
+        if self.pickable {
+            let un = &self.unpicked;
+            self.items.retain(|i| !un.contains(&i.id));
         }
     }
 
@@ -223,7 +243,13 @@ impl OpWindow {
                 let n = self.items.len();
                 match self.stage {
                     Stage::Preview => {
-                        ui.label(RichText::new(format!("Ready to {} {n} {}", self.verb, plural(n, &self.noun))).size(26.0).strong());
+                        let picked = self.picked_count();
+                        let headline = if self.pickable && picked < n {
+                            format!("Ready to {} {picked} of {n} {}", self.verb, plural(n, &self.noun))
+                        } else {
+                            format!("Ready to {} {n} {}", self.verb, plural(n, &self.noun))
+                        };
+                        ui.label(RichText::new(headline).size(26.0).strong());
                         if !self.preview_text.is_empty() {
                             ui.label(RichText::new(&self.preview_text).color(theme::TEXT_DIM));
                         }
@@ -232,16 +258,55 @@ impl OpWindow {
                             theme::banner(ui, theme::GAMING, w);
                             ui.add_space(4.0);
                         }
+                        if self.pickable {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Untick anything you want to keep as it is.").color(theme::TEXT_DIM));
+                                if ui.small_button("Select all").clicked() {
+                                    self.unpicked.clear();
+                                }
+                                if ui.small_button("Select none").clicked() {
+                                    self.unpicked = self.items.iter().map(|i| i.id.clone()).collect();
+                                }
+                            });
+                            ui.add_space(2.0);
+                        }
                         let groups = group_counts(&self.items);
+                        let pickable = self.pickable;
+                        let items = &self.items;
+                        let unpicked = &mut self.unpicked;
                         egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                             ui.set_width(W - 12.0);
                             let single = groups.len() == 1 && n <= 8;
                             for (label, total, _) in &groups {
-                                let body = |ui: &mut egui::Ui| {
-                                    for it in self.items.iter().filter(|i| &i.group == label) {
+                                let mut body = |ui: &mut egui::Ui| {
+                                    if pickable {
+                                        // tick boxes need an outline and square corners to read as tick boxes on the modal
+                                        let w = &mut ui.visuals_mut().widgets;
+                                        for s in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+                                            s.rounding = egui::Rounding::same(3.0);
+                                        }
+                                        w.inactive.bg_stroke = egui::Stroke::new(1.0_f32, theme::TEXT_DIM);
+                                    }
+                                    for it in items.iter().filter(|i| &i.group == label) {
                                         ui.horizontal(|ui| {
-                                            ui.colored_label(if it.optional { theme::OPTIONAL } else { theme::ACCENT }, "•");
-                                            ui.label(&it.name);
+                                            let on = !unpicked.contains(&it.id);
+                                            if pickable {
+                                                let mut tick = on;
+                                                if ui.checkbox(&mut tick, "").changed() {
+                                                    if tick {
+                                                        unpicked.remove(&it.id);
+                                                    } else {
+                                                        unpicked.insert(it.id.clone());
+                                                    }
+                                                }
+                                            } else {
+                                                ui.colored_label(if it.optional { theme::OPTIONAL } else { theme::ACCENT }, "•");
+                                            }
+                                            if on {
+                                                ui.label(&it.name);
+                                            } else {
+                                                ui.label(RichText::new(&it.name).color(theme::TEXT_FAINT).strikethrough());
+                                            }
                                             if !it.detail.is_empty() {
                                                 ui.label(RichText::new(&it.detail).color(theme::TEXT_DIM));
                                             }
@@ -266,7 +331,12 @@ impl OpWindow {
                         }
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(can, theme::primary_button(&format!("   {}   ", self.go_label))).clicked() {
+                            let label = if self.pickable && picked < n { format!("   {} ({picked})   ", self.go_label) } else { format!("   {}   ", self.go_label) };
+                            let go = ui.add_enabled(can && picked > 0, theme::primary_button(&label));
+                            if self.pickable && picked == 0 {
+                                go.on_disabled_hover_text("Tick at least one item.");
+                            } else if go.clicked() {
+                                self.keep_picked();
                                 ev = Some(OpEvent::Go);
                             }
                             if ui.button("Cancel").clicked() {
@@ -459,6 +529,24 @@ pub fn demo_stage(tab: &str) -> Option<Stage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opwin_pick_items() {
+        let items = || vec![OpItem::new("a", "A", "G"), OpItem::new("b", "B", "G"), OpItem::new("c", "C", "G")];
+        let mut w = OpWindow::new("K", "change", "changed", items());
+        w.pickable = true;
+        assert_eq!(w.picked_count(), 3);
+        w.unpicked.insert("b".into());
+        assert_eq!(w.picked_count(), 2);
+        // Go drops the unticked items, so running / result stages list only what is done
+        w.keep_picked();
+        assert_eq!(w.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec!["a", "c"]);
+        // a window that is not pickable never drops items
+        let mut plain = OpWindow::new("K", "change", "changed", items());
+        plain.unpicked.insert("a".into());
+        plain.keep_picked();
+        assert_eq!(plain.items.len(), 3);
+    }
 
     #[test]
     fn opwin_reveal_and_groups() {
