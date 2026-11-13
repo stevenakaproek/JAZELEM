@@ -189,32 +189,75 @@ struct Launch {
     targeted: usize,
 }
 
-/// Add the items unticked in the preview (ids are target names) to the run's -Skip list. The script splits
-/// -Skip on commas. The page's own skip ticks are left as they are: this only affects this run.
-fn skip_more(mut l: Launch, extra: &std::collections::HashSet<String>) -> Launch {
-    if extra.is_empty() {
-        return l;
+/// What runs once the preview is confirmed.
+enum Pending {
+    /// Remove these targets (they are the preview's item ids); items unticked in the preview are left out.
+    Remove { which: Which, title: &'static str, names: Vec<&'static str> },
+    Restore(Launch),
+}
+
+/// Which removal the preview is for: a preset (true = Safe + Optional), or the items selected on the page.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Which {
+    Preset(bool),
+    Selected,
+}
+
+/// Script arguments that remove exactly `picked`: -Optional when a picked item is on the Optional list, and every
+/// other target of the lists that run goes in -Skip (the script splits -Skip on commas).
+fn remove_args(picked: &[&Target]) -> Vec<String> {
+    let optional = picked.iter().any(|t| t.optional);
+    let mut args = vec!["-Apply".to_string()];
+    if optional {
+        args.push("-Optional".into());
     }
-    let mut names: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
-    names.sort_unstable();
-    let more = names.join(",");
-    match l.args.iter().position(|a| a == "-Skip") {
-        Some(i) if i + 1 < l.args.len() => l.args[i + 1] = format!("{},{more}", l.args[i + 1]),
-        _ => l.args.extend(["-Skip".to_string(), more]),
+    args.push("-Yes".into());
+    let skip: Vec<&str> = TARGETS.iter().filter(|t| (optional || !t.optional) && !picked.iter().any(|p| p.name == t.name)).map(|t| t.name).collect();
+    if !skip.is_empty() {
+        args.extend(["-Skip".to_string(), skip.join(",")]);
     }
-    l.targeted = l.targeted.saturating_sub(extra.len());
-    l
+    args
+}
+
+/// The run for a confirmed removal preview.
+/// - Preset: the whole list minus what was unticked. Apps the page already shows as gone are not in the preview but
+///   still run: the page only sees the current user, the script also clears the provisioned copy for new accounts
+///   (and just logs "not installed" when there is nothing).
+/// - Selected: exactly the selected items in the preview, minus anything unticked.
+fn remove_launch(which: Which, title: &'static str, names: &[&'static str], unpicked: &std::collections::HashSet<String>) -> Launch {
+    let picked = names.iter().filter(|n| !unpicked.contains(**n)).count();
+    let args = match which {
+        Which::Preset(optional) => {
+            let mut args = vec!["-Apply".to_string()];
+            if optional {
+                args.push("-Optional".into());
+            }
+            args.push("-Yes".into());
+            let mut skip: Vec<&str> = names.iter().copied().filter(|n| unpicked.contains(*n)).collect();
+            skip.sort_unstable();
+            if !skip.is_empty() {
+                args.extend(["-Skip".to_string(), skip.join(",")]);
+            }
+            args
+        }
+        Which::Selected => {
+            let sel: Vec<&Target> = TARGETS.iter().filter(|t| names.contains(&t.name) && !unpicked.contains(t.name)).collect();
+            remove_args(&sel)
+        }
+    };
+    Launch { args, title, targeted: picked }
 }
 
 pub struct BloatTab {
-    skip: Vec<bool>,
+    /// Items ticked on the page for "Remove selected".
+    selected: Vec<bool>,
     installed: Option<Vec<String>>,
     scan: Option<common::Job<Vec<String>>>,
     stream: Option<Stream>,
     last_title: String,
     targeted: usize,
     op: Option<OpWindow>,
-    pending: Option<Launch>,
+    pending: Option<Pending>,
     show_details: bool,
     /// A run has just ended: read the installed apps again (once).
     rescan_due: bool,
@@ -257,7 +300,7 @@ const DEMO_LOG: &[&str] = &[
 impl BloatTab {
     pub fn new() -> Self {
         let mut tab = BloatTab {
-            skip: vec![false; TARGETS.len()],
+            selected: vec![false; TARGETS.len()],
             installed: None,
             scan: None,
             stream: None,
@@ -272,7 +315,7 @@ impl BloatTab {
         if let Some(stage) = opwin::demo_stage("bloat") {
             // samples for screenshots - the script is not started
             match stage {
-                Stage::Preview => tab.op = Some(tab.remove_window(false).0),
+                Stage::Preview => tab.op = Some(tab.remove_window(Which::Preset(false)).0),
                 Stage::Running | Stage::Done => {
                     let done = stage == Stage::Done;
                     let n = if done { DEMO_LOG.len() } else { DEMO_LOG.len() - 5 };
@@ -294,19 +337,23 @@ impl BloatTab {
         }));
     }
 
-    fn skip_arg(&self, optional: bool) -> Vec<String> {
-        let names: Vec<&str> = TARGETS
+    /// What a removal would still do: the preset's lists, or the items selected on the page - without the apps
+    /// already known to be gone (like Services / Startup Cleaner list only what would change).
+    fn candidates(&self, which: Which) -> Vec<&'static Target> {
+        TARGETS
             .iter()
-            .zip(&self.skip)
-            .filter(|(t, s)| **s && (optional || !t.optional))
-            .map(|(t, _)| t.name)
-            .collect();
-        if names.is_empty() { vec![] } else { vec!["-Skip".into(), names.join(",")] }
+            .zip(&self.selected)
+            .filter(|(t, sel)| match which {
+                Which::Preset(optional) => optional || !t.optional,
+                Which::Selected => **sel,
+            })
+            .map(|(t, _)| t)
+            .filter(|t| self.is_installed(t) != Some(false))
+            .collect()
     }
 
-    /// Targets a run would process: the chosen lists minus the ticked (skipped) items.
-    fn selected(&self, optional: bool) -> Vec<&'static Target> {
-        TARGETS.iter().zip(&self.skip).filter(|(t, s)| !**s && (optional || !t.optional)).map(|(t, _)| t).collect()
+    fn selected_count(&self) -> usize {
+        self.selected.iter().filter(|s| **s).count()
     }
 
     /// Some(true) = installed, Some(false) = removed, None = not known (still scanning, or not a Store app).
@@ -324,32 +371,32 @@ impl BloatTab {
         self.stream = Some(Stream::run_ps_file(&path, &l.args));
     }
 
-    /// Preview window + launch data for "Remove Safe" / "Remove Safe + Optional".
-    fn remove_window(&self, optional: bool) -> (OpWindow, Launch) {
-        let sel = self.selected(optional);
-        let items: Vec<OpItem> = sel
+    /// Preview window for "Remove Safe" / "Remove Safe + Optional" (a tick box per item, all ticked) or
+    /// "Remove selected" (exactly the selection, like Services' Disable / Startup Cleaner's Switch off).
+    fn remove_window(&self, which: Which) -> (OpWindow, Pending) {
+        let work = self.candidates(which);
+        let items: Vec<OpItem> = work
             .iter()
-            .map(|t| {
-                OpItem::new(t.name, friendly(t.name), if t.optional { "Optional list" } else { "Safe list" })
-                    .detail(if self.is_installed(t) == Some(false) { "already gone" } else { "" })
-                    .optional(t.optional)
-            })
+            .map(|t| OpItem::new(t.name, friendly(t.name), if t.optional { "Optional list" } else { "Safe list" }).optional(t.optional))
             .collect();
-        let mut w = OpWindow::new("REMOVE BLOAT", "remove", "removed", items);
+        let title = match which {
+            Which::Preset(false) => "Remove Safe",
+            Which::Preset(true) => "Remove Safe + Optional",
+            Which::Selected => "Remove selected",
+        };
+        let mut w = OpWindow::new(&title.to_uppercase(), "remove", "removed", items);
         w.preview_text = "Removed for every user, leftovers cleaned up, and blocked from coming back with updates.".into();
-        // every item is listed with a tick box (groups always open), all ticked; unticked ones are skipped this run
-        w.pickable = true;
+        // presets: untick anything to keep it; a selection is removed as it is
+        w.pickable = matches!(which, Which::Preset(_));
         w.warning = Some("A restore point is created first. Everything can be undone with Restore.".into());
         w.reassure = "Never touches Xbox, Game Pass, Store, Security, Edge/WebView2, Photos, Notepad or codecs.".into();
         w.go_label = "Remove".into();
-        w.empty_text = "Every item in this list is ticked to be skipped.".into();
-        let mut args = vec!["-Apply".to_string()];
-        if optional {
-            args.push("-Optional".into());
-        }
-        args.push("-Yes".into());
-        args.extend(self.skip_arg(optional));
-        (w, Launch { args, title: if optional { "Remove Safe + Optional" } else { "Remove Safe" }, targeted: sel.len() })
+        w.empty_title = "Already removed".into();
+        w.empty_text = match which {
+            Which::Selected => "Everything you selected is already gone from this PC.".into(),
+            _ => "Everything on this list is already gone from this PC.".into(),
+        };
+        (w, Pending::Remove { which, title, names: work.iter().map(|t| t.name).collect() })
     }
 
     fn restore_window() -> (OpWindow, Launch) {
@@ -468,7 +515,7 @@ fn result_card(ui: &mut egui::Ui, title: &str, run: Option<(&[String], Option<i3
         }
     });
     let Some((lines, exit)) = run else {
-        ui.label(RichText::new("Run a preview first - it changes nothing.").color(theme::TEXT_DIM));
+        ui.label(RichText::new("Nothing has run yet. Remove Safe and Remove Safe + Optional show every item first.").color(theme::TEXT_DIM));
         ui.allocate_space(ui.available_size());
         return false;
     };
@@ -592,8 +639,10 @@ impl Tab for BloatTab {
                 Some(OpEvent::Go) => {
                     let unpicked = op.unpicked.clone();
                     self.op = None;
-                    if let Some(l) = self.pending.take() {
-                        self.launch(skip_more(l, &unpicked));
+                    match self.pending.take() {
+                        Some(Pending::Remove { which, title, names }) => self.launch(remove_launch(which, title, &names, &unpicked)),
+                        Some(Pending::Restore(l)) => self.launch(l),
+                        None => {}
                     }
                 }
                 Some(OpEvent::Close) => {
@@ -635,31 +684,31 @@ impl Tab for BloatTab {
                 let show = |v: Option<usize>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
                 let failed = n(&|r| matches!(r, Res::Failed(_)));
                 let dim = |on: bool, c: egui::Color32| if on { c } else { theme::TEXT_FAINT };
-                stat_fit(ui, 30.0, &show(n(&|r| matches!(r, Res::WouldRemove))), "would remove (after a preview)", dim(last.is_some(), theme::OPTIONAL));
-                stat_fit(ui, 22.0, &show(n(&|r| matches!(r, Res::AlreadyGone | Res::AlreadySet))), "already gone", dim(last.is_some(), theme::TEXT));
+                stat_fit(ui, 30.0, &show(n(&|r| matches!(r, Res::AlreadyGone | Res::AlreadySet))), "already gone", dim(last.is_some(), theme::TEXT));
                 stat_fit(ui, 22.0, &show(failed), "failed", dim(last.is_some(), if failed.unwrap_or(0) > 0 { theme::LOCKED } else { theme::TEXT }));
             });
         });
         ui.add_space(2.0);
 
-        // ---- actions
-        let mut preview: Option<bool> = None;
-        let mut remove: Option<bool> = None;
+        // ---- actions: presets (a preview with a tick per item), the page selection, restore
+        let mut remove: Option<Which> = None;
         let mut restore = false;
         let mut undo = false;
+        let n_sel = self.selected_count();
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(can, theme::primary_button("  Preview Safe  ")).on_hover_text("Shows what would be removed. Changes nothing.").clicked() {
-                preview = Some(false);
+            if ui.add_enabled(can, theme::danger_button("Remove Safe")).on_hover_text("Shows every item first - untick anything to keep it.").clicked() {
+                remove = Some(Which::Preset(false));
             }
-            if ui.add_enabled(can, egui::Button::new("Preview Safe + Optional")).on_hover_text("Shows what would be removed. Changes nothing.").clicked() {
-                preview = Some(true);
+            if ui.add_enabled(can, theme::danger_button("Remove Safe + Optional")).on_hover_text("Shows every item first - untick anything to keep it.").clicked() {
+                remove = Some(Which::Preset(true));
             }
             ui.separator();
-            if ui.add_enabled(can, theme::danger_button("Remove Safe")).clicked() {
-                remove = Some(false);
+            let label = if n_sel > 0 { format!("Remove selected ({n_sel})") } else { "Remove selected".to_string() };
+            if ui.add_enabled(can && n_sel > 0, theme::danger_button(&label)).on_hover_text("Remove the items ticked in the list. Shows a preview first.").clicked() {
+                remove = Some(Which::Selected);
             }
-            if ui.add_enabled(can, theme::danger_button("Remove Safe + Optional")).clicked() {
-                remove = Some(true);
+            if ui.add_enabled(n_sel > 0, egui::Button::new("Clear selection")).clicked() {
+                self.selected.iter_mut().for_each(|s| *s = false);
             }
             ui.separator();
             if ui.add_enabled(can, egui::Button::new("Restore everything")).clicked() {
@@ -672,7 +721,7 @@ impl Tab for BloatTab {
         ui.add_space(2.0);
 
         // ---- targets (left) and the live result (right)
-        let skip = &mut self.skip;
+        let selected = &mut self.selected;
         let installed = &self.installed;
         let show_details = &mut self.show_details;
         let (title, targeted) = (&self.last_title, self.targeted);
@@ -681,7 +730,7 @@ impl Tab for BloatTab {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     theme::section(ui, "Targets");
-                    ui.label(RichText::new("tick an item to skip it").size(12.0).color(theme::TEXT_DIM));
+                    ui.label(RichText::new("tick items, then Remove selected").size(12.0).color(theme::TEXT_DIM));
                 });
                 egui::ScrollArea::vertical().id_salt("bloat-list").auto_shrink([false, false]).show(ui, |ui| {
                     visible_checkboxes(ui);
@@ -706,11 +755,11 @@ impl Tab for BloatTab {
                                     theme::chip(ui, "optional", theme::OPTIONAL);
                                 }
                                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                    ui.checkbox(&mut skip[i], "").on_hover_text("Tick to skip this item");
-                                    let c = if skip[i] || state == Some(false) { theme::DIM } else { theme::TEXT };
+                                    ui.checkbox(&mut selected[i], "").on_hover_text("Tick to select this item for Remove selected");
+                                    let c = if state == Some(false) { theme::DIM } else { theme::TEXT };
                                     let mut name = RichText::new(friendly(t.name)).color(c);
-                                    if skip[i] {
-                                        name = name.strikethrough();
+                                    if selected[i] {
+                                        name = name.strong();
                                     }
                                     ui.add(egui::Label::new(name).truncate()).on_hover_text(format!("{}\nYou lose: {}", t.name.trim_end_matches(['~', '.']), t.loses));
                                 });
@@ -726,24 +775,15 @@ impl Tab for BloatTab {
         });
 
         // button clicks are handled last, when nothing borrows the tab any more
-        if let Some(optional) = preview {
-            let mut args = vec!["-WhatIf".to_string()];
-            if optional {
-                args.push("-Optional".into());
-            }
-            args.extend(self.skip_arg(optional));
-            let targeted = self.selected(optional).len();
-            self.launch(Launch { args, title: if optional { "Preview Safe + Optional" } else { "Preview Safe" }, targeted });
-        }
-        if let Some(optional) = remove {
-            let (w, l) = self.remove_window(optional);
+        if let Some(which) = remove {
+            let (w, l) = self.remove_window(which);
             self.pending = if w.items.is_empty() { None } else { Some(l) };
             self.op = Some(w);
         }
         if restore || undo {
             let (w, l) = Self::restore_window();
             self.op = Some(w);
-            self.pending = Some(l);
+            self.pending = Some(Pending::Restore(l));
         }
     }
 }
@@ -753,27 +793,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bloat_preview_untick_skips() {
-        let tab = BloatTab::new();
-        let (w, l) = tab.remove_window(true);
-        assert!(w.pickable && w.unpicked.is_empty(), "every item starts ticked");
-        assert_eq!(w.items.len(), l.targeted);
-        assert!(!l.args.contains(&"-Skip".to_string()));
-        // unticked items are added to -Skip for this run only, and no longer counted
-        let un: std::collections::HashSet<String> = [w.items[2].id.clone(), w.items[0].id.clone()].into();
-        let l2 = skip_more(Launch { args: l.args.clone(), title: l.title, targeted: l.targeted }, &un);
-        let i = l2.args.iter().position(|a| a == "-Skip").unwrap();
-        let mut want: Vec<&str> = un.iter().map(|s| s.as_str()).collect();
+    fn bloat_presets_and_selection() {
+        use std::collections::HashSet;
+        let names = |p: &Pending| match p {
+            Pending::Remove { names, .. } => names.clone(),
+            Pending::Restore(_) => vec![],
+        };
+        let mut tab = BloatTab::new();
+        let safe_n = TARGETS.iter().filter(|t| !t.optional).count();
+
+        // presets: a tick per item, all ticked; Safe has the Safe list, Safe + Optional everything
+        let (w, p) = tab.remove_window(Which::Preset(false));
+        assert!(w.pickable && w.unpicked.is_empty());
+        assert_eq!((w.items.len(), names(&p).len()), (safe_n, safe_n));
+        let (w, p) = tab.remove_window(Which::Preset(true));
+        assert_eq!(w.items.len(), TARGETS.len());
+
+        // nothing unticked: the plain preset run, no -Skip
+        let all = names(&p);
+        let l = remove_launch(Which::Preset(true), "t", &all, &HashSet::new());
+        assert_eq!((l.args.clone(), l.targeted), (vec!["-Apply".to_string(), "-Optional".into(), "-Yes".into()], TARGETS.len()));
+        // unticked items go in -Skip (sorted) and are no longer counted
+        let un: HashSet<String> = [all[2].to_string(), all[0].to_string()].into();
+        let l = remove_launch(Which::Preset(true), "t", &all, &un);
+        let mut want = vec![all[0], all[2]];
         want.sort_unstable();
-        assert_eq!(l2.args[i + 1], want.join(","));
-        assert_eq!(l2.targeted, l.targeted - 2);
-        assert!(tab.skip.iter().all(|s| !s), "the page's own skip ticks are untouched");
-        // merged into an existing -Skip list from the page
-        let l3 = skip_more(Launch { args: vec!["-Apply".into(), "-Skip".into(), "A".into()], title: "t", targeted: 5 }, &["B".to_string()].into());
-        assert_eq!(l3.args, vec!["-Apply", "-Skip", "A,B"]);
-        // nothing unticked: the run is unchanged
-        let l4 = skip_more(Launch { args: vec!["-Apply".into()], title: "t", targeted: 5 }, &Default::default());
-        assert_eq!((l4.args, l4.targeted), (vec!["-Apply".to_string()], 5));
+        assert_eq!(l.args, vec!["-Apply".to_string(), "-Optional".into(), "-Yes".into(), "-Skip".into(), want.join(",")]);
+        assert_eq!(l.targeted, TARGETS.len() - 2);
+
+        // apps the scan shows as gone are left out of the preview, but the preset run does not skip them
+        let first_app = TARGETS.iter().find(|t| is_app(t) && !t.optional).unwrap();
+        tab.installed = Some(TARGETS.iter().filter(|t| is_app(t) && t.name != first_app.name).map(|t| t.name.to_string()).collect());
+        let (w, p) = tab.remove_window(Which::Preset(false));
+        assert!(!w.items.iter().any(|i| i.id == first_app.name));
+        assert!(!remove_launch(Which::Preset(false), "t", &names(&p), &HashSet::new()).args.contains(&"-Skip".to_string()));
+
+        // selection: no tick boxes, exactly the selected items run, everything else is skipped
+        assert_eq!(tab.selected_count(), 0);
+        let safe_pick = TARGETS.iter().position(|t| !t.optional && t.name != first_app.name).unwrap();
+        tab.selected[safe_pick] = true;
+        let (w, p) = tab.remove_window(Which::Selected);
+        assert!(!w.pickable);
+        assert_eq!(names(&p), vec![TARGETS[safe_pick].name]);
+        let l = remove_launch(Which::Selected, "t", &names(&p), &HashSet::new());
+        assert!(!l.args.contains(&"-Optional".to_string()), "a Safe item alone does not run the Optional list");
+        let skip = &l.args[l.args.iter().position(|a| a == "-Skip").unwrap() + 1];
+        assert_eq!(skip.split(',').count(), safe_n - 1);
+        assert!(!skip.split(',').any(|n| n == TARGETS[safe_pick].name));
+        assert_eq!(l.targeted, 1);
+        // an Optional item in the selection turns on the Optional list, and every other target is skipped
+        let opt_pick = TARGETS.iter().position(|t| t.optional).unwrap();
+        tab.selected[opt_pick] = true;
+        let (_, p) = tab.remove_window(Which::Selected);
+        let l = remove_launch(Which::Selected, "t", &names(&p), &HashSet::new());
+        assert!(l.args.contains(&"-Optional".to_string()));
+        let skip = &l.args[l.args.iter().position(|a| a == "-Skip").unwrap() + 1];
+        assert_eq!(skip.split(',').count(), TARGETS.len() - 2);
+        // a selected app that is already gone: nothing to do
+        tab.selected.iter_mut().for_each(|s| *s = false);
+        tab.selected[TARGETS.iter().position(|t| t.name == first_app.name).unwrap()] = true;
+        assert!(tab.remove_window(Which::Selected).0.items.is_empty());
+        // no target name may contain the -Skip separator
+        assert!(TARGETS.iter().all(|t| !t.name.contains(',')));
     }
 
     #[test]
