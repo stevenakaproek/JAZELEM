@@ -22,11 +22,16 @@
       powershell -ExecutionPolicy Bypass -File .\PostInstall-Tweaks.ps1
       powershell -ExecutionPolicy Bypass -File .\PostInstall-Tweaks.ps1 -RemoveOneDrive
       powershell -ExecutionPolicy Bypass -File .\PostInstall-Tweaks.ps1 -Undo
+      powershell -ExecutionPolicy Bypass -File .\PostInstall-Tweaks.ps1 -Only Edge        (one tweak: Tasks, Edge, Teredo or OneDrive)
+
+  -Only applies just the named tweaks (the state before is still saved first). -Undo always undoes all of them.
 #>
 [CmdletBinding()]
 param(
     [switch]$RemoveOneDrive,
     [switch]$Undo,
+    [ValidateSet('Tasks', 'Edge', 'Teredo', 'OneDrive')]
+    [string[]]$Only,
     [string]$StatePath = (Join-Path $env:LOCALAPPDATA 'PCTuner\tweaks-state.json')
 )
 
@@ -76,6 +81,10 @@ $PolicyValues = @(
     @($edgeKey, 'StartupBoostEnabled'), @($edgeKey, 'BackgroundModeEnabled'),
     @($v6Key, 'Teredo_State'), @($v6Key, 'Teredo_ServerName')
 )
+
+# Which tweaks this run touches: all of them, or only those named in -Only (Undo always does all).
+function Test-Do([string]$Name) { $Undo -or -not $Only -or ($Only -contains $Name) }
+if ($Only -contains 'OneDrive') { $RemoveOneDrive = $true }
 
 $script:Failed = 0
 function Write-Fail([string]$What, [string]$Why) {
@@ -208,6 +217,7 @@ if (-not $Undo) {
     }
 }
 
+if (Test-Do 'Tasks') {
 Write-Host "Scheduled tasks:" -ForegroundColor Cyan
 if ($StateNote -and $Undo) {
     Write-Host "  NOTE      $StateNote Every task is switched back on and the policies are reset to the Windows defaults." -ForegroundColor Yellow
@@ -234,7 +244,9 @@ foreach ($e in $Entries) {
         catch { Write-Fail $p $_.Exception.Message }
     }
 }
+}
 
+if (Test-Do 'Edge') {
 Write-Host "`nEdge background launching:" -ForegroundColor Cyan
 $before = $script:Failed
 if ($Undo -and $State) {
@@ -255,7 +267,9 @@ if ($Undo -and $State) {
         Write-Host '  Startup Boost and background mode turned off (Edge shows "Managed by your organization" - expected)' -ForegroundColor Green
     } catch { Write-Fail 'Edge policies' $_.Exception.Message }
 }
+}
 
+if (Test-Do 'Teredo') {
 Write-Host "`nXbox networking (Teredo):" -ForegroundColor Cyan
 $before = $script:Failed
 if ($Undo -and $State) {
@@ -304,6 +318,7 @@ if ($Undo -and $State) {
     Write-Host "  Teredo: enterpriseclient via $TeredoServer -> state '$s', router UPnP '$u'" -ForegroundColor $color
     if ($s -notin 'qualified', 'dormant') { Write-Host '  Not qualified yet - check again in a minute: netsh interface teredo show state' -ForegroundColor Yellow }
     if ($u -eq 'No') { Write-Host '  Tip: enable UPnP in your router for Open NAT.' -ForegroundColor Yellow }
+}
 }
 
 if ($Undo -and $HadStateFile -and -not $StateBad) {

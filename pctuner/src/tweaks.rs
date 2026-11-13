@@ -22,6 +22,18 @@ enum Mode {
     Apply,
     ApplyOneDrive,
     Undo,
+    /// Apply just one tweak (a group: G_TASKS, G_EDGE, G_XBOX or G_ONEDRIVE).
+    Only(&'static str),
+}
+
+/// The script's -Only name for a group.
+fn only_name(group: &str) -> &'static str {
+    match group {
+        G_TASKS => "Tasks",
+        G_EDGE => "Edge",
+        G_XBOX => "Teredo",
+        _ => "OneDrive",
+    }
 }
 
 impl Mode {
@@ -30,6 +42,7 @@ impl Mode {
             Mode::Apply => vec![],
             Mode::ApplyOneDrive => vec!["-RemoveOneDrive".into()],
             Mode::Undo => vec!["-Undo".into()],
+            Mode::Only(g) => vec!["-Only".into(), only_name(g).into()],
         };
         a.extend(["-StatePath".to_string(), state.display().to_string()]);
         a
@@ -39,11 +52,16 @@ impl Mode {
             Mode::Apply => "Apply tweaks",
             Mode::ApplyOneDrive => "Apply + remove OneDrive",
             Mode::Undo => "Undo tweaks",
+            Mode::Only(G_TASKS) => "Disable the scheduled tasks",
+            Mode::Only(G_EDGE) => "Stop Edge preloading",
+            Mode::Only(G_XBOX) => "Turn on Teredo",
+            Mode::Only(_) => "Remove OneDrive",
         }
     }
     fn groups(self) -> Vec<&'static str> {
         match self {
             Mode::ApplyOneDrive => vec![G_TASKS, G_EDGE, G_XBOX, G_ONEDRIVE],
+            Mode::Only(g) => vec![g],
             _ => vec![G_TASKS, G_EDGE, G_XBOX],
         }
     }
@@ -239,8 +257,11 @@ fn preview_items(mode: Mode, saved: Option<&Saved>, kept_off: &std::collections:
         v.push(OpItem::new("edge-bg", "Background mode", G_EDGE).detail("off"));
         v.push(OpItem::new("teredo", "Teredo", G_XBOX).detail("enterpriseclient, kept on by Group Policy"));
     }
-    if mode == Mode::ApplyOneDrive {
+    if matches!(mode, Mode::ApplyOneDrive | Mode::Only(_)) {
         v.push(OpItem::new("onedrive", "OneDrive", G_ONEDRIVE).detail("uninstalled, its tasks disabled"));
+    }
+    if let Mode::Only(g) = mode {
+        v.retain(|i| i.group == g);
     }
     v
 }
@@ -266,6 +287,21 @@ fn preview_window_with(mode: Mode, saved: Option<&Saved>, kept_off: &std::collec
             w.preview_text = "The same tweaks, and OneDrive is uninstalled.".into();
             w.warning = Some("OneDrive will be uninstalled. \"Undo tweaks\" does not bring it back - reinstall it from the Microsoft Store if you want it again.".into());
             w.reassure = "Xbox and Steam tasks are kept. The other tweaks can be put back exactly with \"Undo tweaks\".".into();
+        }
+        Mode::Only(g) => {
+            w.preview_text = match g {
+                G_TASKS => "Only the telemetry and tips tasks are switched off. Edge, Teredo and OneDrive are left alone.",
+                G_EDGE => "Only Edge's Startup Boost and background mode are switched off. The other tweaks are left alone.",
+                G_XBOX => "Only Teredo is turned on for Xbox online play. The other tweaks are left alone.",
+                _ => "Only OneDrive is uninstalled. The other tweaks are left alone.",
+            }
+            .into();
+            if g == G_ONEDRIVE {
+                w.warning = Some("OneDrive will be uninstalled. \"Undo tweaks\" does not bring it back - reinstall it from the Microsoft Store if you want it again.".into());
+                w.reassure = "Nothing else is changed.".into();
+            } else {
+                w.reassure = "The state before is saved first. \"Undo tweaks\" puts back every tweak applied so far, not just this one.".into();
+            }
         }
         Mode::Undo => match saved {
             Some(s) if !s.inexact => {
@@ -735,16 +771,21 @@ impl TweaksTab {
             ui.set_width(ui.available_width());
             theme::section(ui, "What the tweaks do");
             let n_tasks = script_tasks().len();
-            let rows: [(&str, String); 4] = [
+            let rows: [(&'static str, String); 4] = [
                 (G_TASKS, format!("{n_tasks} telemetry, tips, maps and family-safety tasks are disabled. Xbox and Steam tasks are kept.")),
                 (G_EDGE, "Startup Boost and background mode off, so Edge no longer preloads. Edge stays installed.".into()),
                 (G_XBOX, "Teredo on as \"enterpriseclient\", set as a Group Policy so Windows keeps it.".into()),
-                (G_ONEDRIVE, "Uninstalled only when you choose \"Apply + remove OneDrive\".".into()),
+                (G_ONEDRIVE, "Uninstalled only when you choose \"Apply + remove OneDrive\" or \"Remove\" here.".into()),
             ];
-            egui::Grid::new("tweaks-what").num_columns(2).spacing([18.0, 8.0]).show(ui, |ui| {
+            egui::Grid::new("tweaks-what").num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
                 for (name, text) in &rows {
                     ui.label(RichText::new(*name).strong().color(theme::TEXT));
                     ui.label(RichText::new(text).color(theme::TEXT_DIM));
+                    // apply just this one tweak
+                    let button = if *name == G_ONEDRIVE { theme::danger_button("Remove") } else { egui::Button::new("Apply") };
+                    if ui.add_enabled(can, button).on_hover_text(Mode::Only(name).title()).clicked() {
+                        self.ask(Mode::Only(name));
+                    }
                     ui.end_row();
                 }
             });
@@ -904,6 +945,34 @@ mod tests {
         assert_eq!(last.name, "Other errors");
         assert!(last.result.clone().unwrap().unwrap_err().contains("Access is denied."));
         assert_eq!(result_items(&stray[..2], 0).len(), 1);
+    }
+
+    #[test]
+    fn tweaks_apply_one_at_a_time() {
+        let none = Default::default();
+        // each tweak previews only its own items and runs only its own step
+        let groups = |m: Mode| preview_items(m, None, &none).iter().map(|i| i.group.clone()).collect::<std::collections::BTreeSet<_>>();
+        for g in [G_TASKS, G_EDGE, G_XBOX, G_ONEDRIVE] {
+            assert_eq!(groups(Mode::Only(g)).into_iter().collect::<Vec<_>>(), vec![g.to_string()]);
+            assert_eq!(Mode::Only(g).groups(), vec![g]);
+        }
+        assert_eq!(preview_items(Mode::Only(G_TASKS), None, &none).len(), 32 + 1);
+        assert_eq!(preview_items(Mode::Only(G_EDGE), None, &none).len(), 2);
+        assert!(preview_window_with(Mode::Only(G_ONEDRIVE), None, &none).warning.is_some());
+        assert!(preview_window_with(Mode::Only(G_EDGE), None, &none).warning.is_none());
+
+        // the app passes -Only with a name the script accepts
+        let a = Mode::Only(G_XBOX).args(std::path::Path::new(r"C:\x\s.json"));
+        assert_eq!(&a[..2], &["-Only".to_string(), "Teredo".into()]);
+        for g in [G_TASKS, G_EDGE, G_XBOX, G_ONEDRIVE] {
+            assert!(SCRIPT.contains(&format!("Test-Do '{}'", only_name(g))) || only_name(g) == "OneDrive");
+        }
+        assert!(SCRIPT.contains("[ValidateSet('Tasks', 'Edge', 'Teredo', 'OneDrive')]"));
+
+        // a run of just one section still parses
+        let edge = lines(&["Edge background launching:", "  Startup Boost and background mode turned off (Edge shows \"Managed by your organization\" - expected)", "Done."]);
+        let r = result_items(&edge, 0);
+        assert_eq!((r.len(), r[0].group.as_str()), (1, G_EDGE));
     }
 
     #[test]
