@@ -83,6 +83,12 @@ The Fan Tuner's helper (`pctuner/fanhelper`) uses, unmodified from NuGet,
 its package). These DLLs are embedded in PCTuner.exe and unpacked to `%LOCALAPPDATA%\PCTuner\fan`.
 Hardware access goes through the separately installed [PawnIO](https://pawnio.eu) driver.
 
+The Rust fan backend that is replacing the helper (`pctuner/src/hw`) is ported from LibreHardwareMonitor's
+NCT6687D-R, AMD Zen and NVAPI code; those files stay under MPL-2.0 (noted at the top of each). It loads two
+signed PawnIO modules, `LpcIO.bin` and `AMDFamily17.bin` (`pctuner/assets/pawnio`, LGPL-2.1, unmodified from
+the [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules/releases/tag/0.1.6) 0.1.6 release - the same
+bytes LibreHardwareMonitorLib 0.9.6 embeds).
+
 ## Disclaimer
 
 These tools change Windows services, the registry, scheduled tasks, network adapter settings,

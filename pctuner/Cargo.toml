@@ -12,7 +12,7 @@ serde_json = "1"
 winreg = "0.52"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Services", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Services", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_LibraryLoader"] }
 tray-icon = "0.19"
 
 [build-dependencies]
