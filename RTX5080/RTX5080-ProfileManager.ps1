@@ -130,8 +130,15 @@ function Find-PresetForSection($sec) {
 # Build a preset's curve from the card's own stock curve (same method as RTX5080-Profile.ps1)
 function New-PresetSectionLines($cfg, $p) {
     $startup = Get-Section $cfg 'Startup'
-    if (-not $startup -or -not $startup.VFCurve) { throw "Afterburner has not saved this card's voltage/frequency curve yet. Open Afterburner, leave every setting at stock, click Apply (the tick) once, close Afterburner and retry." }
-    $c = ConvertFrom-Curve $startup.VFCurve
+    if (-not $startup) { $startup = @{} }
+    # [Startup] is empty unless "apply at startup" is on; every saved slot holds the stock base clocks too
+    $curves = @(foreach ($n in 'Startup', 'Profile1', 'Profile2', 'Profile3', 'Profile4', 'Profile5') {
+        $s = Get-Section $cfg $n
+        if ($s -and $s.VFCurve) { $s.VFCurve }
+    })
+    if (-not $curves) { throw "Afterburner has not saved this card's voltage/frequency curve yet. Open Afterburner, leave every setting at stock, click Save and then any profile slot (1-5), close Afterburner and retry." }
+    $c = $null
+    foreach ($v in $curves) { if (-not $c) { $c = ConvertFrom-Curve $v } }
     if (-not $c) { throw 'Unexpected curve format in the Afterburner profile. Not touching anything.' }
     $pts = $c.Points; $b = $c.Bytes
     if ($pts[0].mV -lt 300 -or $pts[0].mV -gt 700 -or ($pts | Measure-Object Base -Maximum).Maximum -gt 5000) { throw 'Curve data does not look like a voltage/frequency table. Not touching anything.' }

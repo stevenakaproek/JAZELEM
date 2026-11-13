@@ -74,14 +74,18 @@ try {
 
     $lines = [System.Collections.Generic.List[string]](Get-Content -LiteralPath $cfg.FullName)
 
-    # --- read the stock curve from [Startup] ---
+    # --- read the stock curve: [Startup], or a saved slot when [Startup] is empty ---
+    # (Afterburner fills [Startup] only while "apply at startup" is on; every saved slot holds the stock base clocks too)
     $start = $lines.IndexOf('[Startup]')
-    if ($start -lt 0) { throw '[Startup] section not found in profile file.' }
     $curveLine = $null
-    for ($i = $start + 1; $i -lt $lines.Count -and -not $lines[$i].StartsWith('['); $i++) {
-        if ($lines[$i].StartsWith('VFCurve=')) { $curveLine = $lines[$i]; break }
+    foreach ($n in 'Startup', 'Profile1', 'Profile2', 'Profile3', 'Profile4', 'Profile5') {
+        $h = $lines.IndexOf("[$n]")
+        if ($curveLine -or $h -lt 0) { continue }
+        for ($i = $h + 1; $i -lt $lines.Count -and -not $lines[$i].StartsWith('['); $i++) {
+            if ($lines[$i].StartsWith('VFCurve=') -and $lines[$i].Length -gt 8) { $curveLine = $lines[$i]; break }
+        }
     }
-    if (-not $curveLine) { throw "Afterburner has not saved this card's voltage/frequency curve yet. Open Afterburner, leave every setting at stock, click Apply (the tick) once, close Afterburner and retry." }
+    if (-not $curveLine) { throw "Afterburner has not saved this card's voltage/frequency curve yet. Open Afterburner, leave every setting at stock, click Save and then any profile slot (1-5), close Afterburner and retry." }
     $hex = $curveLine.Substring(8)
     $b = [byte[]]::new($hex.Length / 2)
     for ($i = 0; $i -lt $b.Length; $i++) { $b[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }
@@ -98,7 +102,7 @@ try {
         throw 'Curve data does not look like a voltage/frequency table. Not touching anything.'
     }
     if ($pts | Where-Object { $_.OldOfs -ne 0 }) {
-        Write-Host 'Note: the saved startup curve already has offsets; they will be replaced (base clocks are used).' -ForegroundColor Yellow
+        Write-Host 'Note: the saved curve already has offsets; they will be replaced (base clocks are used).' -ForegroundColor Yellow
     }
 
     $anchor = $pts | Where-Object { $_.mV -ge $TargetMv } | Select-Object -First 1
@@ -132,9 +136,9 @@ try {
 
     # copy fan settings from [Startup] so the profile doesn't change your fans
     $fanLines = @()
-    for ($i = $start + 1; $i -lt $lines.Count -and -not $lines[$i].StartsWith('['); $i++) {
+    if ($start -ge 0) { for ($i = $start + 1; $i -lt $lines.Count -and -not $lines[$i].StartsWith('['); $i++) {
         if ($lines[$i] -match '^(FanMode|FanSpeed|FanMode2|FanSpeed2)=') { $fanLines += $lines[$i] }
-    }
+    } }
     $section = @("[Profile$Slot]", 'Format=2', 'CoreVoltageBoost=0', "PowerLimit=$PowerLimit", 'CoreClkBoost=0', "VFCurve=$newHex", "MemClkBoost=$($MemOffsetMHz * 1000)") + $fanLines
 
     # remove an existing section for this slot, then append ours

@@ -284,15 +284,27 @@ pub fn find_preset(sec: Option<&Section>) -> Option<usize> {
     PRESETS.iter().position(|p| section_is_preset(sec, p))
 }
 
-/// A card Afterburner has only seen (a new card, or after a card swap) has an empty [Startup]: it writes the
-/// curve there once settings are applied in it.
-const NO_CURVE: &str = "Afterburner has not saved this card's voltage/frequency curve yet. Open Afterburner, leave every setting at stock, click Apply (the tick) once, close Afterburner and retry.";
+/// Afterburner only fills [Startup] while "apply overclocking at system startup" is on (EraseStartupSettings=1
+/// leaves it empty), so a new card may have no curve anywhere until a profile slot is saved.
+const NO_CURVE: &str = "Afterburner has not saved this card's voltage/frequency curve yet. Open Afterburner, leave every setting at stock, click Save and then any profile slot (1-5), close Afterburner and retry.";
 
-/// Build a preset's [ProfileN] section from the card's own stock curve in [Startup].
+/// Sections a stock curve can be read from, in order of preference. Every curve point stores the card's own stock
+/// clock (base) apart from the offset, so any saved section gives the stock curve.
+const CURVE_SOURCES: [&str; 6] = ["Startup", "Profile1", "Profile2", "Profile3", "Profile4", "Profile5"];
+
+/// The card's stock curve: from [Startup] when Afterburner keeps one, otherwise from the first saved profile slot.
+fn stock_curve(cfg: &Cfg) -> Result<Curve, String> {
+    let saved: Vec<String> = CURVE_SOURCES.iter().filter_map(|n| cfg.section(n)?.get("VFCurve").filter(|v| !v.is_empty()).map(str::to_string)).collect();
+    if saved.is_empty() {
+        return Err(NO_CURVE.into());
+    }
+    saved.iter().find_map(|v| decode_curve(v)).ok_or_else(|| "Unexpected curve format in the Afterburner profile. Not touching anything.".into())
+}
+
+/// Build a preset's [ProfileN] section from the card's own stock curve (see stock_curve).
 pub fn preset_section_lines(cfg: &Cfg, p: &Preset) -> Result<Vec<String>, String> {
-    let startup = cfg.section("Startup").ok_or("No [Startup] section in the Afterburner profile. Open Afterburner once, close it, and retry.")?;
-    let vf = startup.get("VFCurve").filter(|v| !v.is_empty()).ok_or(NO_CURVE)?;
-    let c = decode_curve(vf).ok_or("Unexpected curve format in the Afterburner profile. Not touching anything.")?;
+    let c = stock_curve(cfg)?;
+    let startup = cfg.section("Startup");
     let pts = &c.points;
     let mut b = c.bytes.clone();
     let max_base = pts.iter().map(|pt| pt.base).fold(f32::MIN, f32::max);
@@ -326,7 +338,7 @@ pub fn preset_section_lines(cfg: &Cfg, p: &Preset) -> Result<Vec<String>, String
         format!("MemClkBoost={}", p.mem * 1000),
     ];
     for k in ["FanMode", "FanSpeed", "FanMode2", "FanSpeed2"] {
-        if let Some(v) = startup.get(k) {
+        if let Some(v) = startup.as_ref().and_then(|s| s.get(k)) {
             lines.push(format!("{k}={v}"));
         }
     }
@@ -2075,9 +2087,31 @@ mod tests {
         let short = cfg_with_startup(&curve_hex_with(0x0002_0001, N, &|k| 450.0 + k as f32, &fixture_base, &|_| 0.0, 0));
         assert_eq!(preset_section_lines(&short, eff).unwrap_err(), "No curve point at or above 900 mV.");
         // missing pieces
-        assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), b"[Settings]\r\n"), eff).unwrap_err().contains("No [Startup]"));
+        assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), b"[Settings]\r\n"), eff).unwrap_err().contains("has not saved this card's voltage/frequency curve"));
         assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), b"[Startup]\r\nVFCurve=\r\n"), eff).unwrap_err().contains("has not saved this card's voltage/frequency curve"));
         assert!(preset_section_lines(&cfg_with_startup("0102"), eff).unwrap_err().contains("Unexpected curve format"));
+    }
+
+    #[test]
+    fn stock_curve_from_a_saved_slot() {
+        // this PC: [Startup] stays empty (EraseStartupSettings=1), the user saved the stock settings to slot 1
+        let tuned = curve_hex_with(0x0002_0001, N, &fixture_mv, &fixture_base, &|k| 50.0 + k as f32, TRAIL);
+        let text = format!("[Startup]\r\nFormat=2\r\nVFCurve=\r\nFanMode=\r\n[Profile1]\r\nFormat=2\r\nVFCurve={tuned}\r\nFanMode=1\r\nFanSpeed=30\r\n");
+        let from_slot = Cfg::parse(PathBuf::new(), text.as_bytes());
+        let from_startup = cfg_with_startup(&fixture_curve());
+        for p in PRESETS {
+            let a = preset_section_lines(&from_slot, p).unwrap();
+            let b = preset_section_lines(&from_startup, p).unwrap();
+            // same curve: the slot's offsets are replaced, only its stock base clocks are used
+            assert_eq!(a.iter().find(|l| l.starts_with("VFCurve=")), b.iter().find(|l| l.starts_with("VFCurve=")), "{}", p.name);
+            // fan settings still come from [Startup] only, never from the slot that gave the curve
+            assert!(a.contains(&"FanMode=".to_string()) && !a.iter().any(|l| l.starts_with("FanSpeed")));
+        }
+        // [Startup] wins when it has a curve; a broken slot is skipped when another one is fine
+        let both = format!("[Startup]\r\nVFCurve={}\r\n[Profile1]\r\nVFCurve=0102\r\n[Profile2]\r\nVFCurve={tuned}\r\n", fixture_curve());
+        assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), both.as_bytes()), &PRESETS[1]).is_ok());
+        let broken = format!("[Startup]\r\nVFCurve=\r\n[Profile1]\r\nVFCurve=0102\r\n[Profile3]\r\nVFCurve={tuned}\r\n");
+        assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), broken.as_bytes()), &PRESETS[1]).is_ok());
     }
 
     #[test]
