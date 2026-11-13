@@ -19,6 +19,7 @@ mod startup;
 mod theme;
 mod tweaks;
 mod usb;
+mod winsvc;
 
 use common::Tab;
 use eframe::egui;

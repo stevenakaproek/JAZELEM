@@ -120,7 +120,8 @@ trait Backend {
     fn set_start(&self, name: &str, start: u32) -> Result<(), String>;
     /// Some(v) writes DelayedAutostart, None deletes it (absent already = Ok).
     fn set_delayed(&self, name: &str, v: Option<u32>) -> Result<(), String>;
-    /// sc.exe config <name> start= <arg>; Err(sc.exe output) on failure.
+    /// Start type through the Service Control Manager (`sc_arg` as sc.exe names it: disabled / demand / auto /
+    /// delayed-auto); Err(reason) on failure.
     fn sc_config(&self, name: &str, sc_arg: &str) -> Result<(), String>;
     fn is_running(&self, name: &str) -> Option<bool>;
     fn stop(&self, name: &str) -> Result<(), String>;
@@ -128,6 +129,18 @@ trait Backend {
 }
 
 struct System;
+
+/// sc.exe's start names -> (Start value, Delayed start to set). Like sc.exe, only "auto" and "delayed-auto"
+/// touch Delayed start.
+fn scm_start(sc_arg: &str) -> Option<(u32, Option<bool>)> {
+    match sc_arg {
+        "disabled" => Some((4, None)),
+        "demand" => Some((3, None)),
+        "auto" => Some((2, Some(false))),
+        "delayed-auto" => Some((2, Some(true))),
+        _ => None,
+    }
+}
 
 impl System {
     fn writable(name: &str) -> Result<RegKey, String> {
@@ -163,32 +176,17 @@ impl Backend for System {
         }
     }
     fn sc_config(&self, name: &str, sc_arg: &str) -> Result<(), String> {
-        let (code, out) = common::run("sc.exe", &["config", name, "start=", sc_arg]).unwrap_or_else(|e| (-1, e));
-        if code == 0 {
-            return Ok(());
-        }
-        let sc_text: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        Err(sc_text.join(" "))
+        let (start, delayed) = scm_start(sc_arg).ok_or_else(|| format!("unknown start type {sc_arg}"))?;
+        crate::winsvc::set_start(name, start, delayed)
     }
     fn is_running(&self, name: &str) -> Option<bool> {
-        match common::run("sc.exe", &["query", name]) {
-            Ok((0, out)) => Some(out.contains("RUNNING")),
-            _ => None,
-        }
+        crate::winsvc::is_running(name)
     }
     fn stop(&self, name: &str) -> Result<(), String> {
-        let script = format!(
-            "try {{ Stop-Service -Name {} -Force -ErrorAction Stop; 'OK' }} catch {{ 'ERR:' + $_.Exception.Message }}",
-            common::psq(name)
-        );
-        let out = common::ps(&script)?;
-        match out.lines().map(str::trim).find(|l| l.starts_with("ERR:") || *l == "OK") {
-            Some(l) if l.starts_with("ERR:") => Err(l[4..].trim().to_string()),
-            _ => Ok(()),
-        }
+        crate::winsvc::stop(name)
     }
     fn start(&self, name: &str) {
-        let _ = common::run("sc.exe", &["start", name]);
+        let _ = crate::winsvc::start(name);
     }
 }
 
@@ -265,7 +263,7 @@ fn set_registry_start(b: &dyn Backend, name: &str, ty: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// Returns a short note on how it was applied ("ok" when sc.exe did it).
+/// Returns a short note on how it was applied ("ok" when the service manager did it).
 fn set_start_type(b: &dyn Backend, name: &str, ty: &str) -> Result<&'static str, String> {
     let sc_arg = match ty {
         "Disabled" => "disabled",
@@ -276,7 +274,7 @@ fn set_start_type(b: &dyn Backend, name: &str, ty: &str) -> Result<&'static str,
     };
 
     // Per-user services: Windows recreates the instance from its template at each logon,
-    // so change the template (registry only - sc.exe refuses templates). The instance itself is
+    // so change the template (registry only - the service manager refuses templates). The instance itself is
     // best effort: after a reboot the recorded instance name is gone, which is fine.
     if let Some(t) = template_in(b, name) {
         set_registry_start(b, &t, ty)?;
@@ -291,10 +289,10 @@ fn set_start_type(b: &dyn Backend, name: &str, ty: &str) -> Result<&'static str,
         Err(t) => t,
     };
 
-    // Some services are ACL-protected from sc.exe; the registry usually still works.
+    // Some services are ACL-protected from the service manager; the registry usually still works.
     match set_registry_start(b, name, ty) {
         Ok(()) => Ok("via registry, applies after reboot"),
-        Err(e) => Err(format!("sc.exe: {sc_text} / registry: {e}")),
+        Err(e) => Err(format!("service manager: {sc_text} / registry: {e}")),
     }
 }
 
@@ -311,33 +309,18 @@ struct Svc {
     display_lc: String,
 }
 
-#[derive(Deserialize)]
-struct RawSvc {
-    #[serde(rename = "N")]
-    name: String,
-    #[serde(rename = "D", default)]
-    display: Option<String>,
-    #[serde(rename = "S", default)]
-    state: Option<String>,
-}
-
+/// Every service from the Service Control Manager (the same set Win32_Service lists).
 fn load_services() -> Result<Vec<Svc>, String> {
-    let raw = common::ps_json::<RawSvc>(
-        "Get-CimInstance Win32_Service | Select-Object @{n='N';e={$_.Name}},@{n='D';e={$_.DisplayName}},@{n='S';e={$_.State}}",
-    )?;
-    Ok(raw
+    Ok(crate::winsvc::list()?
         .into_iter()
-        .map(|r| {
-            let display = r.display.unwrap_or_default();
-            Svc {
-                start: start_type(&System, &r.name),
-                note: note_for(&r.name),
-                state: r.state.unwrap_or_default(),
-                name_lc: r.name.to_lowercase(),
-                display_lc: display.to_lowercase(),
-                name: r.name,
-                display,
-            }
+        .map(|(name, display, state)| Svc {
+            start: start_type(&System, &name),
+            note: note_for(&name),
+            state,
+            name_lc: name.to_lowercase(),
+            display_lc: display.to_lowercase(),
+            name,
+            display,
         })
         .collect())
 }
@@ -774,7 +757,7 @@ fn demo_finish(win: &mut OpWindow) {
     win.finish(|it| match it.id.as_str() {
         "Spooler" => Some(Ok("changed, but could not be stopped now (a dependent service is still running)".into())),
         "StorSvc" => Some(Ok("via registry, applies after reboot".into())),
-        "TermService" => Some(Err("sc.exe: [SC] ChangeServiceConfig FAILED 5: Access is denied. / registry: Access is denied. (os error 5)".into())),
+        "TermService" => Some(Err("service manager: ChangeServiceConfig failed: Access is denied. (os error 5) / registry: Access is denied. (os error 5)".into())),
         _ => None,
     });
     win.can_undo = true;
@@ -1662,9 +1645,9 @@ mod tests {
         reg: RefCell<HashMap<String, (u32, Option<u32>)>>,
         running: RefCell<HashSet<String>>,
         started: RefCell<Vec<String>>,
-        /// sc.exe refuses these (registry fallback still works)
+        /// the service manager refuses these (registry fallback still works)
         sc_refuses: HashSet<String>,
-        /// both sc.exe and the registry refuse these
+        /// both the service manager and the registry refuse these
         denied: HashSet<String>,
     }
 
