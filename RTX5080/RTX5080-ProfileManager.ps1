@@ -59,8 +59,18 @@ $AbDir = Get-AbDir
 $AbExe = Join-Path $AbDir 'MSIAfterburner.exe'
 $BackupDir = Join-Path $PSScriptRoot 'backups'
 
+# Afterburner keeps a file for every card it has seen (an old card's file stays after a swap):
+# use the installed card's file, else the one Afterburner saved last.
 function Get-CfgFile {
-    Get-ChildItem -LiteralPath (Join-Path $AbDir 'Profiles') -Filter 'VEN_10DE&DEV_2C02*.cfg' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $files = @(Get-ChildItem -LiteralPath (Join-Path $AbDir 'Profiles') -Filter 'VEN_10DE&DEV_2C02*.cfg' -ErrorAction SilentlyContinue)
+    foreach ($pnp in @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { "$($_.PNPDeviceID)" })) {
+        if ($pnp -match '^PCI\\(VEN_10DE&DEV_2C02[^\\]*)') {
+            $want = $Matches[1] + '&'
+            $own = $files | Where-Object { $_.Name.StartsWith($want, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            if ($own) { return $own }
+        }
+    }
+    $files | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 }
 
 function Read-Cfg {
@@ -120,7 +130,7 @@ function Find-PresetForSection($sec) {
 # Build a preset's curve from the card's own stock curve (same method as RTX5080-Profile.ps1)
 function New-PresetSectionLines($cfg, $p) {
     $startup = Get-Section $cfg 'Startup'
-    if (-not $startup -or -not $startup.VFCurve) { throw 'No VFCurve in [Startup]. Open Afterburner once, close it, and retry.' }
+    if (-not $startup -or -not $startup.VFCurve) { throw "Afterburner has not saved this card's voltage/frequency curve yet. Open Afterburner, leave every setting at stock, click Apply (the tick) once, close Afterburner and retry." }
     $c = ConvertFrom-Curve $startup.VFCurve
     if (-not $c) { throw 'Unexpected curve format in the Afterburner profile. Not touching anything.' }
     $pts = $c.Points; $b = $c.Bytes

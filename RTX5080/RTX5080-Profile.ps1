@@ -45,7 +45,17 @@ try {
     try { $abDir = (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\MSI\Afterburner' -ErrorAction Stop).InstallDir } catch {}
     if (-not $abDir) { $abDir = 'C:\Program Files (x86)\MSI Afterburner' }
     $abExe = Join-Path $abDir 'MSIAfterburner.exe'
-    $cfg = Get-ChildItem -LiteralPath (Join-Path $abDir 'Profiles') -Filter 'VEN_10DE&DEV_2C02*.cfg' | Select-Object -First 1
+    # Afterburner keeps a file for every card it has seen (an old card's file stays after a swap):
+    # use the installed card's file, else the one Afterburner saved last.
+    $files = @(Get-ChildItem -LiteralPath (Join-Path $abDir 'Profiles') -Filter 'VEN_10DE&DEV_2C02*.cfg' -ErrorAction SilentlyContinue)
+    $cfg = $null
+    foreach ($pnp in @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { "$($_.PNPDeviceID)" })) {
+        if (-not $cfg -and $pnp -match '^PCI\\(VEN_10DE&DEV_2C02[^\\]*)') {
+            $want = $Matches[1] + '&'
+            $cfg = $files | Where-Object { $_.Name.StartsWith($want, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+        }
+    }
+    if (-not $cfg) { $cfg = $files | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
     if (-not $cfg) { throw "No RTX 5080 profile file (VEN_10DE&DEV_2C02*.cfg) found in $abDir\Profiles. Open Afterburner once, then close it and retry." }
 
     $backupDir = Join-Path $PSScriptRoot 'backups'
@@ -71,7 +81,7 @@ try {
     for ($i = $start + 1; $i -lt $lines.Count -and -not $lines[$i].StartsWith('['); $i++) {
         if ($lines[$i].StartsWith('VFCurve=')) { $curveLine = $lines[$i]; break }
     }
-    if (-not $curveLine) { throw 'No VFCurve in [Startup]. Open Afterburner once, then close it and retry.' }
+    if (-not $curveLine) { throw "Afterburner has not saved this card's voltage/frequency curve yet. Open Afterburner, leave every setting at stock, click Apply (the tick) once, close Afterburner and retry." }
     $hex = $curveLine.Substring(8)
     $b = [byte[]]::new($hex.Length / 2)
     for ($i = 0; $i -lt $b.Length; $i++) { $b[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }

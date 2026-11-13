@@ -67,20 +67,51 @@ pub fn backup_dir() -> PathBuf {
     }
 }
 
-/// Profiles\VEN_10DE&DEV_2C02*.cfg (first by name, like Get-ChildItem).
+/// Afterburner's per-card file names start with this (VEN_10DE = NVIDIA, DEV_2C02 = RTX 5080).
+const CARD_PREFIX: &str = "VEN_10DE&DEV_2C02";
+
+/// "VEN_10DE&DEV_2C02&SUBSYS_89D71043&REV_A1" for every RTX 5080 in Win32_VideoController's PNPDeviceID lines
+/// ("PCI\VEN_10DE&DEV_2C02&SUBSYS_89D71043&REV_A1\6&...").
+fn card_ids(pnp: &str) -> Vec<String> {
+    pnp.lines()
+        .filter_map(|l| {
+            let l = l.trim().to_uppercase();
+            let id = l.strip_prefix("PCI\\")?.split('\\').next()?.to_string();
+            id.starts_with(CARD_PREFIX).then_some(id)
+        })
+        .collect()
+}
+
+/// The RTX 5080 cards in this PC right now (read once per run - the card does not change while PC Tuner runs).
+fn present_cards() -> &'static [String] {
+    static CARDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CARDS.get_or_init(|| common::ps("Get-CimInstance Win32_VideoController | ForEach-Object { $_.PNPDeviceID }").map(|o| card_ids(&o)).unwrap_or_default())
+}
+
+/// Which Profiles\VEN_10DE&DEV_2C02*.cfg belongs to the installed card. Afterburner keeps one file per card it
+/// has ever seen, so after a card swap the old card's file is still there (and may sort first by name): the file
+/// named after a present card wins, otherwise the one Afterburner saved last.
+fn pick_cfg(files: &[(PathBuf, std::time::SystemTime)], cards: &[String]) -> Option<PathBuf> {
+    let name = |p: &PathBuf| p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_uppercase();
+    let rtx: Vec<&(PathBuf, std::time::SystemTime)> = files.iter().filter(|(p, _)| { let n = name(p); n.starts_with(CARD_PREFIX) && n.ends_with(".CFG") }).collect();
+    for card in cards {
+        let want = format!("{card}&");
+        if let Some((p, _)) = rtx.iter().find(|(p, _)| name(p).starts_with(&want)) {
+            return Some(p.clone());
+        }
+    }
+    rtx.iter().max_by_key(|(_, t)| *t).map(|(p, _)| p.clone())
+}
+
+/// The installed RTX 5080's Afterburner profile file (see pick_cfg).
 pub fn cfg_file() -> Option<PathBuf> {
-    let dir = ab_dir().join("Profiles");
-    let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
+    let files: Vec<(PathBuf, std::time::SystemTime)> = std::fs::read_dir(ab_dir().join("Profiles"))
         .ok()?
         .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_uppercase();
-            p.is_file() && n.starts_with("VEN_10DE&DEV_2C02") && n.ends_with(".CFG")
-        })
+        .filter(|e| e.path().is_file())
+        .map(|e| (e.path(), e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH)))
         .collect();
-    names.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
-    names.into_iter().next()
+    pick_cfg(&files, present_cards())
 }
 
 pub struct Cfg {
@@ -253,10 +284,14 @@ pub fn find_preset(sec: Option<&Section>) -> Option<usize> {
     PRESETS.iter().position(|p| section_is_preset(sec, p))
 }
 
+/// A card Afterburner has only seen (a new card, or after a card swap) has an empty [Startup]: it writes the
+/// curve there once settings are applied in it.
+const NO_CURVE: &str = "Afterburner has not saved this card's voltage/frequency curve yet. Open Afterburner, leave every setting at stock, click Apply (the tick) once, close Afterburner and retry.";
+
 /// Build a preset's [ProfileN] section from the card's own stock curve in [Startup].
 pub fn preset_section_lines(cfg: &Cfg, p: &Preset) -> Result<Vec<String>, String> {
     let startup = cfg.section("Startup").ok_or("No [Startup] section in the Afterburner profile. Open Afterburner once, close it, and retry.")?;
-    let vf = startup.get("VFCurve").filter(|v| !v.is_empty()).ok_or("No VFCurve in [Startup]. Open Afterburner once, close it, and retry.")?;
+    let vf = startup.get("VFCurve").filter(|v| !v.is_empty()).ok_or(NO_CURVE)?;
     let c = decode_curve(vf).ok_or("Unexpected curve format in the Afterburner profile. Not touching anything.")?;
     let pts = &c.points;
     let mut b = c.bytes.clone();
@@ -1703,6 +1738,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_file_is_the_installed_cards() {
+        // this PC: an old Gigabyte RTX 5080's file (sorts first) is still there after the swap to an ASUS one
+        let pnp = "PCI\\VEN_1002&DEV_13C0&SUBSYS_7E591462&REV_CB\\4&1\r\nPCI\\VEN_10DE&DEV_2C02&SUBSYS_89D71043&REV_A1\\69208F05A92DB04800\r\n";
+        let cards = card_ids(pnp);
+        assert_eq!(cards, vec!["VEN_10DE&DEV_2C02&SUBSYS_89D71043&REV_A1".to_string()]);
+        let t = |s: u64| std::time::UNIX_EPOCH + Duration::from_secs(s);
+        let old = PathBuf::from("VEN_10DE&DEV_2C02&SUBSYS_418B1458&REV_A1&BUS_1&DEV_0&FN_0.cfg");
+        let new = PathBuf::from("VEN_10DE&DEV_2C02&SUBSYS_89D71043&REV_A1&BUS_1&DEV_0&FN_0.cfg");
+        let files = vec![
+            (PathBuf::from("MSIAfterburner.cfg"), t(900)),
+            (PathBuf::from("VEN_1002&DEV_13C0&SUBSYS_7E591462&REV_CB&BUS_121&DEV_0&FN_0.cfg"), t(800)),
+            (old.clone(), t(500)),
+            (new.clone(), t(100)),
+        ];
+        // the present card's file wins even when it is older and sorts last
+        assert_eq!(pick_cfg(&files, &cards), Some(new.clone()));
+        // card not detected (or no file named after it): the one Afterburner saved last
+        assert_eq!(pick_cfg(&files, &[]), Some(old.clone()));
+        assert_eq!(pick_cfg(&files, &["VEN_10DE&DEV_2C02&SUBSYS_00000000&REV_A1".into()]), Some(old));
+        // a different revision is a different card
+        assert_eq!(pick_cfg(&files[..3], &["VEN_10DE&DEV_2C02&SUBSYS_89D71043&REV_A".into()]).unwrap().to_string_lossy().contains("418B1458"), true);
+        assert_eq!(pick_cfg(&files[..2], &cards), None);
+    }
+
+    #[test]
     fn smi_parse() {
         let l = parse_smi("2895, 17001, 15001, 310.52, 61, P0, 97\r\n").unwrap();
         assert_eq!(l.mem_offset, 2000);
@@ -2016,7 +2076,7 @@ mod tests {
         assert_eq!(preset_section_lines(&short, eff).unwrap_err(), "No curve point at or above 900 mV.");
         // missing pieces
         assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), b"[Settings]\r\n"), eff).unwrap_err().contains("No [Startup]"));
-        assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), b"[Startup]\r\nVFCurve=\r\n"), eff).unwrap_err().contains("No VFCurve"));
+        assert!(preset_section_lines(&Cfg::parse(PathBuf::new(), b"[Startup]\r\nVFCurve=\r\n"), eff).unwrap_err().contains("has not saved this card's voltage/frequency curve"));
         assert!(preset_section_lines(&cfg_with_startup("0102"), eff).unwrap_err().contains("Unexpected curve format"));
     }
 
