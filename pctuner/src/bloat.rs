@@ -189,6 +189,23 @@ struct Launch {
     targeted: usize,
 }
 
+/// Add the items unticked in the preview (ids are target names) to the run's -Skip list. The script splits
+/// -Skip on commas. The page's own skip ticks are left as they are: this only affects this run.
+fn skip_more(mut l: Launch, extra: &std::collections::HashSet<String>) -> Launch {
+    if extra.is_empty() {
+        return l;
+    }
+    let mut names: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+    names.sort_unstable();
+    let more = names.join(",");
+    match l.args.iter().position(|a| a == "-Skip") {
+        Some(i) if i + 1 < l.args.len() => l.args[i + 1] = format!("{},{more}", l.args[i + 1]),
+        _ => l.args.extend(["-Skip".to_string(), more]),
+    }
+    l.targeted = l.targeted.saturating_sub(extra.len());
+    l
+}
+
 pub struct BloatTab {
     skip: Vec<bool>,
     installed: Option<Vec<String>>,
@@ -320,12 +337,8 @@ impl BloatTab {
             .collect();
         let mut w = OpWindow::new("REMOVE BLOAT", "remove", "removed", items);
         w.preview_text = "Removed for every user, leftovers cleaned up, and blocked from coming back with updates.".into();
-        if !sel.is_empty() {
-            // The shared window lists a long group collapsed, so name every item up front:
-            // nobody should have to expand anything to see what is about to be removed.
-            let names: Vec<String> = sel.iter().map(|t| friendly(t.name)).collect();
-            w.preview_text.push_str(&format!("\n\nRemoves: {}.", names.join(", ")));
-        }
+        // every item is listed with a tick box (groups always open), all ticked; unticked ones are skipped this run
+        w.pickable = true;
         w.warning = Some("A restore point is created first. Everything can be undone with Restore.".into());
         w.reassure = "Never touches Xbox, Game Pass, Store, Security, Edge/WebView2, Photos, Notepad or codecs.".into();
         w.go_label = "Remove".into();
@@ -577,9 +590,10 @@ impl Tab for BloatTab {
         if let Some(op) = &mut self.op {
             match op.show(ui.ctx(), can && self.pending.is_some()) {
                 Some(OpEvent::Go) => {
+                    let unpicked = op.unpicked.clone();
                     self.op = None;
                     if let Some(l) = self.pending.take() {
-                        self.launch(l);
+                        self.launch(skip_more(l, &unpicked));
                     }
                 }
                 Some(OpEvent::Close) => {
@@ -737,6 +751,30 @@ impl Tab for BloatTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bloat_preview_untick_skips() {
+        let tab = BloatTab::new();
+        let (w, l) = tab.remove_window(true);
+        assert!(w.pickable && w.unpicked.is_empty(), "every item starts ticked");
+        assert_eq!(w.items.len(), l.targeted);
+        assert!(!l.args.contains(&"-Skip".to_string()));
+        // unticked items are added to -Skip for this run only, and no longer counted
+        let un: std::collections::HashSet<String> = [w.items[2].id.clone(), w.items[0].id.clone()].into();
+        let l2 = skip_more(Launch { args: l.args.clone(), title: l.title, targeted: l.targeted }, &un);
+        let i = l2.args.iter().position(|a| a == "-Skip").unwrap();
+        let mut want: Vec<&str> = un.iter().map(|s| s.as_str()).collect();
+        want.sort_unstable();
+        assert_eq!(l2.args[i + 1], want.join(","));
+        assert_eq!(l2.targeted, l.targeted - 2);
+        assert!(tab.skip.iter().all(|s| !s), "the page's own skip ticks are untouched");
+        // merged into an existing -Skip list from the page
+        let l3 = skip_more(Launch { args: vec!["-Apply".into(), "-Skip".into(), "A".into()], title: "t", targeted: 5 }, &["B".to_string()].into());
+        assert_eq!(l3.args, vec!["-Apply", "-Skip", "A,B"]);
+        // nothing unticked: the run is unchanged
+        let l4 = skip_more(Launch { args: vec!["-Apply".into()], title: "t", targeted: 5 }, &Default::default());
+        assert_eq!((l4.args, l4.targeted), (vec!["-Apply".to_string()], 5));
+    }
 
     #[test]
     fn bloat_summary_from_log() {

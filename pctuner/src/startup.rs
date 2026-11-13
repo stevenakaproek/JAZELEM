@@ -1495,6 +1495,8 @@ fn clean_op(entries: &[Entry], include_optional: bool) -> OpShow {
     win.undo_label = "Undo this cleanup".into();
     win.empty_title = "Already clean".into();
     win.empty_text = "Everything on this list is already switched off.".into();
+    // every item is ticked; untick any to leave it switched on (Go acts on the items left in the window)
+    win.pickable = true;
     OpShow { win, what: What::Clean { spotlight }, batch: None }
 }
 
@@ -2429,6 +2431,9 @@ mod tests {
         assert_eq!(names, ["Widgets (news feed board)", "Consolidator", "OneDrive", "Ext"]);
         assert!(matches!(c.what, What::Clean { spotlight: false }));
         assert_eq!(c.win.stage, Stage::Preview);
+        // every junk item starts ticked and can be unticked; a manual switch stays all-or-nothing
+        assert!(c.win.pickable && c.win.unpicked.is_empty());
+        assert!(!switch_op(&entries[..1], false).win.pickable);
         // + optional: the Spotlight hint is armed and the item is marked optional
         let c = clean_op(&entries, true);
         assert!(matches!(c.what, What::Clean { spotlight: true }));

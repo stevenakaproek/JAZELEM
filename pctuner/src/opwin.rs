@@ -320,8 +320,12 @@ impl OpWindow {
                                     // few items of one kind: just list them
                                     body(ui);
                                 } else {
-                                    // show the names straight away unless the list is very long
-                                    egui::CollapsingHeader::new(RichText::new(format!("{label}    {total}")).strong()).id_salt(label).default_open(groups.len() == 1 || n <= 30).show(ui, body);
+                                    // show the names straight away unless the list is very long; tick boxes are always
+                                    // shown, so nothing has to be expanded to untick it
+                                    egui::CollapsingHeader::new(RichText::new(format!("{label}    {total}")).strong())
+                                        .id_salt(label)
+                                        .default_open(pickable || groups.len() == 1 || n <= 30)
+                                        .show(ui, body);
                                 }
                             }
                         });
