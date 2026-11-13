@@ -203,11 +203,105 @@ pub fn normalize_points(points: &[[f32; 2]]) -> Option<Vec<[f32; 2]>> {
             Some(prev) => p[0].max(prev[0] + 2.0),
             None => p[0],
         };
-        if t <= GRAPH_T.1 {
+        if t <= GRAPH_T.1 && out.len() < MAX_POINTS {
             out.push([t, p[1]]);
         }
     }
-    (out.len() >= 2).then_some(out)
+    (out.len() >= MIN_POINTS).then_some(out)
+}
+
+// ------------------------------------------------------------------ curve point editing
+
+/// A curve keeps 2 to 16 points (16 is the most the fan helper accepts).
+pub const MIN_POINTS: usize = 2;
+pub const MAX_POINTS: usize = 16;
+/// Neighbouring points stay at least this far apart (°C).
+const POINT_GAP: f32 = 2.0;
+
+/// Temperatures point `i` may take: between its neighbours (2 °C apart) and inside the graph.
+fn temp_range(points: &[[f32; 2]], i: usize) -> (f32, f32) {
+    let lo = if i > 0 { points[i - 1][0] + POINT_GAP } else { GRAPH_T.0 };
+    let hi = if i + 1 < points.len() { points[i + 1][0] - POINT_GAP } else { GRAPH_T.1 };
+    (lo, hi.max(lo))
+}
+
+/// Move point `i` to temperature `t` (whole degrees). It stays between its neighbours, so typing or
+/// dragging never reorders the curve. Returns true when it moved.
+pub fn set_point_temp(points: &mut [[f32; 2]], i: usize, t: f32) -> bool {
+    if i >= points.len() || !t.is_finite() {
+        return false;
+    }
+    let (lo, hi) = temp_range(points, i);
+    let nt = t.round().clamp(lo, hi);
+    let moved = nt != points[i][0];
+    points[i][0] = nt;
+    moved
+}
+
+/// Set point `i` to `d` % (whole percent, never under the fan's floor). Returns true when it changed.
+pub fn set_point_duty(points: &mut [[f32; 2]], i: usize, d: f32, floor: f32) -> bool {
+    if i >= points.len() || !d.is_finite() {
+        return false;
+    }
+    let nd = d.round().clamp(floor.min(100.0), 100.0);
+    let moved = nd != points[i][1];
+    points[i][1] = nd;
+    moved
+}
+
+/// Add a point where the curve has most room: the middle of the widest gap between two points, or past the
+/// last one when that is wider. It sits on the curve (same duty as now), so adding it changes nothing until
+/// it is moved. False at 16 points or when no gap is wide enough (4 °C).
+pub fn add_point(points: &mut Vec<[f32; 2]>, floor: f32) -> bool {
+    if points.len() >= MAX_POINTS || points.is_empty() {
+        return false;
+    }
+    // (gap width, temperature for the new point)
+    let mut best: Option<(f32, f32)> = None;
+    for w in points.windows(2) {
+        let gap = w[1][0] - w[0][0];
+        if best.map_or(true, |b| gap > b.0) {
+            best = Some((gap, ((w[0][0] + w[1][0]) / 2.0).round()));
+        }
+    }
+    let last = points[points.len() - 1][0];
+    let tail = GRAPH_T.1 - last;
+    if best.map_or(true, |b| tail > b.0) {
+        best = Some((tail, (last + (tail / 2.0).min(10.0)).round()));
+    }
+    let first = points[0][0];
+    let head = first - GRAPH_T.0;
+    if best.map_or(true, |b| head > b.0) {
+        best = Some((head, (first - (head / 2.0).min(10.0)).round()));
+    }
+    match best {
+        Some((gap, t)) if gap >= 2.0 * POINT_GAP => insert_at(points, t, curve_duty(points, t), floor),
+        _ => false,
+    }
+}
+
+/// Insert a point at `t` °C / `d` % (double-click on the graph). False when it would be within 2 °C of
+/// another point, outside the graph, or past 16 points.
+pub fn insert_at(points: &mut Vec<[f32; 2]>, t: f32, d: f32, floor: f32) -> bool {
+    if points.len() >= MAX_POINTS || !t.is_finite() || !d.is_finite() {
+        return false;
+    }
+    let t = t.round();
+    if t < GRAPH_T.0 || t > GRAPH_T.1 || points.iter().any(|p| (p[0] - t).abs() < POINT_GAP) {
+        return false;
+    }
+    let at = points.iter().position(|p| p[0] > t).unwrap_or(points.len());
+    points.insert(at, [t, d.round().clamp(floor.min(100.0), 100.0)]);
+    true
+}
+
+/// Remove point `i`. False when only 2 would be left.
+pub fn remove_point(points: &mut Vec<[f32; 2]>, i: usize) -> bool {
+    if points.len() <= MIN_POINTS || i >= points.len() {
+        return false;
+    }
+    points.remove(i);
+    true
 }
 
 /// A setting as loaded from fan-profiles.json, with its curve normalised (an unreadable curve becomes the
@@ -369,6 +463,60 @@ struct Shared {
     exited: bool,
     /// When the last status line arrived (the helper sends one about every second).
     last: Option<Instant>,
+    /// Session averages: every CPU / GPU reading since PC Tuner started. Never cleared (not even when a
+    /// helper is replaced), so they cover the whole session.
+    avg: AvgSums,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+struct AvgSums {
+    cpu_sum: f64,
+    cpu_n: u64,
+    gpu_sum: f64,
+    gpu_n: u64,
+    /// The first reading.
+    first: Option<Instant>,
+}
+
+/// Average CPU / GPU temperature since PC Tuner started, and over how long.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+pub struct Avg {
+    pub cpu: Option<f32>,
+    pub gpu: Option<f32>,
+    pub over: Option<Duration>,
+}
+
+impl AvgSums {
+    fn add(&mut self, cpu: Option<f32>, gpu: Option<f32>) {
+        if cpu.is_none() && gpu.is_none() {
+            return;
+        }
+        self.first.get_or_insert_with(Instant::now);
+        if let Some(c) = cpu.filter(|c| c.is_finite()) {
+            self.cpu_sum += c as f64;
+            self.cpu_n += 1;
+        }
+        if let Some(g) = gpu.filter(|g| g.is_finite()) {
+            self.gpu_sum += g as f64;
+            self.gpu_n += 1;
+        }
+    }
+    fn avg(&self) -> Avg {
+        let mean = |s: f64, n: u64| (n > 0).then(|| (s / n as f64) as f32);
+        Avg { cpu: mean(self.cpu_sum, self.cpu_n), gpu: mean(self.gpu_sum, self.gpu_n), over: self.first.map(|t| t.elapsed()) }
+    }
+}
+
+/// "42 min", "1 h 05 min", "35 s"
+fn span_text(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        format!("{} min", s / 60)
+    } else {
+        format!("{} h {:02} min", s / 3600, (s % 3600) / 60)
+    }
 }
 
 /// No status for this long: the data on screen is shown as stale (display only).
@@ -478,6 +626,7 @@ impl Shared {
         if let Some(g) = s.gpu {
             push(&mut self.gpu, g);
         }
+        self.avg.add(s.cpu, s.gpu);
         self.status = Some(s);
     }
 }
@@ -811,6 +960,8 @@ enum CardAction {
     Pump(bool),
     /// Drop the fan's own setting and use the profile's again.
     FollowProfile,
+    /// Open the large curve editor for this fan.
+    OpenEditor,
 }
 
 pub struct FanTab {
@@ -851,6 +1002,8 @@ pub struct FanTab {
     note: Option<String>,
     /// An own setting changed at this time and is not saved yet (saved shortly after, so a curve drag is one write).
     pin_dirty: Option<Instant>,
+    /// The fan whose curve is open in the large editor.
+    editor: Option<String>,
 }
 
 impl FanTab {
@@ -888,6 +1041,7 @@ impl FanTab {
             new_name: String::new(),
             note: None,
             pin_dirty: None,
+            editor: None,
         };
         // apply the last profile at startup (only as administrator: otherwise nothing can be controlled)
         if startup && !demo {
@@ -941,6 +1095,11 @@ impl FanTab {
             tab.settings.insert("/lpc/nct6687d/0/control/0".into(), FanSetting::Manual { percent: 45.0 });
             tab.note = Some("Balanced was applied when PC Tuner started.".into());
             tab.afterburner.store(true, Ordering::Relaxed);
+            // PCTUNER_DEMO=fan:editor - the large curve editor, on the first fan that runs a curve
+            if std::env::var("PCTUNER_DEMO").map(|v| v.eq_ignore_ascii_case("fan:editor")).unwrap_or(false) {
+                let fans = demo_status(0.0).fans;
+                tab.editor = fans.iter().find(|f| matches!(tab.settings.get(&f.id), Some(FanSetting::Curve { .. }))).map(|f| f.id.clone());
+            }
         }
         tab
     }
@@ -1334,6 +1493,19 @@ impl FanTab {
         }
     }
 
+    /// Average CPU / GPU temperature since PC Tuner started (the demo: its sample minute, shown as 42 min).
+    fn averages(&self) -> Avg {
+        if self.demo {
+            let mut sums = AvgSums::default();
+            for i in 0..HISTORY {
+                let s = demo_status(30.0 - (HISTORY - i - 1) as f64);
+                sums.add(s.cpu, s.gpu);
+            }
+            return Avg { over: Some(Duration::from_secs(42 * 60)), ..sums.avg() };
+        }
+        self.shared.lock().map(|sh| sh.avg.avg()).unwrap_or_default()
+    }
+
     /// The data to draw, and whether it is stale (the helper exited, is not running, or sent nothing for 5 s).
     fn snapshot(&self) -> (Option<Status>, HashMap<String, VecDeque<f32>>, VecDeque<f32>, VecDeque<f32>, Option<Duration>) {
         if self.demo {
@@ -1429,6 +1601,9 @@ impl Tab for FanTab {
             theme::banner(ui, theme::LOCKED, e);
         }
         let (status, rpm_hist, cpu_hist, gpu_hist, stale_for) = self.snapshot();
+        let avg = self.averages();
+        // the large editor needs live data; it is never drawn over stale numbers
+        let editor_status = if stale_for.is_none() { status.clone() } else { None };
         let afterburner = self.afterburner.load(Ordering::Relaxed);
         let mut actions: Vec<(String, f32, CardAction)> = vec![];
         let mut dismiss = None;
@@ -1474,7 +1649,7 @@ impl Tab for FanTab {
                 });
                 ui.add_space(4.0);
             }
-            hero_card(ui, &s, &cpu_hist, &gpu_hist);
+            hero_card(ui, &s, &cpu_hist, &gpu_hist, &avg);
             self.profile_bar(ui, &s.fans, can);
             let view = View {
                 settings: &self.settings,
@@ -1483,14 +1658,33 @@ impl Tab for FanTab {
                 afterburner,
                 profile: self.active.as_deref(),
                 handed_back: &self.handed_back,
+                points_open: self.demo,
             };
             fans_and_temps(ui, &s, &rpm_hist, &view, &mut actions);
         });
         if let Some(seq) = dismiss {
             self.msg_dismissed = seq;
         }
+        // the large curve editor: its changes go through the same path as a fan card's
+        if let Some(eid) = self.editor.clone() {
+            let fan = editor_status.as_ref().and_then(|s| s.fans.iter().find(|f| f.id == eid).map(|f| (f.clone(), s)));
+            match (fan, self.settings.get(&eid).cloned()) {
+                (Some((f, s)), Some(setting @ FanSetting::Curve { .. })) => {
+                    let (new, close) = big_editor(ui.ctx(), &f, &setting, s, can);
+                    if let Some(n) = new {
+                        actions.push((eid.clone(), floor_for(f.pump, f.min), CardAction::Set(n)));
+                    }
+                    if close {
+                        self.editor = None;
+                    }
+                }
+                // the fan is gone, left curve mode, or the data is stale
+                _ => self.editor = None,
+            }
+        }
         for (id, floor, a) in actions {
             match a {
+                CardAction::OpenEditor => self.editor = Some(id),
                 // a fan the user tunes gets its own setting: switching profiles leaves it alone
                 CardAction::Set(s) => {
                     let s = match s {
@@ -1538,10 +1732,21 @@ struct View<'a> {
     profile: Option<&'a str>,
     /// fans the helper reports back on the BIOS although PC Tuner asked to drive them
     handed_back: &'a HashSet<String>,
+    /// "Edit points" starts unfolded (demo screenshots only)
+    points_open: bool,
+}
+
+/// A hero-row stat that is left out when the window is too narrow for it (instead of wrapping letter by letter).
+fn stat_fit(ui: &mut egui::Ui, gap: f32, value: &str, label: &str, c: egui::Color32) {
+    if ui.available_width() < gap + 7.0 * label.chars().count().max(value.chars().count() * 2) as f32 {
+        return;
+    }
+    ui.add_space(gap);
+    theme::stat(ui, value, label, c);
 }
 
 /// Banners plus the hero card: the hottest of CPU and GPU, with live graphs.
-fn hero_card(ui: &mut egui::Ui, s: &Status, cpu_hist: &VecDeque<f32>, gpu_hist: &VecDeque<f32>) {
+fn hero_card(ui: &mut egui::Ui, s: &Status, cpu_hist: &VecDeque<f32>, gpu_hist: &VecDeque<f32>, avg: &Avg) {
     if s.emergency {
         theme::banner(ui, theme::LOCKED, "Over 90 °C - every controlled fan is at 100 % until the CPU and GPU are back under 80 °C.");
     }
@@ -1561,12 +1766,16 @@ fn hero_card(ui: &mut egui::Ui, s: &Status, cpu_hist: &VecDeque<f32>, gpu_hist: 
             theme::stat(ui, &t(s.cpu), "CPU", s.cpu.map(temp_color).unwrap_or(theme::TEXT_DIM));
             ui.add_space(22.0);
             theme::stat(ui, &t(s.gpu), "GPU", s.gpu.map(temp_color).unwrap_or(theme::TEXT_DIM));
-            ui.add_space(22.0);
-            theme::stat(ui, &s.fans.len().to_string(), "fans found", theme::TEXT);
-            ui.add_space(22.0);
+            // session averages: since PC Tuner started
+            stat_fit(ui, 22.0, &t(avg.cpu), "CPU avg", avg.cpu.map(temp_color).unwrap_or(theme::TEXT_DIM));
+            stat_fit(ui, 22.0, &t(avg.gpu), "GPU avg", avg.gpu.map(temp_color).unwrap_or(theme::TEXT_DIM));
+            stat_fit(ui, 22.0, &s.fans.len().to_string(), "fans found", theme::TEXT);
             let ctl = s.fans.iter().filter(|f| f.controllable).count();
-            theme::stat(ui, &ctl.to_string(), "can be controlled", theme::TEXT);
+            stat_fit(ui, 22.0, &ctl.to_string(), "can be controlled", theme::TEXT);
         });
+        if let Some(over) = avg.over {
+            ui.label(RichText::new(format!("Averages since PC Tuner started · {}", span_text(over))).size(11.5).color(theme::TEXT_FAINT));
+        }
         ui.add_space(6.0);
         // two graphs side by side, with room for the gap between them
         let w = ((ui.available_width() - 2.0 * ui.spacing().item_spacing.x - 16.0) / 2.0).max(120.0);
@@ -1744,7 +1953,17 @@ fn fan_card(ui: &mut egui::Ui, f: &FanInfo, hist: Option<&VecDeque<f32>>, settin
                 });
                 let mut pts = points.clone();
                 let live = src.read(s.cpu, s.gpu);
-                let changed = curve_editor(ui, &f.id, &mut pts, floor, live);
+                let mut changed = curve_editor(ui, &f.id, &mut pts, floor, live, 150.0);
+                // exact values: type the temperature and fan % of each point (folded to keep the card small)
+                egui::CollapsingHeader::new(RichText::new(format!("Edit points ({})", pts.len())).size(12.5))
+                    .id_salt(("fan-points-open", &f.id))
+                    .default_open(view.points_open)
+                    .show(ui, |ui| {
+                        changed |= point_list(ui, &f.id, &mut pts, floor);
+                    });
+                if ui.small_button("Open large editor").on_hover_text("A big graph with the point list beside it, for fine tuning.").clicked() {
+                    action = Some(CardAction::OpenEditor);
+                }
                 if changed || src != *source {
                     action = Some(CardAction::Set(FanSetting::Curve { source: src, points: pts }));
                 }
@@ -1782,11 +2001,14 @@ fn fan_card(ui: &mut egui::Ui, f: &FanInfo, hist: Option<&VecDeque<f32>>, settin
 
 const GRAPH_T: (f32, f32) = (20.0, 100.0);
 
-/// Draggable fan curve. Returns true when a point moved.
+/// Draggable fan curve. Returns true when the curve changed.
 /// x = temperature 20-100 °C, y = duty 0-100 %. The shaded band is below the fan's floor; the red line is the 90 °C override.
-fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut [[f32; 2]], floor: f32, live: Option<f32>) -> bool {
-    let size = egui::vec2(ui.available_width(), 150.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+/// Drag a point to move it, double-click empty graph to add one, right-click a point to remove it.
+/// `height`: 150 px in a fan card, larger in the big editor.
+fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut Vec<[f32; 2]>, floor: f32, live: Option<f32>, height: f32) -> bool {
+    let size = egui::vec2(ui.available_width(), height);
+    // the background takes double-clicks (add a point); the points are interacted with on top of it
+    let (rect, bg) = ui.allocate_exact_size(size, egui::Sense::click());
     let plot = rect.shrink2(egui::vec2(6.0, 8.0));
     let to_screen = |t: f32, d: f32| {
         egui::pos2(
@@ -1822,30 +2044,54 @@ fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut [[f32; 2]], floor: f32
     painter.text(egui::pos2(x90 + 3.0, plot.top()), egui::Align2::LEFT_TOP, "90°", egui::FontId::proportional(10.5), theme::tint(theme::LOCKED, 200));
     painter.text(plot.left_bottom() + egui::vec2(2.0, -2.0), egui::Align2::LEFT_BOTTOM, "20 °C", egui::FontId::proportional(10.5), theme::TEXT_FAINT);
     painter.text(plot.left_top() + egui::vec2(2.0, 0.0), egui::Align2::LEFT_TOP, "100 %", egui::FontId::proportional(10.5), theme::TEXT_FAINT);
+    // a tall graph (the large editor) has room to label every grid line
+    if height >= 250.0 {
+        // from 40: the "20 °C" corner label already sits where 30 would go
+        for t in (40..=80).step_by(10) {
+            let x = to_screen(t as f32, 0.0).x;
+            painter.text(egui::pos2(x, plot.bottom() - 2.0), egui::Align2::CENTER_BOTTOM, format!("{t} °C"), egui::FontId::proportional(10.5), theme::TEXT_FAINT);
+        }
+        for d in [25, 50, 75] {
+            let y = to_screen(0.0, d as f32).y;
+            painter.text(egui::pos2(plot.left() + 2.0, y - 1.0), egui::Align2::LEFT_BOTTOM, format!("{d} %"), egui::FontId::proportional(10.5), theme::TEXT_FAINT);
+        }
+    }
 
-    // drag the points (temperatures stay in order, 2 °C apart)
+    // drag the points (temperatures stay in order, 2 °C apart); right-click removes one
     let mut changed = false;
-    let n = points.len();
-    for i in 0..n {
+    let mut remove: Option<usize> = None;
+    let mut over_point: Option<usize> = None;
+    for i in 0..points.len() {
         let p = to_screen(points[i][0], points[i][1]);
         let hit = egui::Rect::from_center_size(p, egui::vec2(18.0, 18.0));
-        let resp = ui.interact(hit, ui.id().with(("fan-pt", id, i)), egui::Sense::drag());
+        let resp = ui.interact(hit, ui.id().with(("fan-pt", id, i)), egui::Sense::click_and_drag());
         if resp.dragged() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let (t, d) = from_screen(pos);
-                let lo = if i > 0 { points[i - 1][0] + 2.0 } else { GRAPH_T.0 };
-                let hi = if i + 1 < n { points[i + 1][0] - 2.0 } else { GRAPH_T.1 };
-                let nt = t.round().clamp(lo, hi.max(lo));
-                let nd = d.round().clamp(floor, 100.0);
-                if nt != points[i][0] || nd != points[i][1] {
-                    points[i] = [nt, nd];
-                    changed = true;
-                }
+                changed |= set_point_temp(points, i, t);
+                changed |= set_point_duty(points, i, d, floor);
             }
         }
+        if resp.secondary_clicked() {
+            remove = Some(i);
+        }
         if resp.hovered() || resp.dragged() {
+            over_point = Some(i);
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
+    }
+    if let Some(i) = remove {
+        changed |= remove_point(points, i);
+    }
+    // double-click on the graph (not on a point): a new point there
+    if over_point.is_none() && bg.double_clicked() {
+        if let Some(pos) = bg.interact_pointer_pos() {
+            let (t, d) = from_screen(pos);
+            changed |= insert_at(points, t, d, floor);
+        }
+    }
+    if over_point.is_none() {
+        bg.on_hover_text_at_pointer("Drag a point to move it · double-click to add one · right-click a point to remove it");
     }
 
     // the curve, flat beyond the first and last points
@@ -1855,7 +2101,7 @@ fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut [[f32; 2]], floor: f32
     painter.add(egui::Shape::line(line, egui::Stroke::new(2.0_f32, theme::ACCENT)));
     for (i, p) in points.iter().enumerate() {
         let c = to_screen(p[0], p[1].max(floor));
-        let hot = ui.ctx().is_being_dragged(ui.id().with(("fan-pt", id, i)));
+        let hot = ui.ctx().is_being_dragged(ui.id().with(("fan-pt", id, i))) || over_point == Some(i);
         painter.circle(c, if hot { 7.0 } else { 5.5 }, theme::BG, egui::Stroke::new(2.0_f32, theme::ACCENT));
         if hot {
             painter.text(c + egui::vec2(0.0, -12.0), egui::Align2::CENTER_BOTTOM, format!("{:.0} °C → {:.0} %", p[0], p[1]), egui::FontId::proportional(11.5), theme::TEXT);
@@ -1877,6 +2123,122 @@ fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut [[f32; 2]], floor: f32
         painter.galley(pos, galley, theme::GAMING);
     }
     changed
+}
+
+/// Every point of a curve as typed values: temperature and fan %, a Remove button, and "Add point".
+/// Click a value to type it, or drag it. Temperatures stay between their neighbours (2 °C apart), fan %
+/// never goes under the fan's floor. Returns true when the curve changed.
+fn point_list(ui: &mut egui::Ui, id: &str, points: &mut Vec<[f32; 2]>, floor: f32) -> bool {
+    let mut changed = false;
+    let mut remove: Option<usize> = None;
+    let can_remove = points.len() > MIN_POINTS;
+    egui::Grid::new(("fan-points", id)).num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
+        ui.label(RichText::new("#").size(11.5).color(theme::TEXT_FAINT));
+        ui.label(RichText::new("Temperature").size(11.5).color(theme::TEXT_FAINT));
+        ui.label(RichText::new("Fan").size(11.5).color(theme::TEXT_FAINT));
+        ui.label("");
+        ui.end_row();
+        for i in 0..points.len() {
+            ui.label(RichText::new(format!("{}", i + 1)).color(theme::TEXT_DIM));
+            let (lo, hi) = temp_range(points, i);
+            let mut t = points[i][0];
+            let r = ui
+                .add(egui::DragValue::new(&mut t).range(lo..=hi).speed(0.2).fixed_decimals(0).suffix(" °C"))
+                .on_hover_text(format!("Click to type. {lo:.0}-{hi:.0} °C (stays between its neighbours)."));
+            if r.changed() {
+                changed |= set_point_temp(points, i, t);
+            }
+            let mut d = points[i][1];
+            let r = ui
+                .add(egui::DragValue::new(&mut d).range(floor..=100.0).speed(0.3).fixed_decimals(0).suffix(" %"))
+                .on_hover_text(format!("Click to type. {floor:.0}-100 % (never under this fan's floor)."));
+            if r.changed() {
+                changed |= set_point_duty(points, i, d, floor);
+            }
+            if ui.add_enabled(can_remove, egui::Button::new("Remove").small()).on_hover_text("Remove this point").on_disabled_hover_text("A curve needs at least 2 points.").clicked() {
+                remove = Some(i);
+            }
+            ui.end_row();
+        }
+    });
+    if let Some(i) = remove {
+        changed |= remove_point(points, i);
+    }
+    let full = points.len() >= MAX_POINTS;
+    let tip = if full { format!("A curve can have at most {MAX_POINTS} points.") } else { "Adds a point where the curve has most room, on the curve as it is now.".to_string() };
+    if ui.add_enabled(!full, egui::Button::new("+ Add point").small()).on_hover_text(&tip).on_disabled_hover_text(&tip).clicked() {
+        changed |= add_point(points, floor);
+    }
+    changed
+}
+
+/// The large curve editor (a modal over the Fan Tuner page) for one fan. Returns the new setting when the user
+/// changed it, and whether the window should close.
+fn big_editor(ctx: &egui::Context, f: &FanInfo, setting: &FanSetting, s: &Status, can: bool) -> (Option<FanSetting>, bool) {
+    let FanSetting::Curve { source, points } = setting else { return (None, true) };
+    let floor = floor_for(f.pump, f.min);
+    let mut out = None;
+    let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    theme::dim_backdrop(ctx, "fan-editor");
+    egui::Window::new("fan-curve-editor")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .frame(theme::modal_frame(ctx))
+        .show(ctx, |ui| {
+            const W: f32 = 860.0;
+            ui.set_width(W);
+            theme::section(ui, "FAN CURVE");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&f.name).size(22.0).strong());
+                ui.label(RichText::new(&f.hw).color(theme::TEXT_DIM));
+            });
+            ui.add_space(4.0);
+            ui.add_enabled_ui(can, |ui| {
+                let mut src = *source;
+                let mut pts = points.clone();
+                ui.horizontal(|ui| {
+                    ui.label("Follows");
+                    egui::ComboBox::from_id_salt(("fan-src-big", &f.id)).selected_text(src.label()).width(220.0).show_ui(ui, |ui| {
+                        for x in [Source::Cpu, Source::Gpu, Source::Hottest] {
+                            ui.selectable_value(&mut src, x, x.label());
+                        }
+                    });
+                    ui.label(RichText::new(format!("{} points · lowest allowed {floor:.0} %", pts.len())).color(theme::TEXT_FAINT));
+                });
+                ui.add_space(6.0);
+                let live = src.read(s.cpu, s.gpu);
+                let mut changed = false;
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(W - 280.0);
+                        changed |= curve_editor(ui, &format!("{}-big", f.id), &mut pts, floor, live, 340.0);
+                        ui.label(RichText::new("Drag a point to move it · double-click the graph to add one · right-click a point to remove it.").size(11.5).color(theme::TEXT_FAINT));
+                    });
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        egui::ScrollArea::vertical().id_salt(("fan-points-big", &f.id)).max_height(360.0).show(ui, |ui| {
+                            changed |= point_list(ui, &format!("{}-big", f.id), &mut pts, floor);
+                        });
+                    });
+                });
+                if changed || src != *source {
+                    out = Some(FanSetting::Curve { source: src, points: pts });
+                }
+            })
+            .response
+            .on_disabled_hover_text("Run PC Tuner as administrator to control fans.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add(theme::primary_button("   Done   ")).clicked() {
+                    close = true;
+                }
+                ui.label(RichText::new("Changes apply at once and give this fan its own setting.").color(theme::TEXT_DIM));
+            });
+        });
+    (out, close)
 }
 
 #[cfg(test)]
@@ -2055,6 +2417,84 @@ mod tests {
         assert!(!json.contains("pumps"), "saved profiles no longer carry pump choices: {json}");
         let back: ProfileStore = serde_json::from_str(&serde_json::to_string(&t.store).unwrap()).unwrap();
         assert_eq!(back.pumps, t.store.pumps);
+    }
+
+    /// Typing, adding and removing curve points keeps the curve valid for the helper.
+    #[test]
+    fn fan_point_editing() {
+        let base = || vec![[30.0_f32, 30.0], [50.0, 40.0], [65.0, 60.0], [75.0, 80.0], [85.0, 100.0]];
+        // typed temperatures stay between the neighbours (2 °C apart) and are whole degrees: never a reorder
+        let mut p = base();
+        assert!(set_point_temp(&mut p, 1, 57.4));
+        assert_eq!(p[1][0], 57.0);
+        assert!(set_point_temp(&mut p, 1, 90.0));
+        assert_eq!(p[1][0], 63.0, "clamped 2 °C under the next point");
+        assert!(set_point_temp(&mut p, 1, 5.0));
+        assert_eq!(p[1][0], 32.0, "clamped 2 °C over the previous point");
+        assert!(set_point_temp(&mut p, 0, 0.0) && p[0][0] == 20.0);
+        assert!(set_point_temp(&mut p, 4, 150.0) && p[4][0] == 100.0);
+        assert!(!set_point_temp(&mut p, 4, 100.2), "rounds to the same value: no change");
+        assert!(!set_point_temp(&mut p, 9, 50.0) && !set_point_temp(&mut p, 0, f32::NAN));
+        // fan % never under the floor, never over 100
+        let mut p = base();
+        assert!(set_point_duty(&mut p, 0, 5.0, 30.0) == false && p[0][1] == 30.0, "30 % already at the floor");
+        assert!(set_point_duty(&mut p, 1, 5.0, 35.0) && p[1][1] == 35.0);
+        assert!(set_point_duty(&mut p, 1, 140.0, 35.0) && p[1][1] == 100.0);
+        // add: the middle of the widest gap (30-50 here), on the curve as it is (no change in behaviour)
+        let mut p = base();
+        assert!(add_point(&mut p, 20.0));
+        assert_eq!(p.len(), 6);
+        assert_eq!(p[1], [40.0, curve_duty(&base(), 40.0)]);
+        // the area past the last point counts too
+        let mut p = vec![[30.0, 30.0], [40.0, 50.0]];
+        assert!(add_point(&mut p, 20.0));
+        assert_eq!(p[2], [50.0, 50.0], "10 °C past the last point, flat like the curve");
+        // full: 16 points
+        let mut p = base();
+        while add_point(&mut p, 20.0) {}
+        assert_eq!(p.len(), MAX_POINTS);
+        assert!(!add_point(&mut p, 20.0) && !insert_at(&mut p, 99.0, 50.0, 20.0));
+        assert!(p.windows(2).all(|w| w[1][0] - w[0][0] >= 2.0), "always 2 °C apart: {p:?}");
+        // insert (double-click): kept in order, refused within 2 °C of a point or off the graph
+        let mut p = base();
+        assert!(insert_at(&mut p, 57.6, 47.0, 20.0));
+        assert_eq!(p[2], [58.0, 47.0]);
+        assert!(!insert_at(&mut p, 59.0, 50.0, 20.0), "1 °C from 58");
+        assert!(!insert_at(&mut p, 10.0, 50.0, 20.0) && !insert_at(&mut p, 105.0, 50.0, 20.0));
+        assert!(insert_at(&mut p, 95.0, 10.0, 25.0) && p.last().unwrap() == &[95.0, 25.0], "duty raised to the floor");
+        // remove: never under 2 points
+        let mut p = vec![[30.0, 30.0], [60.0, 60.0], [90.0, 100.0]];
+        assert!(remove_point(&mut p, 1));
+        assert!(!remove_point(&mut p, 0) && p.len() == MIN_POINTS);
+        assert!(!remove_point(&mut p, 7));
+        // whatever was edited, the helper accepts the command (at most 16 "t:d" pairs)
+        let mut p = base();
+        while add_point(&mut p, 20.0) {}
+        let cmd = command_for("x", &FanSetting::Curve { source: Source::Cpu, points: p });
+        let pairs = cmd.rsplit(' ').next().unwrap().split(',').count();
+        assert_eq!(pairs, MAX_POINTS);
+        // a hand-edited file with more than 16 points is cut to 16
+        let many: Vec<[f32; 2]> = (0..30).map(|i| [20.0 + 2.0 * i as f32, 50.0]).collect();
+        assert_eq!(normalize_points(&many).unwrap().len(), MAX_POINTS);
+    }
+
+    /// The session average adds every reading and survives a helper being replaced.
+    #[test]
+    fn fan_session_average() {
+        let mut sh = Shared::default();
+        assert_eq!(sh.avg.avg(), Avg::default());
+        for (c, g) in [(Some(40.0), Some(50.0)), (Some(60.0), None), (None, Some(70.0)), (None, None)] {
+            sh.take_status(Status { cpu: c, gpu: g, ..Default::default() });
+        }
+        let a = sh.avg.avg();
+        assert_eq!((a.cpu, a.gpu), (Some(50.0), Some(60.0)));
+        assert!(a.over.is_some());
+        sh.clear();
+        sh.take_status(Status { cpu: Some(80.0), ..Default::default() });
+        assert_eq!(sh.avg.avg().cpu, Some(60.0), "kept across clear(): (40 + 60 + 80) / 3");
+        assert_eq!(span_text(Duration::from_secs(35)), "35 s");
+        assert_eq!(span_text(Duration::from_secs(42 * 60 + 5)), "42 min");
+        assert_eq!(span_text(Duration::from_secs(3900)), "1 h 05 min");
     }
 
     /// Curves from fan-profiles.json are normalised the same way the helper reads them.
