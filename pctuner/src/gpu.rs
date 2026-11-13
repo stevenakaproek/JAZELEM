@@ -1117,13 +1117,20 @@ struct Work {
     job: Job<()>,
 }
 
+/// Sparkline length: 60 live readings, i.e. 5 minutes at SAMPLE_EVERY.
 const HISTORY: usize = 60;
+/// Live nvidia-smi reading for the sparklines and the live check. Kept slow on purpose: nothing on this tab
+/// needs faster telemetry, and each reading starts a process.
+const SAMPLE_EVERY: Duration = Duration::from_secs(5);
+/// Full state refresh (Afterburner file, Afterburner running, another nvidia-smi reading). An apply / restore /
+/// Refresh click refreshes at once, so this only catches changes made outside PC Tuner.
+const REFRESH_EVERY: Duration = Duration::from_secs(15);
 
 pub struct GpuTab {
     state: Option<State>,
     refresh: Option<Job<State>>,
     next_refresh: Instant,
-    /// light ~1 s sampler feeding the sparklines
+    /// light sampler (every SAMPLE_EVERY) feeding the sparklines
     sampler: Option<Job<Option<Live>>>,
     next_sample: Instant,
     history: VecDeque<Live>,
@@ -1333,7 +1340,7 @@ impl GpuTab {
         }
     }
 
-    /// The nvidia-smi reading on screen: the newest 1 s sample, else the last state refresh.
+    /// The nvidia-smi reading on screen: the newest live sample, else the last state refresh.
     fn live_shown(&self) -> Option<&Live> {
         self.history.back().or(self.state.as_ref().and_then(|s| s.live.as_ref()))
     }
@@ -1367,7 +1374,7 @@ impl GpuTab {
             }
             self.state = Some(s);
             self.refresh = None;
-            self.next_refresh = Instant::now() + Duration::from_secs(3);
+            self.next_refresh = Instant::now() + REFRESH_EVERY;
             // the sign-in check may have reverted the trial while the tab is open
             self.reload_trial();
         }
@@ -1375,7 +1382,7 @@ impl GpuTab {
             self.refresh = Some(Job::spawn(current_state));
         }
 
-        // light sampler: one nvidia-smi reading about once per second
+        // light sampler: one nvidia-smi reading every SAMPLE_EVERY
         if let Some(j) = &self.sampler {
             if let Some(l) = j.poll() {
                 if let Some(l) = l {
@@ -1389,7 +1396,7 @@ impl GpuTab {
             }
         }
         if self.sampler.is_none() && Instant::now() >= self.next_sample {
-            self.next_sample = Instant::now() + Duration::from_secs(1);
+            self.next_sample = Instant::now() + SAMPLE_EVERY;
             self.sampler = Some(Job::spawn(gpu_live));
         }
 
@@ -1422,7 +1429,9 @@ impl GpuTab {
                     }
                 }
                 self.reload_trial();
+                // show the result at once, not at the next (slow) tick
                 self.next_refresh = Instant::now();
+                self.next_sample = Instant::now();
             }
         }
 
@@ -1497,7 +1506,10 @@ impl GpuTab {
                     self.op_action = Some(Action::Restore { path: last, end_trial: trial.is_some() });
                 }
             },
-            Click::Refresh => self.next_refresh = Instant::now(),
+            Click::Refresh => {
+                self.next_refresh = Instant::now();
+                self.next_sample = Instant::now();
+            }
             Click::Keep => {
                 if self.demo {
                     if let Some(t) = self.trial.take() {
