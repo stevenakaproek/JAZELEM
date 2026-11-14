@@ -1004,18 +1004,20 @@ pub struct FanTab {
     pin_dirty: Option<Instant>,
     /// The fan whose curve is open in the large editor.
     editor: Option<String>,
-    /// PCTUNER_FAN=rust: the Rust sensor reader in place of the C# helper (read-only, stage 2).
+    /// The Rust fan backend (the default; PCTUNER_FAN=helper starts the old C# helper instead).
     rust: Option<RustReader>,
 }
 
-/// PCTUNER_FAN=rust selects the Rust hardware backend (read-only while it is being proven).
+/// The Rust fan backend is the default. PCTUNER_FAN=helper selects the old C# helper (kept as a fallback for now).
 fn rust_mode() -> bool {
-    std::env::var("PCTUNER_FAN").map(|v| v.eq_ignore_ascii_case("rust")).unwrap_or(false)
+    rust_mode_for(std::env::var("PCTUNER_FAN").ok().as_deref())
 }
 
-/// Reads the sensors in Rust (crate::hw) once a second into the same Shared the helper's reader thread fills.
-/// Never controls a fan. Stops when dropped.
-/// The Rust fan backend (PCTUNER_FAN=rust): a thread owning the hardware (crate::hw::backend::Hardware) and the
+fn rust_mode_for(v: Option<&str>) -> bool {
+    !v.is_some_and(|v| v.trim().eq_ignore_ascii_case("helper"))
+}
+
+/// The Rust fan backend (the default): a thread owning the hardware (crate::hw::backend::Hardware) and the
 /// safety loop (crate::hw::controller::Controller). It takes the same command lines the helper took, reads
 /// the sensors and runs the loop once a second, and fills the same Shared status. On drop it hands every fan
 /// back and waits for that before returning, so PC Tuner never exits with a fan still driven.
@@ -1724,13 +1726,13 @@ impl Tab for FanTab {
         if let Some(e) = &self.error {
             theme::banner(ui, theme::LOCKED, e);
         }
+        // the Rust backend only speaks up when something needs saying: a part that could not be opened (as
+        // administrator - without it the banner above already explains), or fans restored after a crash
         if let Some(r) = &self.rust {
-            let mut text = "Rust fan backend (preview): PC Tuner reads and drives the fans itself, without the fan helper. Each fan's BIOS settings are saved before it is first driven and put back exactly.".to_string();
-            let errs = r.errors();
+            let errs: Vec<String> = r.errors().into_iter().filter(|e| common::is_admin() || !e.contains("PawnIO")).collect();
             if !errs.is_empty() {
-                text.push_str(&format!(" Not available: {}.", errs.join("; ")));
+                theme::banner(ui, theme::GAMING, &errs.join(" "));
             }
-            theme::banner(ui, theme::GAMING, &text);
         }
         let (status, rpm_hist, cpu_hist, gpu_hist, stale_for) = self.snapshot();
         let avg = self.averages();
@@ -2689,6 +2691,14 @@ mod tests {
         let s = parse_status(r#"{"cpu":50,"gpu":40,"emergency":false,"blind":true,"msg":"x","msgSeq":3,"fans":[],"temps":[]}"#).unwrap();
         assert!(s.blind);
         assert_eq!((s.msg.as_str(), s.msg_seq), ("x", 3));
+    }
+
+    /// The Rust backend is the default; only PCTUNER_FAN=helper picks the old C# helper.
+    #[test]
+    fn fan_backend_choice() {
+        assert!(rust_mode_for(None));
+        assert!(rust_mode_for(Some("rust")) && rust_mode_for(Some("")) && rust_mode_for(Some("anything")));
+        assert!(!rust_mode_for(Some("helper")) && !rust_mode_for(Some(" Helper ")));
     }
 
     /// When the helper is gone its last numbers are stale, and they are cleared when it stops for good.

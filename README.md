@@ -44,9 +44,11 @@ change is being applied waits until it has finished, so the change is recorded a
   (slider) or Curve (draggable points, follows CPU, GPU or the hotter of the two); Silent / Balanced /
   Performance profiles plus your own, the last one applied at startup. Safety: never below 20 %
   (pumps 50 %), 100 % at 90 °C, fans back to the BIOS when PC Tuner closes or crashes, and while
-  temperatures cannot be read. If PC Tuner
-  and its PCTunerFan helper are force-killed together, fans stay at their last speed (never under
-  the floor) until the PC restarts.
+  temperatures cannot be read. Fans are read and driven by PC Tuner itself (Rust, through the PawnIO
+  driver and NVAPI): each fan's BIOS settings are saved before it is first driven and put back byte
+  for byte; if PC Tuner is force-killed, the next start in the same boot puts them back. Supported:
+  the Nuvoton NCT6687D-R board chip (MSI AM5 800-series boards), AMD Zen CPUs and NVIDIA GPUs.
+  `PCTUNER_FAN=helper` still runs the older C# helper instead.
 - **Sidebar** - **Reset GPU to stock** (always visible) and **Power / BIOS**: restarts straight into
   the UEFI/BIOS setup, or shuts down so the next start opens it, using Windows' own `shutdown /fw`.
   Needs administrator rights and a UEFI-booted PC, and asks for confirmation first. Every open
@@ -60,9 +62,10 @@ Download: get PCTuner.exe from the GitHub Releases page (the exe is not in the r
 
 ## Build
 
-Needs Rust (rustup, MSVC toolchain), Visual Studio 2022 Build Tools (C++) and, for the fan helper,
-the .NET 8 SDK (`winget install Microsoft.DotNet.SDK.8`). The fan helper is built first and embedded
-into PCTuner.exe:
+Needs Rust (rustup, MSVC toolchain), Visual Studio 2022 Build Tools (C++) and, for the old C# fan
+helper that is still embedded as a fallback (`PCTUNER_FAN=helper`), the .NET 8 SDK
+(`winget install Microsoft.DotNet.SDK.8`). Without the helper build step, PCTuner.exe still builds and
+Fan Tuner uses its Rust backend. The fan helper is built first and embedded into PCTuner.exe:
 
 ```
 cd pctuner
@@ -83,7 +86,7 @@ The Fan Tuner's helper (`pctuner/fanhelper`) uses, unmodified from NuGet,
 its package). These DLLs are embedded in PCTuner.exe and unpacked to `%LOCALAPPDATA%\PCTuner\fan`.
 Hardware access goes through the separately installed [PawnIO](https://pawnio.eu) driver.
 
-The Rust fan backend that is replacing the helper (`pctuner/src/hw`) is ported from LibreHardwareMonitor's
+The Rust fan backend Fan Tuner uses by default (`pctuner/src/hw`) is ported from LibreHardwareMonitor's
 NCT6687D-R, AMD Zen and NVAPI code; those files stay under MPL-2.0 (noted at the top of each). It loads two
 signed PawnIO modules, `LpcIO.bin` and `AMDFamily17.bin` (`pctuner/assets/pawnio`, LGPL-2.1, unmodified from
 the [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules/releases/tag/0.1.6) 0.1.6 release - the same
