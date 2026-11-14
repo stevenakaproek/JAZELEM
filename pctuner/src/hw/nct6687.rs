@@ -4,7 +4,7 @@
 // defaults in SuperIOHardware.cs), Copyright (C) LibreHardwareMonitor and Contributors.
 
 //! Nuvoton NCT6687D-R (MSI AM5 / LGA1851 800-series boards, e.g. MAG X870E TOMAHAWK WIFI).
-//! Reading: temperatures, fan RPMs and duty. Writing (stage 3): a header's duty, after its BIOS registers are
+//! Reading: temperatures, fan RPMs and duty (the hardware monitor is started first if needed). Writing: a header's duty, after its BIOS registers are
 //! saved (`bios_state`), and putting exactly those registers back (`restore`). Unlike LibreHardwareMonitor,
 //! the restore puts back the BIOS's own manual-mode bit and every point of a System Fan's curve.
 
@@ -23,7 +23,8 @@ const EC_INDEX: u16 = 0x05;
 const EC_DATA: u16 = 0x06;
 const EC_PAGE_SELECT: u8 = 0xFF;
 
-/// Bit 7 set = the monitor is running (LHM sets it on start; read-only Rust only checks it).
+/// Bit 7 set = the hardware monitor is running. LHM sets it when it opens the chip; so does PC Tuner (it is
+/// not a fan setting - without it the temperature / RPM registers do not update).
 const INIT_REGISTER: u16 = 0x180;
 
 pub const HW_NAME: &str = "Nuvoton NCT6687D-R";
@@ -149,10 +150,14 @@ impl Nct6687 {
                 .ok_or("the ISA bus is busy")??;
             if let Some(base) = found {
                 let chip = Nct6687 { lpc, isa, base };
-                let init = chip.locked(|c| c.read(INIT_REGISTER))?;
-                if init & 0x80 == 0 {
-                    return Err("the NCT6687D-R monitor is not started yet (open Fan Tuner with the C# helper once)".into());
-                }
+                // start the hardware monitor if it is not running yet (LHM: same register, same bit)
+                chip.locked(|c| {
+                    let init = c.read(INIT_REGISTER)?;
+                    if init & 0x80 == 0 {
+                        c.write(INIT_REGISTER, init | 0x80)?;
+                    }
+                    Ok(())
+                })?;
                 return Ok(chip);
             }
         }

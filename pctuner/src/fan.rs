@@ -1,27 +1,19 @@
-//! Fan Tuner tab - live fan speeds and temperatures, driven by the PCTunerFan helper
-//! (LibreHardwareMonitorLib + PawnIO). The helper holds the safety rules (floors, 90 C override,
-//! fans back to the BIOS on exit/crash); this side shows the data and sends requests.
+//! Fan Tuner tab - live fan speeds and temperatures, read and driven in Rust (crate::hw: the PawnIO driver
+//! for the board chip and CPU, NVAPI for the GPU). The fan thread (RustReader) holds the safety rules
+//! (floors, 90 °C override, fans back to the BIOS on exit / crash); this side shows the data and sends requests.
 
 use crate::common::{self, Tab};
 use crate::theme;
 use eframe::egui::{self, RichText};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::io::{BufRead, BufReader, Write};
-use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-mod embedded {
-    include!(concat!(env!("OUT_DIR"), "/fan_files.rs"));
-}
-
 const HISTORY: usize = 60;
 
-// ------------------------------------------------------------------ helper protocol
+// ------------------------------------------------------------------ fan status (what the fan thread reports)
 
 #[derive(Deserialize, Clone, Default, Debug)]
 #[serde(default)]
@@ -38,7 +30,7 @@ pub struct FanInfo {
     pub pump: bool,
     pub gpu: bool,
     pub requested: Option<f32>,
-    /// The helper is running a curve for this fan.
+    /// The fan thread is running a curve for this fan.
     pub curve: bool,
 }
 
@@ -58,9 +50,9 @@ pub struct Status {
     pub cpu: Option<f32>,
     pub gpu: Option<f32>,
     pub emergency: bool,
-    /// Temperatures unreadable for > 5 s: the helper has handed the fans to the BIOS until they read again.
+    /// Temperatures unreadable for > 5 s: the fan thread has handed the fans to the BIOS until they read again.
     pub blind: bool,
-    /// The helper's latest notice; it stays in every status line until a new one replaces it.
+    /// The fan thread's latest notice; it stays in every status line until a new one replaces it.
     pub msg: String,
     /// Goes up by one for every new notice (so a dismissed notice stays dismissed).
     #[serde(rename = "msgSeq")]
@@ -109,7 +101,7 @@ impl Source {
             Source::Hottest => "Hotter of CPU and GPU",
         }
     }
-    /// The temperature this source reads now (falls back to whichever one is known, like the helper).
+    /// The temperature this source reads now (falls back to whichever one is known, like the fan thread).
     pub fn read(self, cpu: Option<f32>, gpu: Option<f32>) -> Option<f32> {
         let hottest = match (cpu, gpu) {
             (Some(c), Some(g)) => Some(c.max(g)),
@@ -123,7 +115,7 @@ impl Source {
     }
 }
 
-/// Duty for `temp` on a curve, linear between points, flat beyond the ends (same rule as the helper).
+/// Duty for `temp` on a curve, linear between points, flat beyond the ends (same rule as the fan thread).
 pub fn curve_duty(points: &[[f32; 2]], temp: f32) -> f32 {
     let Some(first) = points.first() else { return 100.0 };
     if temp <= first[0] {
@@ -188,7 +180,7 @@ pub struct ProfileStore {
 }
 
 /// Curve points as the editor keeps them: in temperature order (a stable sort, so equal temperatures keep
-/// their order like the helper's), 20-100 °C, at least 2 °C apart, duty 0-100 %. None when fewer than
+/// their order like the fan thread's), 20-100 °C, at least 2 °C apart, duty 0-100 %. None when fewer than
 /// 2 points are left.
 pub fn normalize_points(points: &[[f32; 2]]) -> Option<Vec<[f32; 2]>> {
     let mut pts: Vec<[f32; 2]> = points
@@ -212,7 +204,7 @@ pub fn normalize_points(points: &[[f32; 2]]) -> Option<Vec<[f32; 2]>> {
 
 // ------------------------------------------------------------------ curve point editing
 
-/// A curve keeps 2 to 16 points (16 is the most the fan helper accepts).
+/// A curve keeps 2 to 16 points (16 is the most the fan controller accepts).
 pub const MIN_POINTS: usize = 2;
 pub const MAX_POINTS: usize = 16;
 /// Neighbouring points stay at least this far apart (°C).
@@ -305,7 +297,7 @@ pub fn remove_point(points: &mut Vec<[f32; 2]>, i: usize) -> bool {
 }
 
 /// A setting as loaded from fan-profiles.json, with its curve normalised (an unreadable curve becomes the
-/// Balanced curve; the helper still applies the fan's floor).
+/// Balanced curve; the fan thread still applies the fan's floor).
 fn normalize_setting(s: &mut FanSetting) {
     if let FanSetting::Curve { points, .. } = s {
         *points = normalize_points(points).unwrap_or_else(|| preset_points("Balanced").map(|p| p.to_vec()).unwrap_or_default());
@@ -374,8 +366,8 @@ pub fn normalized(settings: &HashMap<String, FanSetting>) -> BTreeMap<String, Fa
     settings.iter().filter(|(_, s)| **s != FanSetting::Bios).map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
-/// Fans PC Tuner asks to drive that the helper reports as not driven (no request, no curve, not in software
-/// mode): it refused or dropped the setting, so the BIOS has them. While the helper is "blind" it keeps the
+/// Fans PC Tuner asks to drive that the fan thread reports as not driven (no request, no curve, not in software
+/// mode): it refused or dropped the setting, so the BIOS has them. While the fan thread is "blind" it keeps the
 /// requests, so those fans are not listed here.
 pub fn handed_back(settings: &HashMap<String, FanSetting>, status: &Status) -> Vec<String> {
     status
@@ -391,7 +383,7 @@ pub fn handed_back(settings: &HashMap<String, FanSetting>, status: &Status) -> V
 fn fan_chip(f: &FanInfo, setting: &FanSetting, can: bool, emergency: bool, blind: bool, handed_back: bool) -> (&'static str, egui::Color32) {
     let ours = *setting != FanSetting::Bios;
     if !can {
-        // view-only: nothing is sent, so show what the helper reports, not the saved setting
+        // view-only: nothing is sent, so show what the fan thread reports, not the saved setting
         return match (f.mode == "software", f.curve) {
             (true, true) => ("Curve", theme::ACCENT),
             (true, false) => ("PC Tuner", theme::ACCENT),
@@ -413,7 +405,7 @@ fn fan_chip(f: &FanInfo, setting: &FanSetting, can: bool, emergency: bool, blind
     }
 }
 
-/// The helper command that puts `id` into `setting`.
+/// The fan thread command that puts `id` into `setting`.
 pub fn command_for(id: &str, setting: &FanSetting) -> String {
     match setting {
         FanSetting::Bios => format!("auto {id}"),
@@ -425,7 +417,7 @@ pub fn command_for(id: &str, setting: &FanSetting) -> String {
     }
 }
 
-/// One status line from the helper (anything that is not a JSON object is ignored).
+/// One status line from the fan thread (anything that is not a JSON object is ignored).
 pub fn parse_status(line: &str) -> Option<Status> {
     let t = line.trim().trim_start_matches('\u{feff}');
     if !t.starts_with('{') {
@@ -452,19 +444,18 @@ fn push(h: &mut VecDeque<f32>, v: f32) {
     h.push_back(v);
 }
 
-/// Latest data from the helper, filled by the reader thread (keeps going while another tab is open).
+/// Latest data from the fan thread (keeps going while another tab is open).
 #[derive(Default)]
 struct Shared {
     status: Option<Status>,
     rpm: HashMap<String, VecDeque<f32>>,
     cpu: VecDeque<f32>,
     gpu: VecDeque<f32>,
-    log: Vec<String>,
     exited: bool,
-    /// When the last status line arrived (the helper sends one about every second).
+    /// When the last reading arrived (the fan thread takes one about every second).
     last: Option<Instant>,
-    /// Session averages: every CPU / GPU reading since PC Tuner started. Never cleared (not even when a
-    /// helper is replaced), so they cover the whole session.
+    /// Session averages: every CPU / GPU reading since PC Tuner started. Never cleared (not even when the
+    /// fan thread is restarted), so they cover the whole session.
     avg: AvgSums,
 }
 
@@ -521,33 +512,8 @@ fn span_text(d: Duration) -> String {
 
 /// No status for this long: the data on screen is shown as stale (display only).
 const STALE_AFTER: Duration = Duration::from_secs(5);
-/// A running helper silent for this long is hung and is let go (its input is closed, see `Helper::detach`). Well above the helper's own
-/// 10 s watchdog, so a few slow sensor reads never cost the fans their safety loop.
-const HANG_AFTER: Duration = Duration::from_secs(30);
-/// A fresh helper that sends nothing for this long (opening the PawnIO driver can take a while) is hung.
-const FIRST_STATUS_WITHIN: Duration = Duration::from_secs(30);
-/// The helper's watchdog (Safety.WatchdogSeconds in Program.cs).
-#[cfg(test)]
-const HELPER_WATCHDOG: Duration = Duration::from_secs(10);
 
-/// A hung helper that was let go (its input closed) is killed only after this long: it hands the fans back
-/// itself as soon as its loop runs again, which a kill would make impossible.
-const DETACHED_KILL_AFTER: Duration = Duration::from_secs(150);
-
-/// What a helper's stderr says about the fans: (fans handed back on exit, start-up reset pass done with this
-/// many fans it could not confirm). Only graphics-card fans can be handed back by a new process: a
-/// motherboard header an earlier helper left in manual mode stays there until a reboot ("unconfirmed").
-fn log_marks(line: &str) -> (bool, Option<u32>) {
-    let pass = line.strip_prefix("reset pass done:").map(|rest| {
-        // "reset pass done: <g> gpu, <m> unconfirmed"; anything else counts as unconfirmed
-        rest.split(',')
-            .find_map(|p| p.trim().strip_suffix(" unconfirmed").and_then(|n| n.trim().parse::<u32>().ok()))
-            .unwrap_or(1)
-    });
-    (line.starts_with("fans returned to BIOS"), pass)
-}
-
-/// Seconds since 1970 when Windows started (to tell whether the PC rebooted since fans were left stuck).
+/// Seconds since 1970 when Windows started (the saved BIOS fan state only applies to the boot it was saved in).
 pub(crate) fn boot_time() -> u64 {
     #[link(name = "kernel32")]
     extern "system" {
@@ -558,53 +524,24 @@ pub(crate) fn boot_time() -> u64 {
     now.saturating_sub(unsafe { GetTickCount64() } / 1000)
 }
 
-/// Fans left stuck by a helper stay stuck until a reboot: remembered (with the boot time) across PC Tuner
-/// restarts. Two boot times within this much are the same boot (clock adjustments).
-pub(crate) const SAME_BOOT_SECS: u64 = 120;
-const STUCK_FILE: &str = "fan-stuck.txt";
-
-const STUCK_AT_START: &str = "An earlier fan helper did not hand the fans back since Windows started - they may stay at their last speed. PC Tuner drives them with your settings and its safety rules; reboot to give them back to the BIOS.";
-const WAITING_FOR_OLD_HELPER: &str = "The fan helper stopped answering. Waiting for it to hand the fans back to the BIOS (it does as soon as it runs again) - until then fans may stay at their last speed. A new helper starts after it exits.";
-const RESTARTED_STUCK: &str = "The fan helper stopped without handing the fans back and was restarted. It drives your fans again with its safety rules; motherboard fans cannot go back to the BIOS until you reboot (graphics-card fans were handed back).";
-
-fn stuck_since_this_boot(saved: &str, boot: u64) -> bool {
-    saved.trim().parse::<u64>().map(|b| b.abs_diff(boot) <= SAME_BOOT_SECS).unwrap_or(false)
-}
-
-/// The card shown instead of live data: (headline, detail). Only says "BIOS control" when that is known:
-/// a running helper still owns its fans, and a stuck one may have left them at their last duty.
-fn stale_text(helper_gone: bool, stuck: bool, age_secs: u64) -> (String, String) {
-    if !helper_gone {
-        return (
-            format!("No data from the fan helper for {age_secs} s."),
-            format!("Fans may stay at their last speed while it is stuck. If it stays silent for {} s PC Tuner closes its input: it hands the fans back once it runs again.", HANG_AFTER.as_secs()),
-        );
-    }
-    if stuck {
-        return (
-            "The fan helper is not running - fans may be stuck at their last speed.".into(),
-            "Reboot to give them back to the BIOS.".into(),
-        );
-    }
-    (
-        "The fan helper is not running - fans are on BIOS control.".into(),
-        "The fans are safe: the BIOS / graphics driver drives them.".into(),
-    )
-}
-
-/// The banner when no helper is running any more. `stuck`: a helper that drove fans went away without
-/// saying it handed them back (only a reboot gives such fans back to the BIOS).
-fn gone_message(stuck: bool, tail: &str) -> String {
-    let head = if stuck {
-        "The fan helper stopped without confirming it handed the fans back - fans may be stuck at their last speed. Reboot to give them back to the BIOS."
+/// The card shown instead of live data: (headline, detail). `running`: the fan thread is running (its safety
+/// loop holds the fans; a reading is late - e.g. a slow sensor - and it keeps trying).
+fn stale_text(running: bool, age_secs: u64) -> (String, String) {
+    if running {
+        (
+            format!("No new fan readings for {age_secs} s."),
+            "PC Tuner keeps trying. If temperatures stay unreadable for 5 s, every fan goes back to the BIOS until they can be read again.".into(),
+        )
     } else {
-        "The fan helper stopped. Fans are on BIOS control."
-    };
-    format!("{head} {tail}").trim().to_string()
+        ("Fan Tuner is not running - fans are on BIOS control.".into(), "The BIOS / graphics driver drives them.".into())
+    }
 }
+
+/// Two boot times within this much are the same boot (clock adjustments).
+pub(crate) const SAME_BOOT_SECS: u64 = 120;
 
 impl Shared {
-    /// Forget the live data (the helper is gone for good).
+    /// Forget the live data.
     fn clear(&mut self) {
         self.status = None;
         self.rpm.clear();
@@ -628,255 +565,6 @@ impl Shared {
         }
         self.avg.add(s.cpu, s.gpu);
         self.status = Some(s);
-    }
-}
-
-/// Unpack the embedded helper to %LOCALAPPDATA%\PCTuner\fan and return the exe path.
-fn extract_helper() -> Result<PathBuf, String> {
-    if embedded::FILES.is_empty() {
-        return Err("The fan helper was not built into this copy of PC Tuner (run fanhelper\\build.ps1, then rebuild).".into());
-    }
-    let dir = common::data_dir().join("fan");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    for (name, bytes) in embedded::FILES {
-        let p = dir.join(name);
-        let same = std::fs::read(&p).map(|old| old == *bytes).unwrap_or(false);
-        if !same {
-            // a file can be locked by a helper that is still shutting down; the exe check below catches real problems
-            let _ = std::fs::write(&p, bytes);
-        }
-    }
-    let exe = dir.join("PCTunerFan.exe");
-    if exe.exists() {
-        Ok(exe)
-    } else {
-        Err(format!("could not unpack the fan helper to {}", dir.display()))
-    }
-}
-
-/// The running helper process.
-struct Helper {
-    child: Child,
-    /// None once closed (detach): the helper then hands its fans back as soon as its loop runs.
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
-    shared: Arc<Mutex<Shared>>,
-    stopped: bool,
-    since: Instant,
-    launch: Launch,
-    /// Started with --reset-only: it hands every fan back to the BIOS and exits (takes no commands).
-    reset_only: bool,
-    /// Its stderr said "fans returned to BIOS" (its ResetAll ran).
-    back: Arc<AtomicBool>,
-    /// Its reset pass: how many fans it could not confirm as handed back (u32::MAX: no pass reported yet).
-    pass_unconfirmed: Arc<AtomicU32>,
-    /// Its stderr has closed (every line it wrote has been read).
-    err_done: Arc<AtomicBool>,
-    /// When it was first seen exited.
-    exited_at: Option<Instant>,
-    /// When it was let go as hung (input closed, never killed before DETACHED_KILL_AFTER).
-    detached_at: Option<Instant>,
-}
-
-/// How a helper starts.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Launch {
-    Normal,
-    /// Reset pass on every controllable control first (an earlier helper may have left fans behind): GPU
-    /// fans go back to the driver; motherboard headers cannot (their saved default may be stale), so they
-    /// are driven with the settings and safety rules, and go to 100 % instead of being "handed back".
-    Reclaim,
-    /// Only that reset pass (graphics-card fans back to the driver), then exit.
-    ResetOnly,
-}
-
-impl Helper {
-    fn start(shared: Arc<Mutex<Shared>>, launch: Launch) -> Result<Helper, String> {
-        let exe = extract_helper()?;
-        let mut args = vec!["--parent".to_string(), std::process::id().to_string()];
-        match launch {
-            Launch::Normal => {}
-            Launch::Reclaim => args.push("--reclaim".into()),
-            Launch::ResetOnly => args.push("--reset-only".into()),
-        }
-        let mut child = Command::new(&exe)
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(common::CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| format!("could not start the fan helper: {e}"))?;
-        let stdin = Arc::new(Mutex::new(Some(child.stdin.take().ok_or("no stdin")?)));
-        let out = child.stdout.take().ok_or("no stdout")?;
-        let err = child.stderr.take().ok_or("no stderr")?;
-        {
-            let shared = shared.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(out).lines().map_while(Result::ok) {
-                    if let Some(s) = parse_status(&line) {
-                        if let Ok(mut sh) = shared.lock() {
-                            sh.take_status(s);
-                        }
-                    }
-                }
-                if let Ok(mut sh) = shared.lock() {
-                    sh.exited = true;
-                }
-            });
-        }
-        let back = Arc::new(AtomicBool::new(false));
-        let pass = Arc::new(AtomicU32::new(u32::MAX));
-        let err_done = Arc::new(AtomicBool::new(false));
-        {
-            let shared = shared.clone();
-            let (back, pass, err_done) = (back.clone(), pass.clone(), err_done.clone());
-            std::thread::spawn(move || {
-                for line in BufReader::new(err).lines().map_while(Result::ok) {
-                    let (b, p) = log_marks(&line);
-                    if b {
-                        back.store(true, Ordering::SeqCst);
-                    }
-                    if let Some(m) = p {
-                        pass.store(m, Ordering::SeqCst);
-                    }
-                    if let Ok(mut sh) = shared.lock() {
-                        sh.log.push(line);
-                        if sh.log.len() > 50 {
-                            sh.log.remove(0);
-                        }
-                    }
-                }
-                err_done.store(true, Ordering::SeqCst);
-            });
-        }
-        // keep-alive: the helper hands fans back to the BIOS if it hears nothing for 10 s
-        {
-            let stdin = Arc::downgrade(&stdin);
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(1));
-                let Some(s) = stdin.upgrade() else { break };
-                let ok = s.lock().map(|mut w| w.as_mut().is_some_and(|w| writeln!(w, "ping").and_then(|_| w.flush()).is_ok())).unwrap_or(false);
-                if !ok {
-                    break;
-                }
-            });
-        }
-        Ok(Helper {
-            child,
-            stdin,
-            shared,
-            stopped: false,
-            since: Instant::now(),
-            launch,
-            reset_only: launch == Launch::ResetOnly,
-            back,
-            pass_unconfirmed: pass,
-            err_done,
-            exited_at: None,
-            detached_at: None,
-        })
-    }
-
-    fn send(&self, cmd: &str) -> bool {
-        self.stdin.lock().map(|mut w| w.as_mut().is_some_and(|w| writeln!(w, "{cmd}").and_then(|_| w.flush()).is_ok())).unwrap_or(false)
-    }
-
-    fn alive(&mut self) -> bool {
-        let alive = matches!(self.child.try_wait(), Ok(None));
-        if !alive && self.exited_at.is_none() {
-            self.exited_at = Some(Instant::now());
-        }
-        alive
-    }
-
-    /// Its reset pass covered every control (--reclaim / --reset-only) and every one was a graphics-card
-    /// fan the driver took back: nothing an earlier helper left can still be stuck.
-    fn pass_cleared_all(&self) -> bool {
-        self.launch != Launch::Normal && self.pass_unconfirmed.load(Ordering::SeqCst) == 0
-    }
-
-    /// Let a hung helper go without killing it: its input is closed (the keep-alive stops too), so it hands
-    /// its fans back (ResetAll) as soon as its loop runs again, or its own 10 s watchdog fires. Never blocks.
-    fn detach(&mut self) {
-        self.stopped = true; // Drop never quits / kills it
-        if let Ok(mut w) = self.stdin.lock() {
-            *w = None;
-        }
-        self.detached_at = Some(Instant::now());
-    }
-
-    /// A detached helper that is still stuck after DETACHED_KILL_AFTER: killed as a last resort.
-    fn kill_if_stuck_too_long(&mut self) {
-        if self.detached_at.is_some_and(|t| t.elapsed() > DETACHED_KILL_AFTER) && self.alive() {
-            let _ = self.child.kill();
-            self.detached_at = None;
-            if let Ok(mut sh) = self.shared.lock() {
-                sh.log.push(format!("the fan helper was still stuck after {} s and was stopped", DETACHED_KILL_AFTER.as_secs()));
-            }
-        }
-    }
-
-    /// Without blocking: None while it runs (or its last stderr lines are still coming in, up to 1 s after
-    /// it exited), else whether it said it handed its fans back.
-    fn outcome(&mut self) -> Option<bool> {
-        if self.alive() {
-            return None;
-        }
-        let since = self.exited_at.map(|t| t.elapsed()).unwrap_or_default();
-        if !self.err_done.load(Ordering::SeqCst) && since < Duration::from_secs(1) {
-            return None;
-        }
-        Some(self.back.load(Ordering::SeqCst))
-    }
-
-    /// Running but silent: no status for 30 s (or none at all 30 s after it started).
-    fn hung(&self) -> bool {
-        let last = self.shared.lock().ok().and_then(|s| s.last);
-        match last {
-            Some(t) => t.elapsed() > HANG_AFTER,
-            None => self.since.elapsed() > FIRST_STATUS_WITHIN,
-        }
-    }
-
-    /// After it exited: did it say it handed its fans back? Waits up to 1 s for the last stderr lines.
-    fn handed_back(&self) -> bool {
-        let t0 = Instant::now();
-        while !self.err_done.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(1) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        self.back.load(Ordering::SeqCst)
-    }
-
-    /// Ask the helper to hand every fan back to the BIOS and exit; kill it if it does not within 3 s.
-    /// Only when PC Tuner closes (on_exit / Drop): a hung helper is detached instead, never killed early.
-    fn stop(&mut self) {
-        if self.stopped {
-            return;
-        }
-        self.stopped = true;
-        if let Ok(mut w) = self.stdin.lock() {
-            if let Some(w) = w.as_mut() {
-                let _ = writeln!(w, "quit");
-                let _ = w.flush();
-            }
-        }
-        let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(3) {
-            if !matches!(self.child.try_wait(), Ok(None)) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.child.kill();
-        if let Ok(mut sh) = self.shared.lock() {
-            sh.log.push("helper did not exit in time and was stopped".into());
-        }
-    }
-}
-
-impl Drop for Helper {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -927,7 +615,7 @@ fn demo_status(t: f64) -> Status {
 }
 
 /// Make the demo fans do what the demo settings say (duty = slider value or the curve's live point),
-/// the way the helper would report them.
+/// the way the fan thread would report them.
 fn demo_apply(s: &mut Status, settings: &HashMap<String, FanSetting>) {
     let (cpu, gpu) = (s.cpu, s.gpu);
     for f in s.fans.iter_mut().filter(|f| f.controllable) {
@@ -966,33 +654,18 @@ enum CardAction {
 
 pub struct FanTab {
     shared: Arc<Mutex<Shared>>,
-    helper: Option<Helper>,
     error: Option<String>,
-    restarts: u32,
-    /// The running helper was sent a fan setting (set / curve), so it may own fans.
-    drove: bool,
-    /// A hung helper that was let go (input closed, not killed): it hands its fans back once it runs again.
-    /// No new helper starts until it has exited, so two never drive the same chip.
-    detached: Option<Helper>,
-    /// A helper that may have owned fans went away without saying it handed them back: the fans may be
-    /// stuck at their last duty until a reboot (a new helper cannot restore motherboard headers).
-    /// Remembered across PC Tuner restarts until the PC reboots.
-    stuck: bool,
-    /// `stuck` is saved to STUCK_FILE (the real app; never in tests or the demo).
-    persist: bool,
-    /// A --reset-only helper was already tried for stuck fans.
-    reclaim_tried: bool,
     started: bool,
     demo: bool,
     /// What the user asked for, per fan id.
     settings: HashMap<String, FanSetting>,
-    /// Last command sent per key, so each change is sent once (cleared when the helper restarts).
+    /// Last command sent per key, so each change is sent once.
     sent: HashMap<String, String>,
-    /// When each command was sent (a setting the helper still does not have a while later is sent again).
+    /// When each command was sent (a setting the fan thread still does not have a while later is sent again).
     sent_at: HashMap<String, Instant>,
-    /// Fans PC Tuner should drive but the helper reports as back on the BIOS (refused or dropped setting).
+    /// Fans PC Tuner should drive but the fan thread reports as back on the BIOS (refused or dropped setting).
     handed_back: HashSet<String>,
-    /// The helper notice the user dismissed (its msgSeq).
+    /// The notice the user dismissed (its msgSeq).
     msg_dismissed: u64,
     afterburner: Arc<AtomicBool>,
     store: ProfileStore,
@@ -1004,23 +677,14 @@ pub struct FanTab {
     pin_dirty: Option<Instant>,
     /// The fan whose curve is open in the large editor.
     editor: Option<String>,
-    /// The Rust fan backend (the default; PCTUNER_FAN=helper starts the old C# helper instead).
+    /// The fan thread (reads and drives the hardware), once started.
     rust: Option<RustReader>,
 }
 
-/// The Rust fan backend is the default. PCTUNER_FAN=helper selects the old C# helper (kept as a fallback for now).
-fn rust_mode() -> bool {
-    rust_mode_for(std::env::var("PCTUNER_FAN").ok().as_deref())
-}
-
-fn rust_mode_for(v: Option<&str>) -> bool {
-    !v.is_some_and(|v| v.trim().eq_ignore_ascii_case("helper"))
-}
-
-/// The Rust fan backend (the default): a thread owning the hardware (crate::hw::backend::Hardware) and the
-/// safety loop (crate::hw::controller::Controller). It takes the same command lines the helper took, reads
-/// the sensors and runs the loop once a second, and fills the same Shared status. On drop it hands every fan
-/// back and waits for that before returning, so PC Tuner never exits with a fan still driven.
+/// The fan thread: owns the hardware (crate::hw::backend::Hardware) and the safety loop
+/// (crate::hw::controller::Controller). It takes set / curve / auto / autoall / pump command lines, reads the
+/// sensors and runs the loop once a second, and fills Shared. On drop it hands every fan back and waits for
+/// that before returning, so PC Tuner never exits with a fan still driven.
 struct RustReader {
     stop: Arc<AtomicBool>,
     /// Parts that could not be opened, and what happened at start (e.g. fans restored after a crash).
@@ -1029,7 +693,7 @@ struct RustReader {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// The sensor reading with the controller's view added (what the helper's status line carried).
+/// The sensor reading with the controller's view added (what the fan thread's status line carried).
 fn with_control(mut st: Status, c: &crate::hw::controller::Controller, hw: &crate::hw::backend::Hardware) -> Status {
     for f in st.fans.iter_mut() {
         f.requested = c.requested(&f.id);
@@ -1113,21 +777,14 @@ impl FanTab {
         Self::new_with(store, demo, true)
     }
 
-    /// `startup`: bring back the last profile / own settings (and start the helper as administrator), or
+    /// `startup`: bring back the last profile / own settings (and start the fan thread as administrator), or
     /// set up the demo screen.
     /// Tests pass `demo = true, startup = false`, so they never read the user's file or touch a fan.
     fn new_with(mut store: ProfileStore, demo: bool, startup: bool) -> Self {
         normalize_store(&mut store);
         let mut tab = FanTab {
             shared: Arc::new(Mutex::new(Shared::default())),
-            helper: None,
             error: None,
-            restarts: 0,
-            drove: false,
-            detached: None,
-            stuck: false,
-            persist: startup && !demo,
-            reclaim_tried: false,
             started: false,
             demo,
             settings: HashMap::new(),
@@ -1146,13 +803,8 @@ impl FanTab {
         };
         // apply the last profile at startup (only as administrator: otherwise nothing can be controlled)
         if startup && !demo {
-            // fans an earlier PC Tuner's helper left stuck (same boot): the next helper reclaims them
-            let saved = std::fs::read_to_string(common::data_dir().join(STUCK_FILE)).unwrap_or_default();
-            if stuck_since_this_boot(&saved, boot_time()) {
-                tab.stuck = true;
-            } else if !saved.is_empty() {
-                let _ = std::fs::remove_file(common::data_dir().join(STUCK_FILE));
-            }
+            // the old C# helper's "stuck fans" marker means nothing to the Rust backend (it keeps its own state)
+            let _ = std::fs::remove_file(common::data_dir().join("fan-stuck.txt"));
             let admin = common::is_admin();
             if let Some(name) = tab.store.last.clone() {
                 if let Some(p) = tab.store.profiles.get(&name).cloned() {
@@ -1181,9 +833,6 @@ impl FanTab {
                     tab.start();
                 }
             }
-            if tab.stuck && tab.error.is_none() {
-                tab.error = Some(STUCK_AT_START.into());
-            }
         }
         if demo && startup {
             // the Balanced profile, with the CPU fan changed by hand (shows "changed - not saved")
@@ -1205,60 +854,20 @@ impl FanTab {
         tab
     }
 
+    /// Start the fan thread (once) and the MSI Afterburner check.
     fn start(&mut self) {
-        // fans an earlier helper may have left in software mode: the new one reclaims them (GPU fans go back
-        // to the driver; motherboard headers are driven again, never "handed back" to a stale duty)
-        let launch = if self.stuck { Launch::Reclaim } else { Launch::Normal };
-        self.start_with(launch);
-    }
-
-    /// Mark fans as (not) stuck, remembered with the boot time so a restarted PC Tuner still knows.
-    fn set_stuck(&mut self, stuck: bool) {
-        if self.stuck == stuck {
+        if self.started {
             return;
         }
-        self.stuck = stuck;
-        if !self.persist {
-            return;
-        }
-        let p = common::data_dir().join(STUCK_FILE);
-        if stuck {
-            let _ = std::fs::write(p, boot_time().to_string());
-        } else {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-
-    fn start_with(&mut self, launch: Launch) {
-        let first = !self.started;
         self.started = true;
         if self.demo {
             return;
         }
-        if self.detached.is_some() {
-            // the hung helper may still hand its fans back: never two helpers on the same chip
-            return;
-        }
-        if let Ok(mut sh) = self.shared.lock() {
-            sh.exited = false;
-            // the old helper's last status is not this one's
-            sh.status = None;
-            sh.last = None;
-        }
-        if rust_mode() {
-            // the Rust fan backend in place of the C# helper (opt-in until it is the default)
-            self.rust = Some(RustReader::start(self.shared.clone()));
-            self.error = None;
-            self.sent.clear();
-            self.sent_at.clear();
-            self.handed_back.clear();
-        } else {
-            self.start_helper(launch);
-        }
-        if !first {
-            // the Afterburner check below is already running
-            return;
-        }
+        self.rust = Some(RustReader::start(self.shared.clone()));
+        self.error = None;
+        self.sent.clear();
+        self.sent_at.clear();
+        self.handed_back.clear();
         // is MSI Afterburner running? (it may also be driving the GPU fans)
         let flag = Arc::downgrade(&self.afterburner);
         std::thread::spawn(move || loop {
@@ -1269,44 +878,23 @@ impl FanTab {
         });
     }
 
-    fn start_helper(&mut self, launch: Launch) {
-        match Helper::start(self.shared.clone(), launch) {
-            Ok(h) => {
-                self.helper = Some(h);
-                self.drove = false;
-                self.error = None;
-                // a fresh helper knows nothing: send every setting again
-                self.sent.clear();
-                self.sent_at.clear();
-                self.handed_back.clear();
-                self.msg_dismissed = 0;
-            }
-            Err(e) => self.error = Some(e),
-        }
-    }
-
     /// Send every setting / pump choice that changed since it was last sent.
     /// Only as administrator: a view-only PC Tuner never changes a fan.
     fn sync(&mut self) {
         if !common::is_admin() {
             return;
         }
-        // the Rust backend, or the C# helper
         if self.rust.is_none() {
-            let Some(h) = &self.helper else { return };
-            if h.reset_only {
-                // it takes no commands: settings go to the next helper
-                return;
-            }
+            return;
         }
-        // fans the helper dropped or refused: shown as handed back, and sent again now and then
+        // fans the fan thread dropped or refused: shown as handed back, and sent again now and then
         let (status_at, dropped) = match self.shared.lock() {
             Ok(sh) => (sh.last, sh.status.as_ref().map(|s| handed_back(&self.settings, s)).unwrap_or_default()),
             Err(_) => (None, vec![]),
         };
         self.handed_back.clear();
         for id in dropped {
-            // only once a status has come in well after the last command (the helper had time to take it)
+            // only once a status has come in well after the last command (the fan thread had time to take it)
             let Some(sent) = self.sent_at.get(&id).copied() else { continue };
             if status_at.map(|t| t > sent + Duration::from_millis(1500)).unwrap_or(false) {
                 self.handed_back.insert(id.clone());
@@ -1326,15 +914,7 @@ impl FanTab {
             if self.sent.get(&key) == Some(&cmd) {
                 continue;
             }
-            let sent = match (&self.rust, &self.helper) {
-                (Some(r), _) => r.send(&cmd),
-                (None, Some(h)) => h.send(&cmd),
-                _ => false,
-            };
-            if sent {
-                if cmd.starts_with("set ") || cmd.starts_with("curve ") {
-                    self.drove = true;
-                }
+            if self.rust.as_ref().is_some_and(|r| r.send(&cmd)) {
                 self.sent_at.insert(key.clone(), Instant::now());
                 self.sent.insert(key, cmd);
             }
@@ -1355,16 +935,9 @@ impl FanTab {
         self.active = None;
         self.store.last = None;
         self.save_store();
-        self.note = Some(if self.stuck || self.detached.is_some() {
-            // a reclaim helper cannot hand motherboard headers back (they go to 100 %); a hung one gets nothing
-            "Own settings were cleared and no profile is applied at startup until you pick one. Graphics-card fans go back to the driver; motherboard fans an earlier helper left behind cannot go back to the BIOS until you reboot.".into()
-        } else {
-            "Every fan is back on BIOS control. Own settings were cleared and no profile is applied at startup until you pick one.".into()
-        });
+        self.note = Some("Every fan is back on BIOS control. Own settings were cleared and no profile is applied at startup until you pick one.".into());
         if let Some(r) = &self.rust {
             r.send("autoall");
-        } else if let Some(h) = &self.helper {
-            h.send("autoall");
         }
     }
 
@@ -1536,87 +1109,6 @@ impl FanTab {
         ui.add_space(6.0);
     }
 
-    /// Restart the helper once if it stopped unexpectedly.
-    /// A helper that is running but has sent nothing for 30 s is hung (its loop may be stuck in a sensor
-    /// read): it is never killed early, which would leave the fans at their last duty with no safety rules.
-    /// Its input is closed instead (it hands its fans back as soon as its loop runs again) and it is watched
-    /// without blocking; the next helper starts only once it has exited (killed after DETACHED_KILL_AFTER).
-    /// A helper that may have owned fans and left without saying it handed them back makes the fans "stuck"
-    /// until a reboot: the next helper reclaims them (or, when no restart is left, a reset-only helper hands
-    /// the graphics-card fans back). The banner only says "BIOS control" when that is known.
-    fn watch(&mut self) {
-        if let Some(d) = &mut self.detached {
-            d.kill_if_stuck_too_long();
-            let Some(back) = d.outcome() else { return };
-            let d = self.detached.take().expect("checked above");
-            self.helper_gone(d, back);
-            return;
-        }
-        if self.helper.as_ref().is_some_and(|h| h.pass_cleared_all()) {
-            // every control was a graphics-card fan and the driver took it back
-            self.set_stuck(false);
-        }
-        let Some(h) = &mut self.helper else { return };
-        if h.alive() {
-            if !h.hung() {
-                return;
-            }
-            if let Ok(mut sh) = self.shared.lock() {
-                sh.log.push("the fan helper stopped answering - its input was closed so it hands the fans back once it runs again".into());
-            }
-            h.detach();
-            self.detached = self.helper.take();
-            self.error = Some(WAITING_FOR_OLD_HELPER.into());
-            return;
-        }
-        let Some(back) = h.outcome() else { return };
-        let h = self.helper.take().expect("checked above");
-        self.helper_gone(h, back);
-    }
-
-    /// A helper has exited (`back`: it said it handed its fans back): note stuck fans, then restart.
-    fn helper_gone(&mut self, h: Helper, back: bool) {
-        if h.pass_cleared_all() {
-            self.set_stuck(false);
-        }
-        let reset_only = h.reset_only;
-        drop(h);
-        if self.drove && !back {
-            self.set_stuck(true);
-        }
-        self.drove = false;
-        let tail = self.shared.lock().map(|s| s.log.last().cloned().unwrap_or_default()).unwrap_or_default();
-        if !reset_only && self.restarts < 1 {
-            self.restarts += 1;
-            self.start();
-            self.error = Some(if self.helper.is_none() {
-                gone_message(self.stuck, self.error.as_deref().unwrap_or(""))
-            } else if self.stuck {
-                RESTARTED_STUCK.into()
-            } else {
-                format!("The fan helper stopped and was restarted. {tail}").trim().to_string()
-            });
-        } else if self.stuck && !self.reclaim_tried {
-            // no restart left: one helper that hands the graphics-card fans back to the driver, then exits
-            self.reclaim_tried = true;
-            self.start_with(Launch::ResetOnly);
-            self.error = Some(if self.helper.is_none() {
-                gone_message(true, self.error.as_deref().unwrap_or(""))
-            } else {
-                "The fan helper stopped responding - handing the graphics-card fans back to the driver. Motherboard fans may stay at their last speed until you reboot.".into()
-            });
-            if let Ok(mut sh) = self.shared.lock() {
-                sh.clear();
-            }
-        } else {
-            self.error = Some(gone_message(self.stuck, &tail));
-            // nothing live any more: never show its last numbers (or a 90 °C banner) as if they were current
-            if let Ok(mut sh) = self.shared.lock() {
-                sh.clear();
-            }
-        }
-    }
-
     /// Average CPU / GPU temperature since PC Tuner started (the demo: its sample minute, shown as 42 min).
     fn averages(&self) -> Avg {
         if self.demo {
@@ -1630,7 +1122,7 @@ impl FanTab {
         self.shared.lock().map(|sh| sh.avg.avg()).unwrap_or_default()
     }
 
-    /// The data to draw, and whether it is stale (the helper exited, is not running, or sent nothing for 5 s).
+    /// The data to draw, and whether it is stale (no fan thread, or no reading for 5 s).
     fn snapshot(&self) -> (Option<Status>, HashMap<String, VecDeque<f32>>, VecDeque<f32>, VecDeque<f32>, Option<Duration>) {
         if self.demo {
             // a fixed moment, so the screenshot's numbers agree with each other
@@ -1646,7 +1138,7 @@ impl FanTab {
         match self.shared.lock() {
             Ok(sh) => {
                 let age = sh.last.map(|t| t.elapsed());
-                let stale = sh.exited || (self.helper.is_none() && self.rust.is_none()) || age.is_some_and(|a| a > STALE_AFTER);
+                let stale = sh.exited || self.rust.is_none() || age.is_some_and(|a| a > STALE_AFTER);
                 let stale_for = (sh.status.is_some() && stale).then(|| age.unwrap_or_default());
                 (sh.status.clone(), sh.rpm.clone(), sh.cpu.clone(), sh.gpu.clone(), stale_for)
             }
@@ -1663,7 +1155,6 @@ impl Tab for FanTab {
     fn tick(&mut self) {
         // keeps a startup profile running while another tab is open
         if self.started {
-            self.watch();
             self.sync();
         }
         if self.pin_dirty.map(|t| t.elapsed() > Duration::from_millis(600)).unwrap_or(false) {
@@ -1676,29 +1167,12 @@ impl Tab for FanTab {
         if self.pin_dirty.take().is_some() {
             self.save_store();
         }
-        // the Rust backend hands every fan back before this returns
+        // the fan thread hands every fan back before this returns
         drop(self.rust.take());
-        if let Some(mut h) = self.helper.take() {
-            h.stop();
-            if self.drove && !h.handed_back() {
-                // killed after 3 s, or it did not say so: remembered for the next start (same boot)
-                self.set_stuck(true);
-            }
-        }
-        if let Some(mut d) = self.detached.take() {
-            // never killed here: with PC Tuner gone it hands its fans back once it runs again; until it is
-            // known, the next PC Tuner start treats the fans as stuck
-            if self.drove && (d.alive() || !d.handed_back()) {
-                self.set_stuck(true);
-            }
-        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
-        if !self.started {
-            self.start();
-        }
-        self.watch();
+        self.start();
         ui.ctx().request_repaint_after(Duration::from_millis(500));
         let can = common::is_admin() || self.demo;
 
@@ -1741,15 +1215,13 @@ impl Tab for FanTab {
         let afterburner = self.afterburner.load(Ordering::Relaxed);
         let mut actions: Vec<(String, f32, CardAction)> = vec![];
         let mut dismiss = None;
-        // a detached (hung) helper may still own fans: never "BIOS control" while it runs
-        let helper_gone = !self.demo && self.helper.is_none() && self.detached.is_none() && self.rust.is_none();
-        let stuck = !self.demo && self.stuck;
+        let running = self.demo || self.rust.is_some();
         egui::ScrollArea::vertical().id_salt("fan-page").auto_shrink([false, false]).show(ui, |ui| {
             if let Some(age) = stale_for {
                 // old numbers are not shown as live (and a stale 90 °C banner never stays up)
                 theme::card(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    let (head, sub) = stale_text(helper_gone, stuck, age.as_secs());
+                    let (head, sub) = stale_text(running, age.as_secs());
                     ui.label(RichText::new(head).size(18.0).strong());
                     ui.label(RichText::new(sub).color(theme::TEXT_DIM));
                 });
@@ -1758,8 +1230,8 @@ impl Tab for FanTab {
             let Some(s) = status else {
                 theme::card(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    if helper_gone {
-                        let (head, sub) = stale_text(true, stuck, 0);
+                    if !running {
+                        let (head, sub) = stale_text(false, 0);
                         ui.label(RichText::new(head).size(18.0).strong());
                         ui.label(RichText::new(sub).color(theme::TEXT_DIM));
                     } else {
@@ -1773,7 +1245,7 @@ impl Tab for FanTab {
             if s.blind {
                 theme::banner(ui, theme::GAMING, "Temperatures cannot be read - every fan is on BIOS control until they can be read again. Your settings come back by themselves.");
             }
-            // the helper's latest notice stays until dismissed
+            // the fan thread's latest notice stays until dismissed
             if !s.msg.is_empty() && s.msg_seq != self.msg_dismissed {
                 ui.horizontal(|ui| {
                     if ui.small_button("Dismiss").clicked() {
@@ -1864,7 +1336,7 @@ struct View<'a> {
     can: bool,
     afterburner: bool,
     profile: Option<&'a str>,
-    /// fans the helper reports back on the BIOS although PC Tuner asked to drive them
+    /// fans the fan thread reports back on the BIOS although PC Tuner asked to drive them
     handed_back: &'a HashSet<String>,
     /// "Edit points" starts unfolded (demo screenshots only)
     points_open: bool,
@@ -2043,7 +1515,7 @@ fn fan_card(ui: &mut egui::Ui, f: &FanInfo, hist: Option<&VecDeque<f32>>, settin
         if !view.can && *setting != FanSetting::Bios {
             ui.label(RichText::new("Saved setting below - not applied (view-only).").size(11.5).color(theme::GAMING));
         } else if view.can && *setting != FanSetting::Bios && view.handed_back.contains(&f.id) {
-            ui.label(RichText::new("The helper did not take this setting, so the BIOS drives this fan. PC Tuner tries again every few seconds.").size(11.5).color(theme::GAMING));
+            ui.label(RichText::new("PC Tuner could not apply this setting, so the BIOS drives this fan. PC Tuner tries again every few seconds.").size(11.5).color(theme::GAMING));
         }
         // own setting vs following the profile
         // plain labels wrap inside the card (a horizontal row would widen it past its column)
@@ -2484,7 +1956,7 @@ mod tests {
         let fans = demo_status(0.0).fans;
         let pump = "/lpc/nct6687d/0/control/1";
         let cpu = "/lpc/nct6687d/0/control/0";
-        // demo + no startup: never reads or writes fan-profiles.json and never starts the helper
+        // demo + no startup: never reads or writes fan-profiles.json and never starts the fan thread
         let mut t = FanTab::new_with(ProfileStore::default(), true, false);
         t.load_profile("Performance", &fans);
         assert!(matches!(t.settings[pump], FanSetting::Curve { .. }));
@@ -2553,7 +2025,7 @@ mod tests {
         assert_eq!(back.pumps, t.store.pumps);
     }
 
-    /// Typing, adding and removing curve points keeps the curve valid for the helper.
+    /// Typing, adding and removing curve points keeps the curve valid for the fan thread.
     #[test]
     fn fan_point_editing() {
         let base = || vec![[30.0_f32, 30.0], [50.0, 40.0], [65.0, 60.0], [75.0, 80.0], [85.0, 100.0]];
@@ -2601,7 +2073,7 @@ mod tests {
         assert!(remove_point(&mut p, 1));
         assert!(!remove_point(&mut p, 0) && p.len() == MIN_POINTS);
         assert!(!remove_point(&mut p, 7));
-        // whatever was edited, the helper accepts the command (at most 16 "t:d" pairs)
+        // whatever was edited, the fan thread accepts the command (at most 16 "t:d" pairs)
         let mut p = base();
         while add_point(&mut p, 20.0) {}
         let cmd = command_for("x", &FanSetting::Curve { source: Source::Cpu, points: p });
@@ -2612,7 +2084,7 @@ mod tests {
         assert_eq!(normalize_points(&many).unwrap().len(), MAX_POINTS);
     }
 
-    /// The session average adds every reading and survives a helper being replaced.
+    /// The session average adds every reading and survives the live data being cleared.
     #[test]
     fn fan_session_average() {
         let mut sh = Shared::default();
@@ -2631,15 +2103,15 @@ mod tests {
         assert_eq!(span_text(Duration::from_secs(3900)), "1 h 05 min");
     }
 
-    /// Curves from fan-profiles.json are normalised the same way the helper reads them.
+    /// Curves from fan-profiles.json are normalised the same way the fan thread reads them.
     #[test]
     fn fan_curve_normalisation() {
-        // duplicate temperatures: stable order (the helper's ParsePoints keeps it too), pushed 2 °C apart
+        // duplicate temperatures: stable order (the controller's parse_points keeps it too), pushed 2 °C apart
         let n = normalize_points(&[[28.0, 82.0], [28.0, 54.0]]).unwrap();
         assert_eq!(n, vec![[28.0, 82.0], [30.0, 54.0]]);
         assert_eq!(curve_duty(&n, 20.0), 82.0);
         assert_eq!(curve_duty(&n, 40.0), 54.0);
-        // unsorted: same points and duties as the helper's selftest
+        // unsorted: same points and duties as the controller's tests
         let n = normalize_points(&[[70.0, 70.0], [30.0, 25.0], [50.0, 40.0], [85.0, 100.0]]).unwrap();
         assert_eq!(n, vec![[30.0, 25.0], [50.0, 40.0], [70.0, 70.0], [85.0, 100.0]]);
         assert_eq!(curve_duty(&n, 20.0), 25.0);
@@ -2662,9 +2134,9 @@ mod tests {
         assert_eq!(points, &vec![[30.0, 30.0], [40.0, 60.0]]);
     }
 
-    /// The chip shows what the helper really does: view-only, blind and refused settings are not "Curve".
+    /// The chip shows what the fan thread really does: view-only, blind and refused settings are not "Curve".
     #[test]
-    fn fan_chips_follow_the_helper() {
+    fn fan_chips_follow_the_fan_thread() {
         let gpu = FanInfo { id: "g".into(), controllable: true, gpu: true, mode: "default".into(), ..Default::default() };
         let curve = FanSetting::Curve { source: Source::Gpu, points: vec![[30.0, 30.0], [85.0, 100.0]] };
         assert_eq!(fan_chip(&gpu, &curve, false, false, false, false).0, "BIOS", "view-only: the saved curve is not applied");
@@ -2678,13 +2150,13 @@ mod tests {
         assert_eq!(fan_chip(&gpu, &curve, true, true, true, false).0, "BIOS - temps unreadable");
         assert_eq!(fan_chip(&gpu, &curve, true, true, false, false).0, "100 % - hot");
         assert_eq!(fan_chip(&gpu, &FanSetting::Bios, true, true, false, false).0, "BIOS");
-        // a setting the helper dropped (requested null, no curve, default mode) is found
+        // a setting the fan thread dropped (requested null, no curve, default mode) is found
         let settings: HashMap<String, FanSetting> = [("g".to_string(), curve.clone())].into_iter().collect();
         let status = |f: &FanInfo| Status { fans: vec![f.clone()], ..Default::default() };
         assert_eq!(handed_back(&settings, &status(&gpu)), vec!["g".to_string()]);
         assert!(handed_back(&settings, &status(&driven)).is_empty());
         let mut paused = gpu.clone();
-        paused.requested = Some(40.0); // blind: the helper keeps the request while the BIOS has the fan
+        paused.requested = Some(40.0); // blind: the fan thread keeps the request while the BIOS has the fan
         assert!(handed_back(&settings, &status(&paused)).is_empty());
         assert!(handed_back(&HashMap::new(), &status(&gpu)).is_empty(), "a fan on BIOS is not handed back");
         // the new status fields
@@ -2693,15 +2165,7 @@ mod tests {
         assert_eq!((s.msg.as_str(), s.msg_seq), ("x", 3));
     }
 
-    /// The Rust backend is the default; only PCTUNER_FAN=helper picks the old C# helper.
-    #[test]
-    fn fan_backend_choice() {
-        assert!(rust_mode_for(None));
-        assert!(rust_mode_for(Some("rust")) && rust_mode_for(Some("")) && rust_mode_for(Some("anything")));
-        assert!(!rust_mode_for(Some("helper")) && !rust_mode_for(Some(" Helper ")));
-    }
-
-    /// When the helper is gone its last numbers are stale, and they are cleared when it stops for good.
+    /// When the fan thread is gone its last numbers are stale, and they are cleared when it stops for good.
     #[test]
     fn fan_stale_data() {
         let mut sh = Shared::default();
@@ -2710,54 +2174,25 @@ mod tests {
         assert!(sh.last.is_some() && sh.status.is_some());
         sh.clear();
         assert!(sh.status.is_none() && sh.cpu.is_empty() && sh.gpu.is_empty() && sh.rpm.is_empty() && sh.last.is_none());
-        // no helper running (never started here): an old status is reported as stale
+        // no fan thread running (never started here): an old status is reported as stale
         let t = FanTab::new_with(ProfileStore::default(), false, false);
         t.shared.lock().unwrap().take_status(demo_status(0.0));
         let (s, _, _, _, stale) = t.snapshot();
         assert!(s.is_some() && stale.is_some());
     }
 
-    /// A hung helper is only declared hung well after the helper's own watchdog, and the screen only says
-    /// "BIOS control" when that is known.
+    /// The card shown instead of live data, and the boot time the saved BIOS state is tied to.
     #[test]
-    fn fan_hang_and_bios_claims() {
-        assert!(HANG_AFTER >= HELPER_WATCHDOG * 2, "hang threshold safely above the helper's 10 s watchdog");
-        assert!(HANG_AFTER > STALE_AFTER);
-        assert!(DETACHED_KILL_AFTER >= Duration::from_secs(120), "a hung helper gets minutes to recover before a kill");
-        assert_eq!(log_marks("fans returned to BIOS: PC Tuner closed"), (true, None));
-        // "reset pass done" alone is no proof: only GPU fans count, motherboard headers stay unconfirmed
-        assert_eq!(log_marks("reset pass done: 1 gpu, 3 unconfirmed"), (false, Some(3)));
-        assert_eq!(log_marks("reset pass done: 2 gpu, 0 unconfirmed"), (false, Some(0)));
-        assert_eq!(log_marks("reset pass done: 3 fan(s) handed back to the BIOS"), (false, Some(1)), "an old format is unconfirmed");
-        assert_eq!(log_marks("fans left at 100 % (they cannot go back to the BIOS until a reboot): exit"), (false, None));
-        assert_eq!(log_marks("helper did not exit in time and was stopped"), (false, None));
-        assert!(gone_message(false, "").contains("BIOS control"));
-        let stuck = gone_message(true, "x");
-        assert!(stuck.contains("may be stuck") && stuck.contains("Reboot") && !stuck.contains("Restart PC Tuner"));
-        assert!(!stuck.contains("on BIOS control") && stuck.ends_with(" x"));
-        // a running (silent) helper still owns its fans: never "BIOS control", no promise of a hand-back
-        let (h, d) = stale_text(false, false, 7);
-        assert!(h.contains("7 s") && !h.contains("BIOS control") && !d.contains("are safe") && d.contains("may stay"));
-        let (h, d) = stale_text(true, true, 0);
-        assert!(h.contains("may be stuck") && d.contains("eboot") && !d.contains("Restart PC Tuner"));
-        let (h, _) = stale_text(true, false, 0);
+    fn fan_stale_text_and_boot_time() {
+        let (h, d) = stale_text(true, 7);
+        assert!(h.contains("7 s") && !h.contains("BIOS control") && d.contains("back to the BIOS"));
+        let (h, _) = stale_text(false, 0);
         assert!(h.contains("BIOS control"));
-        for m in [STUCK_AT_START, WAITING_FOR_OLD_HELPER, RESTARTED_STUCK] {
-            assert!(!m.contains("on BIOS control") && !m.contains("Restart PC Tuner"), "{m}");
-        }
-        // stuck fans are remembered until the PC reboots
-        assert!(stuck_since_this_boot("1000000", 1000000 + SAME_BOOT_SECS));
-        assert!(!stuck_since_this_boot("1000000", 1000000 + SAME_BOOT_SECS + 1));
-        assert!(!stuck_since_this_boot("", 1000000) && !stuck_since_this_boot("junk", 1000000));
         let b = boot_time();
         assert!(b > 1_500_000_000 && boot_time().abs_diff(b) <= 2, "boot time is stable");
-        // a fresh tab: nothing driven, nothing stuck, nothing saved (tests never write the user's files)
-        let mut t = FanTab::new_with(ProfileStore::default(), false, false);
-        assert!(!t.drove && !t.stuck && !t.reclaim_tried && t.detached.is_none() && !t.persist);
-        t.set_stuck(true);
-        assert!(t.stuck);
-        t.set_stuck(false);
-        assert!(!t.stuck);
+        // a fresh tab in a test: never starts the fan thread
+        let t = FanTab::new_with(ProfileStore::default(), false, false);
+        assert!(t.rust.is_none() && !t.started);
     }
 
     /// The demo screen (README screenshots): duty agrees with the slider and with the curve's live point.

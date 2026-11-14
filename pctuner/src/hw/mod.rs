@@ -1,7 +1,7 @@
-//! Fan Tuner hardware access in Rust (replacing the C# helper in stages).
-//! Stage 1: read-only sensors for this PC's hardware - Nuvoton NCT6687D-R board chip and AMD Zen CPU through the
-//! PawnIO driver, the NVIDIA GPU through NVAPI. `read()` produces the same `Status` (ids, names, order) the C#
-//! helper sends, so the rest of Fan Tuner and the saved profiles work unchanged.
+//! Fan Tuner hardware access in Rust: the Nuvoton NCT6687D-R board chip and AMD Zen CPU through the PawnIO
+//! driver, the NVIDIA GPU through NVAPI. `Sensors::read()` produces the `Status` Fan Tuner shows (ids and
+//! names as LibreHardwareMonitor gave them, so profiles saved with the old C# helper keep working); `backend`
+//! drives the fans and `controller` holds the safety rules.
 
 pub mod amdcpu;
 pub mod backend;
@@ -42,7 +42,7 @@ impl Sensors {
     pub fn read(&self) -> Status {
         let mut s = Status::default();
         let temp = |id: String, hw: &str, kind: &str, name: &str, v: f32| TempInfo { id, hw: hw.into(), kind: kind.into(), name: name.into(), value: Some(v) };
-        // the helper lists 0-150 °C only
+        // only 0-150 °C is shown (a sensor outside that is not real)
         let plausible = |v: f32| v > 0.0 && v < 150.0;
 
         if let Some(b) = &self.board {
@@ -72,7 +72,7 @@ impl Sensors {
         if let Some(c) = &self.cpu {
             if let Ok(ts) = c.read() {
                 let main: Vec<f32> = ts.iter().filter(|t| plausible(t.2)).map(|t| t.2).collect();
-                // the helper: the hottest of the Tctl / Tdie / Package sensors
+                // the hottest of the Tctl / Tdie sensors
                 s.cpu = main.iter().copied().reduce(f32::max);
                 for (i, name, v) in ts.into_iter().filter(|t| plausible(t.2)) {
                     s.temps.push(temp(format!("{}/temperature/{i}", amdcpu::ID_PREFIX), &c.name, "Cpu", &name, v));
@@ -104,80 +104,5 @@ impl Sensors {
             }
         }
         s
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Opt-in, needs an elevated prompt (`cargo test hw_same_as_helper -- --ignored --nocapture`): the Rust
-    /// reading next to the C# helper's `--dump` taken right after it - same fans, ids and names, values close.
-    /// Read-only on both sides.
-    #[test]
-    #[ignore]
-    fn hw_same_as_helper() {
-        let sensors = Sensors::open();
-        assert!(sensors.errors.is_empty(), "{:?}", sensors.errors);
-        let ours = sensors.read();
-        let exe = dirs_helper();
-        let rep = std::env::temp_dir().join("pctuner-hw-compare.txt");
-        let st = std::process::Command::new(&exe).args(["--dump", &rep.display().to_string()]).output().expect("run the C# helper");
-        assert!(st.status.success());
-        // read again right after: idle CCD temperatures move several degrees within a second
-        let after = sensors.read();
-        let span = |id: &str| -> (f32, f32) {
-            let v: Vec<f32> = [&ours, &after].iter().filter_map(|s| s.temps.iter().find(|t| t.id == id).and_then(|t| t.value)).collect();
-            (v.iter().copied().fold(f32::MAX, f32::min), v.iter().copied().fold(f32::MIN, f32::max))
-        };
-        let dump = std::fs::read_to_string(&rep).unwrap();
-        println!("RUST cpu {:?} gpu {:?}", ours.cpu, ours.gpu);
-        let mut bad = vec![];
-        // fans: "hw | name | rpm=.. | percent=.. | ... | id=.."
-        for line in dump.lines().filter(|l| l.contains(" | id=")) {
-            let f: Vec<&str> = line.split(" | ").collect();
-            let id = f.last().unwrap().trim_start_matches("id=");
-            let num = |k: &str| f.iter().find_map(|x| x.strip_prefix(k)).and_then(|v| v.parse::<f32>().ok());
-            match ours.fans.iter().find(|x| x.id == id) {
-                None => bad.push(format!("missing fan {id}")),
-                Some(o) => {
-                    let (r1, r2) = (num("rpm=").unwrap_or(0.0), o.rpm.unwrap_or(0.0));
-                    let (p1, p2) = (num("percent=").unwrap_or(0.0), o.percent.unwrap_or(0.0));
-                    println!("{id:34} {:16} rpm C# {r1:6} Rust {r2:6}   % C# {p1:4} Rust {p2:4}  name C# {:?}", o.name, f[1]);
-                    if o.name != f[1] || o.hw != f[0] {
-                        bad.push(format!("{id}: name/hw {:?}/{:?} vs {:?}/{:?}", o.name, o.hw, f[1], f[0]));
-                    }
-                    if (r1 - r2).abs() > (r1 * 0.05).max(60.0) || (p1 - p2).abs() > 3.0 {
-                        bad.push(format!("{id}: rpm {r1} vs {r2}, % {p1} vs {p2}"));
-                    }
-                }
-            }
-        }
-        // temperatures: "    Temperature  <name>  <value>   <id>"
-        for line in dump.lines().filter(|l| l.trim_start().starts_with("Temperature ")) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            let id = *parts.last().unwrap();
-            let v: f32 = parts[parts.len() - 2].parse().unwrap_or(f32::NAN);
-            match ours.temps.iter().find(|t| t.id == id) {
-                None => bad.push(format!("missing temperature {id}")),
-                Some(t) => {
-                    let (lo, hi) = span(id);
-                    println!("{id:34} {:22} C# {v:5}  Rust {lo:.1}..{hi:.1}", t.name);
-                    if v < lo - 1.0 || v > hi + 1.0 {
-                        bad.push(format!("{id}: C# {v} outside Rust {lo:.1}..{hi:.1}"));
-                    }
-                }
-            }
-        }
-        assert!(bad.is_empty(), "{bad:#?}");
-    }
-
-    fn dirs_helper() -> std::path::PathBuf {
-        let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(r"fanhelper\out\PCTunerFan.exe");
-        if built.exists() {
-            built
-        } else {
-            crate::common::data_dir().join(r"fan\PCTunerFan.exe")
-        }
     }
 }

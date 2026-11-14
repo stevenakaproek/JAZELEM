@@ -48,7 +48,6 @@ change is being applied waits until it has finished, so the change is recorded a
   driver and NVAPI): each fan's BIOS settings are saved before it is first driven and put back byte
   for byte; if PC Tuner is force-killed, the next start in the same boot puts them back. Supported:
   the Nuvoton NCT6687D-R board chip (MSI AM5 800-series boards), AMD Zen CPUs and NVIDIA GPUs.
-  `PCTUNER_FAN=helper` still runs the older C# helper instead.
 - **Sidebar** - **Reset GPU to stock** (always visible) and **Power / BIOS**: restarts straight into
   the UEFI/BIOS setup, or shuts down so the next start opens it, using Windows' own `shutdown /fw`.
   Needs administrator rights and a UEFI-booted PC, and asks for confirmation first. Every open
@@ -62,14 +61,11 @@ Download: get PCTuner.exe from the GitHub Releases page (the exe is not in the r
 
 ## Build
 
-Needs Rust (rustup, MSVC toolchain), Visual Studio 2022 Build Tools (C++) and, for the old C# fan
-helper that is still embedded as a fallback (`PCTUNER_FAN=helper`), the .NET 8 SDK
-(`winget install Microsoft.DotNet.SDK.8`). Without the helper build step, PCTuner.exe still builds and
-Fan Tuner uses its Rust backend. The fan helper is built first and embedded into PCTuner.exe:
+Needs Rust (rustup, MSVC toolchain) and Visual Studio 2022 Build Tools (C++). PC Tuner is pure Rust:
+no .NET, no helper programs.
 
 ```
 cd pctuner
-powershell -ExecutionPolicy Bypass -File fanhelper\build.ps1
 cargo build --release
 ```
 
@@ -80,14 +76,10 @@ unelevated in view-only mode. `cargo test` runs the unit tests (use the debug pr
 
 ## Third-party components
 
-The Fan Tuner's helper (`pctuner/fanhelper`) uses, unmodified from NuGet,
-[LibreHardwareMonitorLib](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) 0.9.6
-(MPL-2.0; source code at that link) and its dependencies (HidSharp - Apache-2.0, and others listed in
-its package). These DLLs are embedded in PCTuner.exe and unpacked to `%LOCALAPPDATA%\PCTuner\fan`.
-Hardware access goes through the separately installed [PawnIO](https://pawnio.eu) driver.
-
-The Rust fan backend Fan Tuner uses by default (`pctuner/src/hw`) is ported from LibreHardwareMonitor's
-NCT6687D-R, AMD Zen and NVAPI code; those files stay under MPL-2.0 (noted at the top of each). It loads two
+Fan Tuner's hardware code (`pctuner/src/hw`) is ported from
+[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) 0.9.6's NCT6687D-R,
+AMD Zen and NVAPI code; those files stay under MPL-2.0 (noted at the top of each). Hardware access goes
+through the separately installed [PawnIO](https://pawnio.eu) driver. PC Tuner loads two
 signed PawnIO modules, `LpcIO.bin` and `AMDFamily17.bin` (`pctuner/assets/pawnio`, LGPL-2.1, unmodified from
 the [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules/releases/tag/0.1.6) 0.1.6 release - the same
 bytes LibreHardwareMonitorLib 0.9.6 embeds).

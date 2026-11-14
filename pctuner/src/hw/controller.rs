@@ -1,4 +1,5 @@
-//! The fan safety loop, ported from the C# helper's Controller / Safety (fanhelper/Program.cs), now in-process.
+//! The fan safety loop, ported from the old C# helper's Controller / Safety (fanhelper/Program.cs, removed), now
+//! in-process.
 //! It has no hardware or clock of its own (tests drive it with a fake), and takes the same command lines
 //! Fan Tuner already sends: set / curve / auto / autoall / pump / ping.
 //!
