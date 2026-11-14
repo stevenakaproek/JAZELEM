@@ -4,6 +4,8 @@
 //! helper sends, so the rest of Fan Tuner and the saved profiles work unchanged.
 
 pub mod amdcpu;
+pub mod backend;
+pub mod controller;
 pub mod nct6687;
 pub mod nvgpu;
 pub mod pawnio;
@@ -12,9 +14,9 @@ use crate::fan::{FanInfo, Status, TempInfo};
 
 /// The open hardware; any part can be missing (reported in `errors`).
 pub struct Sensors {
-    board: Option<nct6687::Nct6687>,
-    cpu: Option<amdcpu::AmdCpu>,
-    gpu: Option<nvgpu::NvGpu>,
+    pub(super) board: Option<nct6687::Nct6687>,
+    pub(super) cpu: Option<amdcpu::AmdCpu>,
+    pub(super) gpu: Option<nvgpu::NvGpu>,
     pub errors: Vec<String>,
 }
 

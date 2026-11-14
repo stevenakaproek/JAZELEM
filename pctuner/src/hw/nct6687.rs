@@ -3,9 +3,10 @@
 // Ported from LibreHardwareMonitor (Hardware/Motherboard/Lpc/LpcIO.cs, LpcPort.cs, Nct677X.cs and the NCT6687DR
 // defaults in SuperIOHardware.cs), Copyright (C) LibreHardwareMonitor and Contributors.
 
-//! Nuvoton NCT6687D-R (MSI AM5 / LGA1851 800-series boards, e.g. MAG X870E TOMAHAWK WIFI) - READ ONLY.
-//! Stage 1 of the Rust fan backend: temperatures, fan RPMs and duty. Nothing is written to the chip's settings
-//! (the Super I/O configuration enter/exit and the EC page handshake are port selects, as for any read).
+//! Nuvoton NCT6687D-R (MSI AM5 / LGA1851 800-series boards, e.g. MAG X870E TOMAHAWK WIFI).
+//! Reading: temperatures, fan RPMs and duty. Writing (stage 3): a header's duty, after its BIOS registers are
+//! saved (`bios_state`), and putting exactly those registers back (`restore`). Unlike LibreHardwareMonitor,
+//! the restore puts back the BIOS's own manual-mode bit and every point of a System Fan's curve.
 
 use super::pawnio::{BusMutex, Module, ISA_BUS, LPC_IO};
 use std::time::{Duration, Instant};
@@ -52,6 +53,44 @@ pub const HEADERS: [(usize, &str, &str); 10] = [
     (15, "System Fan #6", "System Fan #6"),
     (3, "EZ-Connect Fan", "EZ-Connect Fan"),
 ];
+
+/// Control registers per header index (LHM's NCT6687DR table). CPU / Pump / Chipset / EZ-Connect (0-3) have a
+/// command register and a manual-mode bit in 0xA00; System Fans (9-15) are driven by writing every point of
+/// their BIOS curve, which starts at this register (7 points, every second byte).
+const FAN_PWM_COMMAND: [u16; 16] = [0xA28, 0xA29, 0xA2A, 0xA2B, 0xFFF, 0xFFF, 0xFFF, 0xFFF, 0xFFF, 0xBE0, 0xC70, 0xC58, 0xC40, 0xC28, 0xC10, 0xBF8];
+const FAN_CONTROL_MODE: u16 = 0xA00;
+const FAN_PWM_REQUEST: u16 = 0xA01;
+const CURVE_POINTS: u16 = 7;
+
+/// The registers a header is driven through: (register, value) pairs, plus the manual-mode bit for 0-7.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HeaderState {
+    pub index: usize,
+    /// Some(bit set) for headers 0-7 (bit `index` of 0xA00); None for System Fans.
+    pub manual_bit: Option<bool>,
+    /// The command register (0-7) or every curve point (9-15), as the BIOS had them.
+    pub registers: Vec<(u16, u8)>,
+}
+
+/// The registers written to drive header `index`.
+pub fn control_registers(index: usize) -> Vec<u16> {
+    let first = FAN_PWM_COMMAND[index];
+    if index > 8 {
+        (0..CURVE_POINTS).map(|k| first + 2 * k).collect()
+    } else {
+        vec![first]
+    }
+}
+
+/// A duty percentage as the chip's byte (LHM: value * 2.55, truncated).
+pub fn duty_byte(percent: f32) -> u8 {
+    (percent.clamp(0.0, 100.0) * 2.55) as u8
+}
+
+/// Headers that can be driven on this chip (the named ones).
+pub fn controllable(index: usize) -> bool {
+    HEADERS.iter().any(|h| h.0 == index) && FAN_PWM_COMMAND[index] != 0xFFF
+}
 
 /// One reading of the chip.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -143,6 +182,103 @@ impl Nct6687 {
         Ok(v)
     }
 
+    fn write(&self, address: u16, value: u8) -> Result<(), String> {
+        let page_port = self.base + EC_PAGE;
+        let timeout = Instant::now() + Duration::from_millis(500);
+        let mut access = self.lpc.pio_inb(page_port)?;
+        while access != EC_PAGE_SELECT && Instant::now() < timeout {
+            std::thread::sleep(Duration::from_millis(1));
+            access = self.lpc.pio_inb(page_port)?;
+        }
+        if access != EC_PAGE_SELECT {
+            self.lpc.pio_outb(page_port, EC_PAGE_SELECT)?;
+        }
+        self.lpc.pio_outb(page_port, (address >> 8) as u8)?;
+        self.lpc.pio_outb(self.base + EC_INDEX, (address & 0xFF) as u8)?;
+        self.lpc.pio_outb(self.base + EC_DATA, value)?;
+        self.lpc.pio_outb(page_port, EC_PAGE_SELECT)?;
+        Ok(())
+    }
+
+    /// One raw register (read-only), for checks.
+    pub fn peek(&self, address: u16) -> Result<u8, String> {
+        self.locked(|c| c.read(address))
+    }
+
+    /// What the BIOS has in header `index`'s control registers now (read before the header is first driven).
+    pub fn bios_state(&self, index: usize) -> Result<HeaderState, String> {
+        if !controllable(index) {
+            return Err(format!("header {index} cannot be controlled"));
+        }
+        self.locked(|c| {
+            let manual_bit = if index < 8 { Some(c.read(FAN_CONTROL_MODE)? & (1 << index) != 0) } else { None };
+            let mut registers = vec![];
+            for r in control_registers(index) {
+                registers.push((r, c.read(r)?));
+            }
+            Ok(HeaderState { index, manual_bit, registers })
+        })
+    }
+
+    /// The request / acknowledge sequence around a change (LHM: 0x80, wait, change, 0x40, wait).
+    fn change(&self, f: impl FnOnce(&Self) -> Result<(), String>) -> Result<(), String> {
+        self.write(FAN_PWM_REQUEST, 0x80)?;
+        std::thread::sleep(Duration::from_millis(50));
+        let r = f(self);
+        // always acknowledge, even when the change failed half way
+        let ack = self.write(FAN_PWM_REQUEST, 0x40);
+        std::thread::sleep(Duration::from_millis(50));
+        r.and(ack)
+    }
+
+    /// Drive header `index` at `percent`. The caller must have saved `bios_state` first.
+    pub fn set_duty(&self, index: usize, percent: f32) -> Result<(), String> {
+        if !controllable(index) {
+            return Err(format!("header {index} cannot be controlled"));
+        }
+        let value = duty_byte(percent);
+        self.locked(|c| {
+            // a System Fan already at this duty: its curve is not rewritten (as LHM)
+            if index > 8 && c.read(FAN_PWM_OUT[index])? == value {
+                return Ok(());
+            }
+            c.change(|c| {
+                if index < 8 {
+                    let mode = c.read(FAN_CONTROL_MODE)?;
+                    c.write(FAN_CONTROL_MODE, mode | (1 << index))?;
+                }
+                for r in control_registers(index) {
+                    c.write(r, value)?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// Put back exactly what `bios_state` saved: every register, and the manual-mode bit as the BIOS had it.
+    pub fn restore(&self, s: &HeaderState) -> Result<(), String> {
+        if !controllable(s.index) {
+            return Err(format!("header {} cannot be controlled", s.index));
+        }
+        let allowed = control_registers(s.index);
+        if s.registers.iter().any(|(r, _)| !allowed.contains(r)) {
+            return Err(format!("saved state for header {} names other registers - not restored", s.index));
+        }
+        self.locked(|c| {
+            c.change(|c| {
+                for (r, v) in &s.registers {
+                    c.write(*r, *v)?;
+                }
+                if let Some(bit) = s.manual_bit {
+                    let mode = c.read(FAN_CONTROL_MODE)?;
+                    let m = if bit { mode | (1 << s.index) } else { mode & !(1 << s.index) };
+                    c.write(FAN_CONTROL_MODE, m)?;
+                }
+                Ok(())
+            })
+        })
+    }
+
     /// Every named temperature and header.
     pub fn read_all(&self) -> Result<Reading, String> {
         self.locked(|c| {
@@ -177,5 +313,20 @@ mod tests {
         // every named header has registers; index 8 is the unused 0xFFF slot
         assert!(HEADERS.iter().all(|(i, _, _)| FAN_PWM_OUT[*i] != 0xFFF));
         assert_eq!(FAN_RPM[14], 0x156, "System Fan #5");
+    }
+
+    #[test]
+    fn nct6687_control_registers() {
+        assert_eq!(control_registers(0), vec![0xA28]);
+        assert_eq!(control_registers(1), vec![0xA29], "pump");
+        // System Fan #5: 7 curve points from 0xC10, every second byte
+        assert_eq!(control_registers(14), vec![0xC10, 0xC12, 0xC14, 0xC16, 0xC18, 0xC1A, 0xC1C]);
+        assert!(controllable(14) && controllable(3) && !controllable(8) && !controllable(4) && !controllable(9), "9 (System Fan 7) is not named on this board");
+        assert_eq!(duty_byte(40.0), 102);
+        assert_eq!(duty_byte(100.0), 255);
+        assert_eq!(duty_byte(-5.0), 0);
+        let s = HeaderState { index: 14, manual_bit: None, registers: control_registers(14).into_iter().map(|r| (r, 77)).collect() };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<HeaderState>(&json).unwrap(), s);
     }
 }

@@ -22,6 +22,30 @@ const ID_GET_FULL_NAME: u32 = 0xCEEE_8E9F;
 const ID_GET_THERMAL_SETTINGS: u32 = 0xE364_0A56;
 const ID_GET_THERMAL_SENSORS: u32 = 0x65FE_3AAD;
 const ID_FAN_COOLERS_GET_STATUS: u32 = 0x35AE_D5E8;
+const ID_FAN_COOLERS_GET_CONTROL: u32 = 0x814B_209F;
+const ID_FAN_COOLERS_SET_CONTROL: u32 = 0xA589_71A5;
+const MODE_AUTO: u32 = 0;
+const MODE_MANUAL: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NvFanCoolerControlItem {
+    cooler_id: u32,
+    level: u32,
+    control_mode: u32,
+    reserved: [u32; 8],
+}
+
+#[repr(C)]
+struct NvFanCoolerControl {
+    version: u32,
+    reserved: u32,
+    count: u32,
+    reserved2: [u32; 8],
+    items: [NvFanCoolerControlItem; MAX_FAN_COOLERS],
+}
+
+type FnCoolersControl = unsafe extern "C" fn(*mut c_void, *mut NvFanCoolerControl) -> i32;
 
 pub const ID_PREFIX: &str = "/gpu-nvidia/0";
 
@@ -98,6 +122,8 @@ pub struct NvGpu {
     thermal_settings: Option<FnThermalSettings>,
     thermal_sensors: Option<FnThermalSensors>,
     coolers: Option<FnCoolersStatus>,
+    get_control: Option<FnCoolersControl>,
+    set_control: Option<FnCoolersControl>,
     /// Highest working thermal-sensor mask (LHM probes it once), 0 = none.
     sensor_mask: u32,
     /// Sensors in the thermal settings (the memory junction sits at that index + 2).
@@ -156,6 +182,8 @@ impl NvGpu {
                 thermal_settings: get(ID_GET_THERMAL_SETTINGS).map(|p| std::mem::transmute(p)),
                 thermal_sensors: get(ID_GET_THERMAL_SENSORS).map(|p| std::mem::transmute(p)),
                 coolers: get(ID_FAN_COOLERS_GET_STATUS).map(|p| std::mem::transmute(p)),
+                get_control: get(ID_FAN_COOLERS_GET_CONTROL).map(|p| std::mem::transmute(p)),
+                set_control: get(ID_FAN_COOLERS_SET_CONTROL).map(|p| std::mem::transmute(p)),
                 sensor_mask: 0,
                 settings_count: 0,
             };
@@ -226,6 +254,60 @@ impl NvGpu {
         out
     }
 
+    /// Set one cooler: Some(level %) = manual at that level, None = back to the driver (Auto). The driver's
+    /// current control block is read and only this cooler is changed.
+    fn control(&self, cooler_id: u32, level: Option<u32>) -> Result<(), String> {
+        let (get, set) = match (self.get_control, self.set_control) {
+            (Some(g), Some(s)) => (g, s),
+            _ => return Err("this driver has no fan-cooler control".into()),
+        };
+        let mut c: NvFanCoolerControl = unsafe { std::mem::zeroed() };
+        c.version = version::<NvFanCoolerControl>(1);
+        let r = unsafe { get(self.handle, &mut c) };
+        if r != OK {
+            return Err(format!("NvAPI_GPU_ClientFanCoolersGetControl failed ({r})"));
+        }
+        let n = (c.count as usize).min(MAX_FAN_COOLERS);
+        let item = c.items[..n].iter_mut().find(|i| i.cooler_id == cooler_id).ok_or_else(|| format!("no GPU cooler {cooler_id}"))?;
+        match level {
+            Some(l) => {
+                item.control_mode = MODE_MANUAL;
+                item.level = l.min(100);
+            }
+            None => {
+                item.control_mode = MODE_AUTO;
+                item.level = 0;
+            }
+        }
+        let r = unsafe { set(self.handle, &mut c) };
+        if r != OK {
+            return Err(format!("NvAPI_GPU_ClientFanCoolersSetControl failed ({r})"));
+        }
+        Ok(())
+    }
+
+    /// Drive a GPU fan at `percent` (never under the driver's minimum - the controller floors it too).
+    pub fn set_level(&self, cooler_id: u32, percent: f32) -> Result<(), String> {
+        let min = self.coolers().iter().find(|c| c.id == cooler_id).map(|c| c.min).unwrap_or(30);
+        self.control(cooler_id, Some((percent.round().clamp(0.0, 100.0) as u32).max(min)))
+    }
+
+    /// Hand a GPU fan back to the graphics driver's own curve.
+    pub fn set_auto(&self, cooler_id: u32) -> Result<(), String> {
+        self.control(cooler_id, None)
+    }
+
+    /// Is the cooler under manual (software) control right now?
+    pub fn is_manual(&self, cooler_id: u32) -> Option<bool> {
+        let get = self.get_control?;
+        let mut c: NvFanCoolerControl = unsafe { std::mem::zeroed() };
+        c.version = version::<NvFanCoolerControl>(1);
+        if unsafe { get(self.handle, &mut c) } != OK {
+            return None;
+        }
+        c.items[..(c.count as usize).min(MAX_FAN_COOLERS)].iter().find(|i| i.cooler_id == cooler_id).map(|i| i.control_mode == MODE_MANUAL)
+    }
+
     pub fn coolers(&self) -> Vec<Cooler> {
         let Some(f) = self.coolers else { return vec![] };
         let mut s: NvFanCoolersStatus = unsafe { std::mem::zeroed() };
@@ -251,6 +333,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<NvFanCoolersStatusItem>(), 52);
         assert_eq!(std::mem::size_of::<NvFanCoolersStatus>(), 40 + 32 * 52);
         assert_eq!(std::mem::size_of::<NvThermalSettings>(), 8 + 3 * 20);
+        assert_eq!(std::mem::size_of::<NvFanCoolerControlItem>(), 44);
+        assert_eq!(std::mem::size_of::<NvFanCoolerControl>(), 44 + 32 * 44);
         assert_eq!(version::<NvThermalSensors>(2), 168 | 2 << 16);
         assert_eq!(full_name("GeForce RTX 5080"), "NVIDIA GeForce RTX 5080");
         assert_eq!(full_name("NVIDIA GeForce RTX 5080"), "NVIDIA GeForce RTX 5080");

@@ -548,7 +548,7 @@ fn log_marks(line: &str) -> (bool, Option<u32>) {
 }
 
 /// Seconds since 1970 when Windows started (to tell whether the PC rebooted since fans were left stuck).
-fn boot_time() -> u64 {
+pub(crate) fn boot_time() -> u64 {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetTickCount64() -> u64;
@@ -560,7 +560,7 @@ fn boot_time() -> u64 {
 
 /// Fans left stuck by a helper stay stuck until a reboot: remembered (with the boot time) across PC Tuner
 /// restarts. Two boot times within this much are the same boot (clock adjustments).
-const SAME_BOOT_SECS: u64 = 120;
+pub(crate) const SAME_BOOT_SECS: u64 = 120;
 const STUCK_FILE: &str = "fan-stuck.txt";
 
 const STUCK_AT_START: &str = "An earlier fan helper did not hand the fans back since Windows started - they may stay at their last speed. PC Tuner drives them with your settings and its safety rules; reboot to give them back to the BIOS.";
@@ -1015,42 +1015,92 @@ fn rust_mode() -> bool {
 
 /// Reads the sensors in Rust (crate::hw) once a second into the same Shared the helper's reader thread fills.
 /// Never controls a fan. Stops when dropped.
+/// The Rust fan backend (PCTUNER_FAN=rust): a thread owning the hardware (crate::hw::backend::Hardware) and the
+/// safety loop (crate::hw::controller::Controller). It takes the same command lines the helper took, reads
+/// the sensors and runs the loop once a second, and fills the same Shared status. On drop it hands every fan
+/// back and waits for that before returning, so PC Tuner never exits with a fan still driven.
 struct RustReader {
     stop: Arc<AtomicBool>,
-    /// Parts that could not be opened (e.g. the board chip without administrator rights).
+    /// Parts that could not be opened, and what happened at start (e.g. fans restored after a crash).
     errors: Arc<Mutex<Vec<String>>>,
+    tx: std::sync::mpsc::Sender<String>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The sensor reading with the controller's view added (what the helper's status line carried).
+fn with_control(mut st: Status, c: &crate::hw::controller::Controller, hw: &crate::hw::backend::Hardware) -> Status {
+    for f in st.fans.iter_mut() {
+        f.requested = c.requested(&f.id);
+        f.curve = c.has_curve(&f.id);
+        f.pump = c.is_pump(hw, &f.id) || f.pump && !c.is_not_pump(&f.id);
+        if c.is_touched(&f.id) {
+            f.mode = "software".into();
+        }
+    }
+    st.emergency = c.emergency;
+    st.blind = c.blind;
+    st.msg = c.message.clone();
+    st.msg_seq = c.message_seq;
+    st
 }
 
 impl RustReader {
     fn start(shared: Arc<Mutex<Shared>>) -> RustReader {
         let stop = Arc::new(AtomicBool::new(false));
         let errors = Arc::new(Mutex::new(vec![]));
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
         let (s, e) = (stop.clone(), errors.clone());
-        std::thread::spawn(move || {
-            let sensors = crate::hw::Sensors::open();
+        let thread = std::thread::spawn(move || {
+            let mut hw = crate::hw::backend::Hardware::open();
             if let Ok(mut e) = e.lock() {
-                *e = sensors.errors.clone();
+                *e = hw.sensors.errors.iter().chain(&hw.notes).cloned().collect();
             }
+            let mut c = crate::hw::controller::Controller::new(Instant::now());
+            // a panic below still unwinds through `hw`, whose Drop hands every fan back
             while !s.load(Ordering::Relaxed) {
-                let st = sensors.read();
+                while let Ok(line) = rx.try_recv() {
+                    c.handle(&mut hw, &line);
+                }
+                let st = hw.sensors.read();
+                // view-only PC Tuner: never drive anything
+                if common::is_admin() {
+                    c.tick(&mut hw, Instant::now(), st.cpu, st.gpu);
+                }
+                let st = with_control(st, &c, &hw);
                 if let Ok(mut sh) = shared.lock() {
                     sh.exited = false;
                     sh.take_status(st);
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                // a second between ticks, but react to stop at once
+                for _ in 0..10 {
+                    if s.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
+            c.reset_all(&mut hw);
+            drop(hw); // anything left is handed back here
         });
-        RustReader { stop, errors }
+        RustReader { stop, errors, tx, thread: Some(thread) }
     }
 
     fn errors(&self) -> Vec<String> {
         self.errors.lock().map(|e| e.clone()).unwrap_or_default()
     }
+
+    fn send(&self, cmd: &str) -> bool {
+        self.tx.send(cmd.to_string()).is_ok()
+    }
 }
 
 impl Drop for RustReader {
+    /// Stop, and wait until every fan has been handed back.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -1194,13 +1244,12 @@ impl FanTab {
             sh.last = None;
         }
         if rust_mode() {
-            // stage 2: sensors read in Rust, no C# helper and no fan control
+            // the Rust fan backend in place of the C# helper (opt-in until it is the default)
             self.rust = Some(RustReader::start(self.shared.clone()));
             self.error = None;
-            // nothing is applied in this mode: never claim a startup profile was
-            if self.note.as_deref().is_some_and(|n| n.contains("applied")) {
-                self.note = Some("Saved fan settings are kept but not applied: fan control is off in the Rust sensor preview.".into());
-            }
+            self.sent.clear();
+            self.sent_at.clear();
+            self.handed_back.clear();
         } else {
             self.start_helper(launch);
         }
@@ -1240,10 +1289,13 @@ impl FanTab {
         if !common::is_admin() {
             return;
         }
-        let Some(h) = &self.helper else { return };
-        if h.reset_only {
-            // it takes no commands: settings go to the next helper
-            return;
+        // the Rust backend, or the C# helper
+        if self.rust.is_none() {
+            let Some(h) = &self.helper else { return };
+            if h.reset_only {
+                // it takes no commands: settings go to the next helper
+                return;
+            }
         }
         // fans the helper dropped or refused: shown as handed back, and sent again now and then
         let (status_at, dropped) = match self.shared.lock() {
@@ -1269,7 +1321,15 @@ impl FanTab {
             cmds.push((id.clone(), command_for(id, s)));
         }
         for (key, cmd) in cmds {
-            if self.sent.get(&key) != Some(&cmd) && h.send(&cmd) {
+            if self.sent.get(&key) == Some(&cmd) {
+                continue;
+            }
+            let sent = match (&self.rust, &self.helper) {
+                (Some(r), _) => r.send(&cmd),
+                (None, Some(h)) => h.send(&cmd),
+                _ => false,
+            };
+            if sent {
                 if cmd.starts_with("set ") || cmd.starts_with("curve ") {
                     self.drove = true;
                 }
@@ -1299,7 +1359,9 @@ impl FanTab {
         } else {
             "Every fan is back on BIOS control. Own settings were cleared and no profile is applied at startup until you pick one.".into()
         });
-        if let Some(h) = &self.helper {
+        if let Some(r) = &self.rust {
+            r.send("autoall");
+        } else if let Some(h) = &self.helper {
             h.send("autoall");
         }
     }
@@ -1612,6 +1674,8 @@ impl Tab for FanTab {
         if self.pin_dirty.take().is_some() {
             self.save_store();
         }
+        // the Rust backend hands every fan back before this returns
+        drop(self.rust.take());
         if let Some(mut h) = self.helper.take() {
             h.stop();
             if self.drove && !h.handed_back() {
@@ -1634,8 +1698,7 @@ impl Tab for FanTab {
         }
         self.watch();
         ui.ctx().request_repaint_after(Duration::from_millis(500));
-        // the Rust reader (stage 2) only reads: no fan is controlled in that mode
-        let can = (common::is_admin() || self.demo) && self.rust.is_none();
+        let can = common::is_admin() || self.demo;
 
         let mut give_back = false;
         ui.horizontal(|ui| {
@@ -1662,7 +1725,7 @@ impl Tab for FanTab {
             theme::banner(ui, theme::LOCKED, e);
         }
         if let Some(r) = &self.rust {
-            let mut text = "Rust sensor reader (preview): readings come from PC Tuner itself, without the fan helper. Fan control is off in this mode - your saved settings are kept, not applied.".to_string();
+            let mut text = "Rust fan backend (preview): PC Tuner reads and drives the fans itself, without the fan helper. Each fan's BIOS settings are saved before it is first driven and put back exactly.".to_string();
             let errs = r.errors();
             if !errs.is_empty() {
                 text.push_str(&format!(" Not available: {}.", errs.join("; ")));
