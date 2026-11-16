@@ -12,13 +12,14 @@
 
 use crate::common::Tone;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Stage {
     Preview,
     Running,
     Done,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct OpItem {
     pub id: String,
     pub name: String,
@@ -51,7 +52,7 @@ impl OpItem {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum OpEvent {
     /// "Go" was clicked in the preview. The window has switched itself to Running.
     Go,
@@ -62,6 +63,7 @@ pub enum OpEvent {
     Extra(usize),
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct OpWindow {
     /// Small caption at the top ("CLEAN JUNK", "SERVICES").
     pub kicker: String,
