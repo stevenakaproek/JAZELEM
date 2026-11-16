@@ -1,0 +1,29 @@
+/* Group Policy: a selectable row that also holds its own controls (drop-downs, Reset). */
+
+.gp-row {
+  cursor: default;
+}
+.gp-row .row-accessory {
+  flex-shrink: 1;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 55%;
+}
+.gp-opts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s2);
+  margin-top: var(--s2);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+.gp-opts .select {
+  min-width: 150px;
+}
+.gp-hero-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-shrink: 0;
+}

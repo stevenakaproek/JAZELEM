@@ -1,0 +1,28 @@
+/* RAM LED: the small colour well next to "Set colour". */
+
+.ramled-color {
+  appearance: none;
+  width: 44px;
+  height: var(--control-h);
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: var(--fill-control);
+  box-shadow: inset 0 0 0 0.5px var(--hairline);
+  cursor: default;
+}
+.ramled-color::-webkit-color-swatch-wrapper {
+  padding: 3px;
+}
+.ramled-color::-webkit-color-swatch {
+  border: 0;
+  border-radius: var(--r-xs);
+}
+.ramled-color:disabled {
+  opacity: 0.4;
+}
+.ramled-divider {
+  width: 1px;
+  height: var(--control-h);
+  background: var(--separator);
+}

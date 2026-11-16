@@ -1,0 +1,14 @@
+/* Optimization > Windows tweaks: the raw log of the last run. */
+
+.tweaks-log {
+  max-height: 280px;
+  overflow-y: auto;
+  padding: var(--s3) var(--s4);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.tweaks-log > div {
+  min-height: 1.5em;
+}

@@ -1401,3 +1401,7 @@ html.tauri .sidebar {
 .trigger-grid .input.number {
   width: 52px;
 }
+
+.hero-value {
+  white-space: nowrap;
+}

@@ -6,6 +6,8 @@ use serde_json::Value;
 pub trait Backend: Send {
     /// Poll background work. Called about five times a second, also while the window is hidden.
     fn pump(&mut self) {}
+    /// Whether the page is showing this tab right now (called before every `pump`).
+    fn shown(&mut self, _on: bool) {}
     /// Everything the page needs to draw this tab.
     fn view(&self) -> Value;
     /// Something the user did on the page.

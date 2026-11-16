@@ -125,6 +125,8 @@ impl Shell {
         let active = lock(&self.active).clone();
         for (name, tab) in &self.tabs {
             let mut t = lock(tab);
+            let shown = has_window && active.iter().any(|a| a == name);
+            t.shown(shown);
             t.pump();
             if !has_window || !active.iter().any(|a| a == name) {
                 continue;

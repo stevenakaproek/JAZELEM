@@ -1,0 +1,58 @@
+/* RTX 5080 Profiles: the trial notice, the preset cards and the live tiles. */
+
+.gpu-notice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.gpu-notice.warn {
+  background: var(--yellow-soft);
+  box-shadow: inset 0 0 0 0.5px var(--yellow);
+}
+.gpu-notice.error {
+  background: var(--red-soft);
+  box-shadow: inset 0 0 0 0.5px var(--red);
+}
+.gpu-notice-title {
+  font-size: var(--text-lg);
+  font-weight: 600;
+}
+.gpu-small {
+  font-size: var(--text-sm);
+}
+.gpu-presets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--s3);
+}
+.gpu-preset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  min-height: 148px;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.gpu-preset-name {
+  font-size: var(--text-lg);
+  font-weight: 600;
+}
+.gpu-preset.selected .gpu-preset-name {
+  color: var(--accent);
+}
+.gpu-tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--s4);
+}
+.gpu-message {
+  white-space: pre-wrap;
+}
+
+@media (max-width: 860px) {
+  .gpu-presets,
+  .gpu-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -1144,6 +1144,7 @@ pub struct Gpu {
     pub demo: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 pub enum Click {
     Reset,
     Apply,
