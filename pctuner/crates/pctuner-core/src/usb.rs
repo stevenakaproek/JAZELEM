@@ -53,6 +53,9 @@ pub struct RawNode {
     pub loc_path: Option<String>,
     #[serde(rename = "BusDesc", default)]
     pub bus_desc: Option<String>,
+    /// Device Manager problem code (22 = disabled)
+    #[serde(rename = "Problem", default)]
+    pub problem: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +67,8 @@ pub struct Node {
     pub loc_info: String,
     pub loc_path: String,
     pub bus_desc: String,
+    /// switched off in Device Manager (problem code 22)
+    pub disabled: bool,
 }
 
 /// All present PnP devices. Lookups are case-insensitive (keys upper-cased), like PowerShell hashtables.
@@ -87,7 +92,7 @@ foreach ($d in $all) {
         foreach ($p in @($r.deviceProperties)) { if ($p -and $p.KeyName) { $v[[string]$p.KeyName] = $p.Data } }
     } catch {}
     $i = $d.InstanceId
-    [pscustomobject]@{ Id = [string]$i; Name = [string]$d.FriendlyName; Class = [string]$d.Class; Parent = [string]$v['DEVPKEY_Device_Parent']; LocInfo = [string]$v['DEVPKEY_Device_LocationInfo']; LocPath = [string](@($v['DEVPKEY_Device_LocationPaths'])[0]); BusDesc = [string]$v['DEVPKEY_Device_BusReportedDeviceDesc'] }
+    [pscustomobject]@{ Id = [string]$i; Name = [string]$d.FriendlyName; Class = [string]$d.Class; Parent = [string]$v['DEVPKEY_Device_Parent']; LocInfo = [string]$v['DEVPKEY_Device_LocationInfo']; LocPath = [string](@($v['DEVPKEY_Device_LocationPaths'])[0]); BusDesc = [string]$v['DEVPKEY_Device_BusReportedDeviceDesc']; Problem = [int]$d.ConfigManagerErrorCode }
 }
 if ($sp.CimSession) { Remove-CimSession $sp.CimSession }
 "#;
@@ -123,6 +128,7 @@ impl Tree {
                     loc_info: r.loc_info.unwrap_or_default(),
                     loc_path: r.loc_path.unwrap_or_default(),
                     bus_desc: r.bus_desc.unwrap_or_default(),
+                    disabled: r.problem == Some(PROBLEM_DISABLED),
                 })
             })
             .collect();
@@ -220,7 +226,12 @@ pub struct Controller {
     pub name: String,
     pub tier: u8,
     pub path: String,
+    /// switched off in Device Manager (by PC Tuner or by hand)
+    pub disabled: bool,
 }
+
+/// Device Manager problem code of a disabled device.
+pub const PROBLEM_DISABLED: i64 = 22;
 
 /// AMD Promontory chipset upstream ports above the controller: 2 = tier 4, 1 = tier 3; otherwise PCI depth decides.
 pub fn controller_tier(tree: &Tree, ctl_id: &str) -> u8 {
@@ -249,7 +260,7 @@ pub fn controllers(tree: &Tree) -> Vec<Controller> {
                 && (n.class.eq_ignore_ascii_case("USB") || has(&n.name, "USB4"))
                 && has_any(&n.name, &["Host Controller", "Host Router"])
         })
-        .map(|n| Controller { id: n.id.clone(), name: n.name.clone(), tier: controller_tier(tree, &n.id), path: n.loc_path.clone() })
+        .map(|n| Controller { id: n.id.clone(), name: n.name.clone(), tier: controller_tier(tree, &n.id), path: n.loc_path.clone(), disabled: n.disabled })
         .collect()
 }
 
@@ -323,6 +334,37 @@ pub fn usb_devices(tree: &Tree, ctls: &[Controller]) -> Vec<UsbDevice> {
         });
     }
     out
+}
+
+/// Devices plugged in below a controller right now.
+pub fn devices_on(m: &Map, ctl_id: &str) -> usize {
+    m.devices.iter().filter(|d| d.ctl_id.eq_ignore_ascii_case(ctl_id)).count()
+}
+
+/// Why a controller may not be switched off (None: it may). Only an empty, ordinary controller can be:
+/// a USB4 router always shows 0 devices although devices on its ports run through it.
+pub fn why_not_disable(m: &Map, c: &Controller) -> Option<&'static str> {
+    if c.disabled {
+        Some("It is already disabled.")
+    } else if is_router(c) {
+        Some("A USB4 router carries devices that show under another controller - it is never disabled.")
+    } else if devices_on(m, &c.id) > 0 {
+        Some("Something is plugged into it. Only controllers with no devices can be disabled.")
+    } else {
+        None
+    }
+}
+
+/// Switch a USB controller on or off with Windows' own pnputil (administrator). Ok = a note for the user.
+pub fn set_controller(id: &str, enable: bool) -> Result<String, String> {
+    let verb = if enable { "/enable-device" } else { "/disable-device" };
+    let (code, out) = common::run("pnputil", &[verb, id])?;
+    match code {
+        0 => Ok(String::new()),
+        // ERROR_SUCCESS_REBOOT_REQUIRED
+        3010 => Ok("Windows finishes this at the next restart.".into()),
+        _ => Err(format!("pnputil {verb} failed (code {code}): {}", out.trim())),
+    }
 }
 
 /// The full picture, sorted the way the script prints it.
@@ -500,6 +542,10 @@ pub struct Usb {
     pub watch: Option<Watch>,
     pub log: Vec<LogEntry>,
     pub watch_error: Option<String>,
+    /// a controller being switched on / off: (its name, enable, the job)
+    pub change: Option<(String, bool, Job<Result<String, String>>)>,
+    /// the result of the last switch
+    pub change_note: Option<(bool, String)>,
 }
 
 pub fn shorten(s: &str, max: usize) -> String {
@@ -523,7 +569,7 @@ impl Default for Usb {
 
 impl Usb {
     pub fn new() -> Self {
-        let mut tab = Usb { map: None, map_job: None, scan_started: None, error: None, watch: None, log: vec![], watch_error: None };
+        let mut tab = Usb { map: None, map_job: None, scan_started: None, error: None, watch: None, log: vec![], watch_error: None, change: None, change_note: None };
         if crate::opwin::demo_stage("usb").is_some() {
             // sample plug-in test hits for screenshots (the newest one stays highlighted)
             let ctl = "AMD USB 3.10 eXtensible Host Controller - 1.20 (Microsoft)";
@@ -539,7 +585,42 @@ impl Usb {
         self.map_job = Some(Job::spawn(load_map));
     }
 
+    /// Disable (an empty controller) or enable a controller, in the background; the map is read again afterwards.
+    pub fn switch_controller(&mut self, id: &str, enable: bool) -> Result<(), String> {
+        if !common::is_admin() {
+            return Err("Run PC Tuner as administrator to switch USB controllers.".into());
+        }
+        if self.change.is_some() || self.map_job.is_some() {
+            return Err("Wait for the current change or scan to finish.".into());
+        }
+        let m = self.map.as_ref().ok_or("The USB tree has not been read yet.")?;
+        let c = m.controllers.iter().find(|c| c.id.eq_ignore_ascii_case(id)).ok_or("That controller is no longer there - rescan.")?;
+        if enable && !c.disabled {
+            return Err("It is already on.".into());
+        }
+        if !enable {
+            if let Some(why) = why_not_disable(m, c) {
+                return Err(why.into());
+            }
+        }
+        let id = c.id.clone();
+        self.change_note = None;
+        self.change = Some((c.name.clone(), enable, Job::spawn(move || set_controller(&id, enable))));
+        Ok(())
+    }
+
     pub fn pump(&mut self, now: f64) {
+        if let Some(r) = self.change.as_ref().and_then(|(_, _, j)| j.poll()) {
+            let (name, enable, _) = self.change.take().expect("checked above");
+            let what = if enable { "enabled" } else { "disabled" };
+            self.change_note = Some(match r {
+                Ok(note) => (true, format!("{name} {what}. {note}").trim().to_string()),
+                Err(e) => (false, format!("{name} could not be {what}: {e}")),
+            });
+            if self.map_job.is_none() {
+                self.start_scan();
+            }
+        }
         if let Some(j) = &self.map_job {
             if let Some(r) = j.poll() {
                 match r {
@@ -640,7 +721,7 @@ mod tests {
     }
 
     fn node(id: &str, name: &str, class: &str, parent: &str, loc_info: &str, loc_path: &str) -> Node {
-        Node { id: id.into(), name: name.into(), class: class.into(), parent: parent.into(), loc_info: loc_info.into(), loc_path: loc_path.into(), bus_desc: String::new() }
+        Node { id: id.into(), name: name.into(), class: class.into(), parent: parent.into(), loc_info: loc_info.into(), loc_path: loc_path.into(), bus_desc: String::new(), disabled: false }
     }
 
     /// Two xHCI controllers (one CPU, one chipset), a USB4 host router and one flash drive.
@@ -756,5 +837,25 @@ mod tests {
             let n = tree.get(id).expect("id in tree");
             assert!(n.parent.eq_ignore_ascii_case(parent), "{id}: {parent} vs {}", n.parent);
         }
+    }
+
+    #[test]
+    fn usb_which_controllers_can_be_disabled() {
+        let ctl = |id: &str, name: &str, disabled: bool| Controller { id: id.into(), name: name.into(), tier: 3, path: String::new(), disabled };
+        let dev = |ctl_id: &str| UsbDevice { name: "Mouse".into(), kind: "mouse", onboard: false, tier: 3, controller: String::new(), ctl_id: ctl_id.into(), port: String::new(), hubs: 0, id: r"USB\VID_1".into(), functions: String::new() };
+        let m = Map {
+            controllers: vec![ctl(r"PCI\A", "AMD USB 3.10 eXtensible Host Controller", false), ctl(r"PCI\B", "AMD USB 3.10 eXtensible Host Controller", false), ctl(r"PCI\R", "USB4 Host Router", false), ctl(r"PCI\D", "AMD USB 3.20 eXtensible Host Controller", true)],
+            devices: vec![dev(r"pci\a")],
+            time: String::new(),
+        };
+        assert_eq!(devices_on(&m, r"PCI\A"), 1, "ids compare without case");
+        assert!(why_not_disable(&m, &m.controllers[0]).unwrap().contains("plugged into it"));
+        assert_eq!(why_not_disable(&m, &m.controllers[1]), None, "empty: may be disabled");
+        assert!(why_not_disable(&m, &m.controllers[2]).unwrap().contains("never disabled"), "USB4 router");
+        assert!(why_not_disable(&m, &m.controllers[3]).unwrap().contains("already disabled"));
+        // the switch itself needs administrator and a read map (the tests never run pnputil)
+        let mut u = Usb::new();
+        assert!(u.switch_controller(r"PCI\B", false).is_err());
+        assert!(u.change.is_none());
     }
 }

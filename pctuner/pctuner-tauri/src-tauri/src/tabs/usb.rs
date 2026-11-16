@@ -1,5 +1,6 @@
 //! USB Port Finder: which controller every device is plugged into, and the live plug-in test.
-//! All logic is pctuner_core::usb; this backend builds the view. It changes nothing on the PC.
+//! All logic is pctuner_core::usb; this backend builds the view. The only change it makes: switching an empty USB
+//! controller off (and back on).
 
 use crate::backend::{parse, Backend};
 use pctuner_core::common::Tone;
@@ -25,6 +26,9 @@ enum Action {
     Rescan,
     StartWatch,
     StopWatch,
+    /// Disable (only an empty controller) or enable a USB controller.
+    Controller { id: String, enable: bool },
+    DismissNote,
 }
 
 fn tier_tone(t: u8) -> Tone {
@@ -79,7 +83,7 @@ impl UsbTab {
         json!({ "hero": hero, "stats": stats })
     }
 
-    fn map(m: &Map) -> Value {
+    fn map(m: &Map, can: bool) -> Value {
         let key: Vec<Value> = key_devices(m).iter().map(|d| json!({ "tier": format!("Tier {}", d.tier), "tone": tier_tone(d.tier), "name": d.name, "verdict": verdict(d) })).collect();
         let controllers: Vec<Value> = m
             .controllers
@@ -94,7 +98,21 @@ impl UsbTab {
                 } else {
                     format!("{n} devices")
                 };
-                json!({ "tier": tier_short(c.tier), "tone": tier_tone(c.tier), "name": c.name, "router": router, "note": note, "empty": n == 0, "hover": format!("{}\n{}", c.id, c.path) })
+                let why_not = why_not_disable(m, c);
+                json!({
+                    "id": c.id,
+                    "tier": tier_short(c.tier),
+                    "tone": tier_tone(c.tier),
+                    "name": c.name,
+                    "router": router,
+                    "note": if c.disabled { "disabled".to_string() } else { note },
+                    "empty": n == 0,
+                    "disabled": c.disabled,
+                    "canDisable": can && why_not.is_none(),
+                    "canEnable": can && c.disabled,
+                    "whyNot": if c.disabled { None } else { why_not },
+                    "hover": format!("{}\n{}", c.id, c.path),
+                })
             })
             .collect();
         let devices: Vec<Value> = m
@@ -130,6 +148,7 @@ impl Backend for UsbTab {
         self.opened.store(true, Ordering::Relaxed);
         let u = &self.u;
         let now = self.clock.elapsed().as_secs_f64();
+        let can = pctuner_core::common::is_admin() && u.change.is_none() && u.map_job.is_none();
         let watch = u.watch.as_ref().map(|w| {
             if !w.seeded {
                 "Taking a snapshot of the connected devices..."
@@ -162,7 +181,10 @@ impl Backend for UsbTab {
             "scanSecs": u.scan_started.map(|t| t.elapsed().as_secs()).unwrap_or(0),
             "error": u.error,
             "summary": u.map.as_ref().map(Self::hero),
-            "map": u.map.as_ref().map(Self::map),
+            "map": u.map.as_ref().map(|m| Self::map(m, can)),
+            "switching": u.change.as_ref().map(|(name, enable, _)| format!("{} {name}...", if *enable { "Enabling" } else { "Disabling" })),
+            "switchNote": u.change_note.as_ref().map(|(ok, text)| json!({ "ok": ok, "text": text })),
+            "admin": pctuner_core::common::is_admin(),
             "watch": watch,
             "tested": if u.log.is_empty() { None } else { Some(format!("{} port(s) tested", u.log.len())) },
             "watchError": u.watch_error,
@@ -183,6 +205,12 @@ impl Backend for UsbTab {
                 }
             }
             Action::StopWatch => self.u.stop_watch(),
+            Action::Controller { id, enable } => {
+                if let Err(e) = self.u.switch_controller(&id, enable) {
+                    self.u.change_note = Some((false, e));
+                }
+            }
+            Action::DismissNote => self.u.change_note = None,
         }
         Ok(Value::Null)
     }

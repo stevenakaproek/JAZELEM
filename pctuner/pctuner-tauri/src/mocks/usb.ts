@@ -1,6 +1,6 @@
 import type { Tone } from "../lib/types";
 import type { Action, UsbHit, UsbMap, View } from "../tabs/Usb";
-import { mockParams } from "./env";
+import { mockAdmin, mockParams } from "./env";
 import type { MockTab } from "./types";
 
 // "?state=loading | error | empty" shows the other faces of the tab
@@ -34,6 +34,10 @@ const controllers: [tier: number, name: string, id: string, path: string][] = [
   [3, CHIP, "PCI\\VEN_1022&DEV_43FD&SUBSYS_11421B21&REV_01\\6&3A4B5C6D&0&00600011", "PCIROOT(0)#PCI(0201)#PCI(0000)#PCI(0C00)#PCI(0000)"],
 ];
 
+// controllers switched off in the stand-in data (the 2.0 controller has nothing plugged in)
+const off = new Set<string>();
+let switchNote: View["switchNote"] = null;
+
 const key = (d: Dev) => d[2] === "GAME CONTROLLER" || d[2] === "AUDIO";
 const verdict = (d: Dev) => (d[0] === 1 ? "already on a CPU port - nothing to do" : d[0] === 2 ? "on CPU lanes - fine" : "on a chipset port - move it to a Tier 1 port if one is free") + (d[5] > 0 ? "; it is going through a hub - plug it into the PC directly" : "");
 
@@ -45,7 +49,22 @@ function mapView(): UsbMap {
     controllers: controllers.map(([tier, name, id, path]) => {
       const n = list.filter((d) => d[3] === name).length;
       const router = name.includes("Host Router");
-      return { tier: SHORT[tier], tone: tone(tier), name, router, note: router ? "USB4 router - devices on these ports appear under the add-on chip's USB controller" : n === 1 ? "1 device" : `${n} devices`, empty: n === 0, hover: `${id}\n${path}` };
+      const disabled = off.has(id);
+      const whyNot = disabled ? null : router ? "A USB4 router carries devices that show under another controller - it is never disabled." : n > 0 ? "Something is plugged into it. Only controllers with no devices can be disabled." : null;
+      return {
+        id,
+        tier: SHORT[tier],
+        tone: tone(tier),
+        name,
+        router,
+        note: disabled ? "disabled" : router ? "USB4 router - devices on these ports appear under the add-on chip's USB controller" : n === 1 ? "1 device" : `${n} devices`,
+        empty: n === 0,
+        disabled,
+        canDisable: mockAdmin && !disabled && whyNot === null,
+        canEnable: mockAdmin && disabled,
+        whyNot,
+        hover: `${id}\n${path}`,
+      };
     }),
     devices: list.map((d) => ({ tier: `Tier ${d[0]}`, tone: tone(d[0]), name: d[1], kind: d[2].toLowerCase(), keyKind: key(d), hubs: d[5] > 0 ? `via ${d[5]} hub(s)` : null, onboard: d[6], where: `${d[3]}  ·  ${d[4]}`, hover: `${d[7]}\n${d[8]}` })),
   };
@@ -88,6 +107,9 @@ export const usb: MockTab<View, Action> = {
       tested: log.length ? `${log.length} port(s) tested` : null,
       watchError: null,
       log: [...log].reverse().map(({ age, ...l }) => ({ ...l, fresh: age < 5 })),
+      switching: null,
+      switchNote,
+      admin: mockAdmin,
     };
   },
   act(a) {
@@ -96,6 +118,13 @@ export const usb: MockTab<View, Action> = {
       ticks = 0;
       log = [];
     } else if (a.kind === "stop_watch") watching = false;
+    else if (a.kind === "dismiss_note") switchNote = null;
+    else if (a.kind === "controller" && mockAdmin) {
+      const name = controllers.find((c) => c[2] === a.id)?.[1] ?? "?";
+      if (a.enable) off.delete(a.id);
+      else off.add(a.id);
+      switchNote = { ok: true, text: `${name} ${a.enable ? "enabled" : "disabled"}.` };
+    }
   },
   tick() {
     secs = Math.floor((ticks + 1) / 2);

@@ -43,3 +43,4 @@
   flex-wrap: wrap;
   row-gap: var(--s1);
 }
+.usb-off .usb-tier { opacity: 0.5; }
