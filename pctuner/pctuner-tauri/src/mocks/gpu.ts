@@ -29,6 +29,7 @@ let trial: { preset: string; previous: string; status: "pending" | "reverted" } 
 if (trial?.status === "pending") current = 5;
 if (trial?.status === "reverted") current = 0;
 
+let powerPct = 100;
 type Sample = { core: number; temp: number; power: number; util: number; volt: number; vram: number; memclock: number; fan: number };
 const hist: Sample[] = [];
 let t = 0;
@@ -42,19 +43,18 @@ for (let i = 0; i < 40; i++) sample();
 
 function live(): GpuTile[] {
   const l = hist[hist.length - 1];
-  const tile = (key: keyof Sample, label: string, unit: string, sub: string | null = null): GpuTile => ({ key, label, unit, value: l[key], sub, hist: hist.map((h) => h[key]) });
+  const tile = (key: keyof Sample, label: string, unit: string, max: number | null, digits = 0, scale = 1): GpuTile => ({ key, label, unit, text: (l[key] * scale).toFixed(digits), value: l[key], max });
   return [
-    tile("core", "Core clock", "MHz"),
-    tile("temp", "Temperature", "°C"),
-    tile("power", "Power draw", "W"),
-    tile("util", "GPU load", "%"),
-    tile("volt", "Core voltage", "mV"),
-    tile("vram", "Memory used", "MB", "of 16303 MB"),
-    tile("memclock", "Memory clock", "MHz"),
-    tile("fan", "Fan speed", "%"),
+    tile("temp", "Temperature", "°C", 100),
+    tile("volt", "Core voltage", "V", null, 2, 0.001),
+    tile("power", "Power draw", "W", (360 * powerPct) / 100, 1),
+    tile("util", "GPU load", "%", 100),
+    tile("core", "Core clock", "MHz", 3210),
+    tile("vram", "Memory used", "MB", 16303),
+    tile("memclock", "Memory clock", "MHz", null),
+    tile("fan", "Fan speed", "%", 100),
   ];
 }
-let powerPct = 100;
 
 function tuning(i: number) {
   return i === CUSTOM ? { max: custom.maxMhz, core: custom.core, mem: custom.mem, power: custom.power } : { ...PRESETS[i] };

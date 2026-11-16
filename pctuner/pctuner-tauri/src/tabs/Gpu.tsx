@@ -3,7 +3,7 @@
 import { Plus, RefreshCw, RotateCcw, SlidersHorizontal, X } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { OpSheet } from "../components/OpSheet";
-import { Badge, Banner, Button, ContextMenu, ErrorState, Group, Hero, LoadingState, NumberField, Page, Sheet, Slider, Sparkline, Spinner, Stat, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
+import { Badge, Banner, Button, ContextMenu, ErrorState, Group, Hero, LoadingState, NumberField, Page, Sheet, Slider, Spinner, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow, Tone } from "../lib/types";
 import { useTab } from "../lib/useTab";
@@ -21,10 +21,11 @@ export interface GpuTile {
   key: string;
   label: string;
   unit: string;
+  /** the value as shown ("62.5", "1.01") */
+  text: string;
   value: number | null;
-  /** "of 16303 MB" */
-  sub: string | null;
-  hist: number[];
+  /** the value that fills the bar (null: no bar) */
+  max: number | null;
 }
 
 export interface GpuHero {
@@ -135,7 +136,15 @@ function TrialNotice({ t, act }: { t: GpuTrial; act: Act }) {
 }
 
 const TILE_KEY = "pctuner.gpu.tiles";
-const DEFAULT_TILES = ["core", "temp", "power", "util", "volt", "vram"];
+const DEFAULT_TILES = ["temp", "volt", "power", "util", "core", "vram"];
+
+/** Bar colour per reading: temperature goes green, orange, red as it rises. */
+function barColor(t: GpuTile): string {
+  if (t.key === "temp") return (t.value ?? 0) >= 85 ? "var(--red)" : (t.value ?? 0) >= 70 ? "var(--orange)" : "var(--green)";
+  if (t.key === "power") return "color-mix(in srgb, var(--green), var(--yellow))";
+  if (t.key === "vram") return "var(--green)";
+  return "var(--accent)";
+}
 
 function loadTiles(): string[] {
   try {
@@ -155,7 +164,7 @@ function saveTiles(keys: string[]) {
   }
 }
 
-/** Live readings as tiles: drag a tile to move it, the cross removes it, "Add" brings one back. */
+/** Live readings as one compact strip (number, unit, a thin bar): drag a reading to move it, the cross removes it, "Add" brings one back. */
 function TelemetryTiles({ tiles }: { tiles: GpuTile[] }) {
   const [order, setOrder] = useState<string[]>(loadTiles);
   const [dragging, setDragging] = useState<string | null>(null);
@@ -198,7 +207,7 @@ function TelemetryTiles({ tiles }: { tiles: GpuTile[] }) {
             key={k}
             data-tile={k}
             className={cx("gpu-tile", dragging === k && "dragging", over === k && dragging !== k && "drop-target")}
-            title="Drag to move"
+            title={`${t.label} - drag to move`}
             onPointerDown={(e) => {
               if (e.button !== 0 || (e.target as HTMLElement).closest(".gpu-tile-remove")) return;
               press.current = { key: k, x: e.clientX, y: e.clientY, active: false };
@@ -225,8 +234,12 @@ function TelemetryTiles({ tiles }: { tiles: GpuTile[] }) {
             <button type="button" className="gpu-tile-remove" title={`Remove ${t.label}`} aria-label={`Remove ${t.label}`} onClick={() => update(shown.filter((x) => x !== k))}>
               <X size={12} />
             </button>
-            <Stat value={t.value === null ? "-" : t.value.toFixed(0)} unit={t.unit} label={t.sub ? `${t.label} ${t.sub}` : t.label} />
-            <Sparkline values={t.hist} />
+            <div className="gpu-read">
+              <span className="gpu-read-value">{t.text}</span>
+              <span className="gpu-read-unit">{t.unit}</span>
+            </div>
+            <div className="gpu-read-bar" aria-hidden>{t.max !== null && t.value !== null && <span style={{ width: `${Math.min(100, Math.max(0, (t.value / t.max) * 100))}%`, background: barColor(t) }} />}</div>
+            <div className="gpu-read-label">{t.label}</div>
           </div>
         );
       })}

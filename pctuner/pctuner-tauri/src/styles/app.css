@@ -1498,3 +1498,4 @@ html.tauri .sidebar {
   color: var(--text);
   font-weight: 600;
 }
+.fan-presets { gap: 6px; flex-wrap: wrap; }

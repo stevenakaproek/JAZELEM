@@ -1,4 +1,4 @@
-// Fan Tuner: live speeds and temperatures, profiles, and each fan's BIOS / Manual / Curve / Trigger setting.
+// Fan Tuner: live speeds and temperatures, and each fan's BIOS / Manual / Curve / Trigger setting.
 import { ChevronRight, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Badge, Banner, Button, ErrorState, Group, Hero, LoadingState, NumberField, Page, Progress, Segmented, Slider, Sparkline, Stat, Switch, ToneBadge, cx } from "../components/ui";
@@ -24,13 +24,13 @@ export interface FanCardView {
   controllable: boolean;
   pump: boolean;
   gpu: boolean;
-  pinned: boolean;
   chip: { text: string; tone: Tone };
   hist: number[];
   floor: number;
   setting: FanSetting;
   notice: string | null;
-  follow: string;
+  /** Silent / Balanced / Performance for this fan; `active` when its curve is exactly that preset */
+  presets: { name: string; active: boolean }[];
   live: number | null;
   liveDuty: number | null;
   afterburner: boolean;
@@ -61,7 +61,7 @@ export interface FanView {
   viewOnly: boolean;
   error: string | null;
   anyControlled: boolean;
-  profile: { names: string[]; active: string | null; modified: boolean; builtin: boolean; note: string | null; newName: string; newNameOk: boolean; newNameWhy: string | null };
+  note: string | null;
   sources: { key: FanSource; label: string }[];
   graph: GraphLimits;
   stale?: { head: string; sub: string };
@@ -84,10 +84,9 @@ export interface FanView {
 }
 
 export type FanAction =
-  | { kind: "give_back" | "save_changes" | "reset_builtin" | "delete_profile" | "save_as_new" }
+  | { kind: "give_back" }
   | { kind: "dismiss"; seq: number }
-  | { kind: "load_profile"; name: string }
-  | { kind: "new_name"; name: string }
+  | { kind: "preset"; id: string; name: string }
   | { kind: "mode"; id: string; mode: FanSetting["mode"] }
   | { kind: "manual"; id: string; percent: number }
   | { kind: "source"; id: string; source: FanSource }
@@ -95,7 +94,6 @@ export type FanAction =
   | { kind: "curve_add"; id: string; t: number; d: number }
   | { kind: "curve_remove"; id: string; index: number }
   | { kind: "trigger"; id: string; idle_temp: number; load_temp: number; idle: number; load: number }
-  | { kind: "follow"; id: string }
   | { kind: "pump"; id: string; on: boolean }
   | { kind: "pair_sensor"; id: string; sensor: string }
   | { kind: "test"; id: string; test: "calibrate" | "pair" }
@@ -241,7 +239,6 @@ function FanCard({ f, view, act }: { f: FanCardView; view: FanView; act: Act }) 
       <div className="hstack">
         <div className="fan-name">{f.name}</div>
         <span className="spacer" />
-        {f.pinned && <Badge color="yellow">Own setting</Badge>}
         {f.pump && <Badge>Pump</Badge>}
         <ToneBadge tone={f.chip.tone}>{f.chip.text}</ToneBadge>
       </div>
@@ -264,18 +261,14 @@ function FanCard({ f, view, act }: { f: FanCardView; view: FanView; act: Act }) 
               {f.notice}
             </div>
           )}
-          {f.pinned ? (
-            <div className="hstack" style={{ flexWrap: "wrap" }}>
-              <span className="tone-warn" style={{ fontSize: "var(--text-sm)" }}>
-                Own setting - profiles leave this fan alone.
-              </span>
-              <Button variant="plain" disabled={disabled} title={f.follow} onClick={() => act({ kind: "follow", id: f.id })}>
-                Follow profile
-              </Button>
-            </div>
-          ) : (
-            <div className="tertiary" style={{ fontSize: "var(--text-sm)" }}>
-              {f.follow}
+          {f.presets.length > 0 && (
+            <div className="hstack fan-presets">
+              <span className="secondary" style={{ fontSize: "var(--text-sm)" }}>Preset</span>
+              {f.presets.map((p) => (
+                <button key={p.name} type="button" className={cx("pill", p.active && "on")} disabled={disabled} title={`Sets this fan to the ${p.name} curve now.`} onClick={() => act({ kind: "preset", id: f.id, name: p.name })}>
+                  {p.name}
+                </button>
+              ))}
             </div>
           )}
           <Segmented value={s.mode} disabled={disabled} options={MODES.map((m) => ({ value: m.value, label: <span title={m.tip}>{m.label}</span> }))} onChange={(mode) => act({ kind: "mode", id: f.id, mode })} />
@@ -317,71 +310,6 @@ function FanCard({ f, view, act }: { f: FanCardView; view: FanView; act: Act }) 
         </div>
       )}
     </div>
-  );
-}
-
-function ProfileBar({ view, act }: { view: FanView; act: Act }) {
-  const p = view.profile;
-  const disabled = !view.can;
-  const [name, setName] = useState(p.newName);
-  useEffect(() => {
-    if (p.newName === "") setName("");
-  }, [p.newName]);
-  return (
-    <Group title="Profile" padded footer={p.note ?? undefined}>
-      <div className="stack">
-        <div className="profile-pills">
-          {p.names.map((n) => (
-            <button key={n} type="button" className={cx("pill", p.active === n && "on")} disabled={disabled} onClick={() => act({ kind: "load_profile", name: n })}>
-              {n}
-            </button>
-          ))}
-        </div>
-        <div className="toolbar">
-          {p.active ? (
-            <>
-              <strong>{p.active}</strong>
-              {p.modified ? <Badge color="yellow">Changed - not saved</Badge> : <Badge>Saved</Badge>}
-              <Button disabled={disabled || !p.modified} title={`Store the fans as they are now in ${p.active}.`} onClick={() => act({ kind: "save_changes" })}>
-                Save changes
-              </Button>
-              {p.builtin ? (
-                <Button disabled={disabled} title={`Throw away your edits to ${p.active} and use PC Tuner's default curves.`} onClick={() => act({ kind: "reset_builtin" })}>
-                  Reset to default
-                </Button>
-              ) : (
-                <Button variant="danger" disabled={disabled} onClick={() => act({ kind: "delete_profile" })}>
-                  Delete
-                </Button>
-              )}
-            </>
-          ) : (
-            <span className="secondary">No profile - pick one, or set fans below and save them as a profile.</span>
-          )}
-          <span className="spacer" />
-          <input
-            className="input"
-            style={{ width: 170 }}
-            value={name}
-            placeholder="New profile name"
-            disabled={disabled}
-            spellCheck={false}
-            onChange={(e) => {
-              setName(e.target.value);
-              void act({ kind: "new_name", name: e.target.value });
-            }}
-          />
-          <Button disabled={disabled || !p.newNameOk} title={p.newNameWhy ?? (p.newNameOk ? undefined : "Type a name for the new profile.")} onClick={() => act({ kind: "save_as_new" })}>
-            Save as new
-          </Button>
-        </div>
-        {p.newNameWhy && name.trim() !== "" && (
-          <div className="tone-warn" style={{ fontSize: "var(--text-sm)" }}>
-            {p.newNameWhy}
-          </div>
-        )}
-      </div>
-    </Group>
   );
 }
 
@@ -449,7 +377,7 @@ function Body({ view, act }: { view: FanView; act: Act }) {
           </div>
         </div>
       </Group>
-      <ProfileBar view={view} act={act} />
+      {view.note && <div className="secondary selectable">{view.note}</div>}
       <section className="group-wrap">
         <div className="group-title">
           <span>Fans</span>
@@ -511,7 +439,7 @@ export function Fan() {
           variant="danger"
           icon={<RotateCcw />}
           disabled={!view || !view.can || !view.anyControlled}
-          title={!view || view.can ? (view?.anyControlled ? "Every fan goes back to its BIOS / graphics-driver curve. Own settings are cleared and no profile is applied at startup until you pick one." : "No fan is controlled by PC Tuner.") : "Run PC Tuner as administrator to control fans."}
+          title={!view || view.can ? (view?.anyControlled ? "Every fan goes back to its BIOS / graphics-driver curve. Their settings here are cleared, so nothing is applied at startup until you set a fan again." : "No fan is controlled by PC Tuner.") : "Run PC Tuner as administrator to control fans."}
           onClick={() => act({ kind: "give_back" })}
         >
           Give all fans back to BIOS

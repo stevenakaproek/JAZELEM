@@ -29,10 +29,7 @@ const fans: MockFan[] = [
   { id: "gpu", name: "GPU Fan", hw: "NVIDIA GeForce RTX 5080", base: 1150, gpu: true, pump: false, controllable: true, floor: 30, setting: { mode: "bios" }, pinned: false, hist: [] },
   { id: "sys5", name: "System Fan #5", hw: board, base: 0, gpu: false, pump: false, controllable: true, floor: 0, setting: { mode: "bios" }, pinned: false, hist: [] },
 ];
-const names = ["Silent", "Balanced", "Performance", "Night"];
-let active: string | null = "Balanced";
-let note: string | null = "Balanced was applied when PC Tuner started.";
-let newName = "";
+let note: string | null = null;
 let tick = 0;
 let cpu = 58;
 let gpu = 52;
@@ -65,6 +62,13 @@ function duty(points: [number, number][], t: number): number {
   return points[points.length - 1][1];
 }
 
+const PRESETS: Record<string, [number, number][]> = {
+  Silent: [[30, 20], [50, 25], [65, 40], [75, 60], [85, 100]],
+  Balanced: [[30, 30], [50, 40], [65, 60], [75, 80], [85, 100]],
+  Performance: [[30, 40], [50, 55], [65, 75], [75, 90], [80, 100]],
+};
+const presetCurve = (f: MockFan, n: string): FanSetting => ({ mode: "curve", source: f.gpu ? "gpu" : f.pump || f.name.startsWith("CPU") ? "cpu" : "hottest", points: PRESETS[n].map(([t, d]) => [t, Math.max(d, f.floor)] as [number, number]) });
+
 function card(f: MockFan): FanCardView {
   const s = f.setting;
   const src = s.mode === "curve" || s.mode === "trigger" ? s.source : null;
@@ -81,13 +85,12 @@ function card(f: MockFan): FanCardView {
     controllable: f.controllable,
     pump: f.pump,
     gpu: f.gpu,
-    pinned: f.pinned,
     chip: { text, tone: text === "BIOS" ? "Off" : "Accent" },
     hist: f.hist,
     floor: f.floor,
     setting: s,
     notice: !mockAdmin && ours ? "Saved setting below - not applied (view-only)." : null,
-    follow: f.pinned ? `Use ${active ?? "the profile"}'s setting for this fan again.` : `${active ? `Follows ${active}.` : "Follows the profile."} Change it here to give this fan its own setting.`,
+    presets: f.controllable ? Object.keys(PRESETS).filter((n) => !(f.gpu && n === "Silent")).map((n) => ({ name: n, active: JSON.stringify(f.setting) === JSON.stringify(presetCurve(f, n)) })) : [],
     live,
     liveDuty,
     afterburner: f.gpu && ours,
@@ -134,7 +137,7 @@ export const fan: MockTab<FanView, FanAction> = {
       viewOnly: !mockAdmin,
       error: null,
       anyControlled: fans.some((f) => f.setting.mode !== "bios"),
-      profile: { names, active, modified: fans.some((f) => f.pinned) && false, builtin: active !== "Night", note, newName, newNameOk: newName.trim() !== "" && !names.includes(newName.trim()), newNameWhy: names.includes(newName.trim()) ? `A profile called ${newName.trim()} already exists - pick it and use Save changes, or choose another name.` : null },
+      note,
       sources: [
         { key: "cpu", label: "CPU temperature" },
         { key: "gpu", label: "GPU temperature" },
@@ -189,29 +192,10 @@ export const fan: MockTab<FanView, FanAction> = {
           x.setting = { mode: "bios" };
           x.pinned = false;
         });
-        active = null;
-        note = "Every fan is back on BIOS control. Own settings were cleared and no profile is applied at startup until you pick one.";
+        note = "Every fan is back on BIOS control.";
         break;
-      case "load_profile":
-        active = a.name;
-        note = `${a.name} is on. It will be applied again the next time PC Tuner starts.`;
-        break;
-      case "save_changes":
-        note = `${active} saved.`;
-        break;
-      case "new_name":
-        newName = a.name;
-        break;
-      case "save_as_new":
-        names.push(newName.trim());
-        active = newName.trim();
-        note = `${active} saved and will be applied when PC Tuner starts.`;
-        newName = "";
-        break;
-      case "delete_profile":
-        if (active) names.splice(names.indexOf(active), 1);
-        note = `${active} deleted. The fans stay as they are until you change them.`;
-        active = null;
+      case "preset":
+        if (f && PRESETS[a.name] && !(f.gpu && a.name === "Silent")) own(presetCurve(f, a.name));
         break;
       case "mode":
         if (!f || f.setting.mode === a.mode) break;
@@ -246,9 +230,6 @@ export const fan: MockTab<FanView, FanAction> = {
         break;
       case "trigger":
         if (f && f.setting.mode === "trigger") own({ ...f.setting, idle_temp: Math.min(a.idle_temp, a.load_temp - 2), load_temp: a.load_temp, idle: a.idle, load: a.load });
-        break;
-      case "follow":
-        if (f) f.pinned = false;
         break;
       case "pump":
         if (f) f.pump = a.on;

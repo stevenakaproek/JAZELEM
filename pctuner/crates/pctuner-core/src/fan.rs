@@ -410,19 +410,33 @@ pub fn preset_points(name: &str) -> Option<[[f32; 2]; 5]> {
 /// headers stay on BIOS), never under its floor. The GPU is included even when its fans are stopped at idle.
 /// Silent leaves the graphics card on its own curve, which can stop its fans at idle.
 pub fn builtin_profile(name: &str, fans: &[FanInfo], pumps: &BTreeMap<String, bool>) -> Option<Profile> {
-    let pts = preset_points(name)?;
+    preset_points(name)?;
     let mut p = Profile::default();
     for f in fans.iter().filter(|f| f.controllable && (f.gpu || f.rpm.unwrap_or(0.0) > 0.0)) {
-        let pump = pumps.get(&f.id).copied().unwrap_or(f.pump);
-        if name == "Silent" && f.gpu {
-            continue;
+        if let Some(s) = fan_preset(name, f, pumps) {
+            p.fans.insert(f.id.clone(), s);
         }
-        let floor = floor_for(pump, f.min);
-        let FanSetting::Curve { source, .. } = default_curve(&f.name, f.gpu, pump, floor) else { continue };
-        let points = pts.iter().map(|q| [q[0], q[1].max(floor)]).collect();
-        p.fans.insert(f.id.clone(), FanSetting::Curve { source, points });
     }
     Some(p)
+}
+
+/// A preset's curve for one fan: the preset's points, never under the fan's floor, following the temperature
+/// that suits the fan. None for an unknown preset, a fan that cannot be controlled, and Silent on the
+/// graphics card (its own curve can stop the fans at idle).
+pub fn fan_preset(name: &str, f: &FanInfo, pumps: &BTreeMap<String, bool>) -> Option<FanSetting> {
+    let pts = preset_points(name)?;
+    if !f.controllable || (name == "Silent" && f.gpu) {
+        return None;
+    }
+    let pump = pumps.get(&f.id).copied().unwrap_or(f.pump);
+    let floor = floor_for(pump, f.min);
+    let FanSetting::Curve { source, .. } = default_curve(&f.name, f.gpu, pump, floor) else { return None };
+    Some(FanSetting::Curve { source, points: pts.iter().map(|q| [q[0], q[1].max(floor)]).collect() })
+}
+
+/// Which preset a fan's setting is exactly (None: BIOS, manual, a trigger or an edited curve).
+pub fn preset_of(setting: &FanSetting, f: &FanInfo, pumps: &BTreeMap<String, bool>) -> Option<&'static str> {
+    BUILTIN.iter().copied().find(|n| fan_preset(n, f, pumps).as_ref() == Some(setting))
 }
 
 /// Can a new profile be saved under `name`? (false, reason) for an empty, too long, built-in or taken name
@@ -1293,6 +1307,21 @@ impl Fan {
         self.pin_dirty = Some(Instant::now());
     }
 
+    /// Move away from profiles (the new app sets presets per fan): every fan keeps the setting it has now as
+    /// its own, and no profile is active or comes back at startup. Nothing changes on the fans.
+    pub fn adopt_profile_settings(&mut self) {
+        if self.active.is_none() && self.store.last.is_none() {
+            return;
+        }
+        for (id, s) in normalized(&self.settings) {
+            self.store.pinned.entry(id).or_insert(s);
+        }
+        self.active = None;
+        self.store.last = None;
+        self.note = None;
+        self.save_store();
+    }
+
     /// Hand a fan back to the active profile.
     pub fn unpin(&mut self, id: &str) {
         self.store.pinned.remove(id);
@@ -1928,6 +1957,44 @@ mod tests {
     }
 
     /// Pump choices belong to the hardware: switching profiles never drops them, old per-profile ones are merged.
+    #[test]
+    fn fan_presets_per_fan() {
+        let fans = demo_status(0.0).fans;
+        let pumps = BTreeMap::new();
+        // the same curve a whole-PC profile gives that fan
+        for name in BUILTIN {
+            let p = builtin_profile(name, &fans, &pumps).unwrap();
+            for f in fans.iter().filter(|f| f.controllable) {
+                assert_eq!(fan_preset(name, f, &pumps).as_ref(), p.fans.get(&f.id), "{name} {}", f.name);
+            }
+        }
+        let cpu = fans.iter().find(|f| f.name == "CPU Fan").unwrap();
+        let gpu = fans.iter().find(|f| f.gpu).unwrap();
+        let sys = fans.iter().find(|f| !f.controllable).unwrap();
+        assert_eq!(fan_preset("Silent", gpu, &pumps), None, "Silent leaves the graphics card alone");
+        assert_eq!(fan_preset("Balanced", sys, &pumps), None, "read-only fan");
+        assert_eq!(fan_preset("Turbo", cpu, &pumps), None);
+        let perf = fan_preset("Performance", cpu, &pumps).unwrap();
+        assert_eq!(preset_of(&perf, cpu, &pumps), Some("Performance"));
+        assert_eq!(preset_of(&FanSetting::Manual { percent: 50.0 }, cpu, &pumps), None);
+        assert_eq!(preset_of(&FanSetting::Bios, cpu, &pumps), None);
+
+        // moving off profiles: every fan keeps its setting as its own, no profile comes back
+        let mut f = Fan::new_with(ProfileStore::default(), true, false);
+        f.load_profile("Balanced", &fans);
+        f.apply(cpu.id.clone(), 0.0, CardAction::Set(FanSetting::Manual { percent: 45.0 }));
+        let before = normalized(&f.settings);
+        f.adopt_profile_settings();
+        assert!(f.active.is_none() && f.store.last.is_none());
+        assert_eq!(normalized(&f.settings), before);
+        assert_eq!(f.store.pinned, before, "all of them are own settings now");
+        assert_eq!(f.store.pinned.get(&cpu.id), Some(&FanSetting::Manual { percent: 45.0 }), "an own setting is not overwritten");
+        // a preset on one fan touches only that fan
+        f.apply(cpu.id.clone(), 0.0, CardAction::Set(perf.clone()));
+        assert_eq!(f.settings.get(&cpu.id), Some(&perf));
+        assert_eq!(f.settings.get(&gpu.id), before.get(&gpu.id));
+    }
+
     #[test]
     fn fan_tests_keep_their_results() {
         let mut f = Fan::new_with(ProfileStore::default(), true, false);

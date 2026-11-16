@@ -54,19 +54,15 @@
   color: var(--accent);
 }
 .gpu-tiles {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--s4);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: var(--s2) var(--s4);
 }
 .gpu-message {
   white-space: pre-wrap;
 }
 
-@media (max-width: 860px) {
-  .gpu-tiles {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
 
 /* live reading tiles: drag to reorder, cross to remove, "Add reading" */
 .gpu-tile {
@@ -115,7 +111,9 @@
   align-items: center;
   justify-content: center;
   gap: 6px;
-  min-height: 90px;
+  min-height: 0;
+  padding: var(--s2) var(--s3);
+  font-size: var(--text-sm);
   border: 1px dashed var(--separator);
   background: transparent;
   color: var(--text-secondary);
@@ -151,4 +149,49 @@
 .gpu-tiles.is-dragging,
 .gpu-tiles.is-dragging .gpu-tile {
   cursor: grabbing;
+}
+
+/* one reading in the strip: bold number, small unit, a thin bar that fills with the value */
+.gpu-tile:not(.gpu-tile-add) {
+  min-width: 96px;
+  padding: var(--s2) var(--s3) var(--s1);
+}
+.gpu-read {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  white-space: nowrap;
+}
+.gpu-read-value {
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.gpu-read-unit {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.gpu-read-bar {
+  height: 4px;
+  margin-top: 5px;
+  border-radius: 2px;
+  background: var(--fill-control);
+  overflow: hidden;
+}
+.gpu-read-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  transition: width var(--t-base) var(--ease-out);
+}
+.gpu-read-bar:empty {
+  background: transparent;
+}
+.gpu-read-label {
+  margin-top: 3px;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  white-space: nowrap;
 }

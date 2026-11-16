@@ -71,21 +71,24 @@ impl GpuTab {
         if let Some(l) = live.filter(|l| l.full_clocks) {
             chips.push(json!({ "text": format!("Memory {} MHz ({:+} over stock {})", l.mem, l.mem_offset, l.mem_stock), "tone": pctuner_core::common::Tone::Dim }));
         }
-        let series = |f: &dyn Fn(&Live) -> f64| -> Vec<f64> { self.g.history.iter().map(f).collect() };
-        // every reading the page can show as a tile (the page keeps which ones and their order)
+        // every reading the page can show (the page keeps which ones and their order): the text as shown, and
+        // value / max for the bar under it (no max = no bar)
+        let power_max = s.limits.map(|l| (l.power_default_w * s.power_pct.unwrap_or(100) / 100) as f64);
+        let clock_max = s.limits.map(|l| l.clock.1 as f64);
         let live = live.map(|l| {
-            let tile = |key: &str, label: &str, unit: &str, value: Option<f64>, sub: Option<String>, f: &dyn Fn(&Live) -> f64| {
-                json!({ "key": key, "label": label, "unit": unit, "value": value, "sub": sub, "hist": series(f) })
+            let tile = |key: &str, label: &str, unit: &str, text: String, value: Option<f64>, max: Option<f64>| {
+                json!({ "key": key, "label": label, "unit": unit, "text": text, "value": value, "max": max })
             };
+            let whole = |v: f64| format!("{v:.0}");
             json!([
-                tile("core", "Core clock", "MHz", Some(l.core as f64), None, &|l| l.core as f64),
-                tile("temp", "Temperature", "°C", Some(l.temp as f64), None, &|l| l.temp as f64),
-                tile("power", "Power draw", "W", Some(l.power), None, &|l| l.power),
-                tile("util", "GPU load", "%", Some(l.util as f64), None, &|l| l.util as f64),
-                tile("volt", "Core voltage", "mV", l.volt_mv, None, &|l| l.volt_mv.unwrap_or(0.0)),
-                tile("vram", "Memory used", "MB", Some(l.vram_used_mb as f64), (l.vram_total_mb > 0).then(|| format!("of {} MB", l.vram_total_mb)), &|l| l.vram_used_mb as f64),
-                tile("memclock", "Memory clock", "MHz", Some(l.mem as f64), None, &|l| l.mem as f64),
-                tile("fan", "Fan speed", "%", Some(l.fan_pct as f64), None, &|l| l.fan_pct as f64),
+                tile("temp", "Temperature", "°C", whole(l.temp as f64), Some(l.temp as f64), Some(100.0)),
+                tile("volt", "Core voltage", "V", l.volt_mv.map(|v| format!("{:.2}", v / 1000.0)).unwrap_or_else(|| "-".into()), l.volt_mv, None),
+                tile("power", "Power draw", "W", format!("{:.1}", l.power), Some(l.power), power_max),
+                tile("util", "GPU load", "%", whole(l.util as f64), Some(l.util as f64), Some(100.0)),
+                tile("core", "Core clock", "MHz", whole(l.core as f64), Some(l.core as f64), clock_max),
+                tile("vram", "Memory used", "MB", whole(l.vram_used_mb as f64), Some(l.vram_used_mb as f64), (l.vram_total_mb > 0).then_some(l.vram_total_mb as f64)),
+                tile("memclock", "Memory clock", "MHz", whole(l.mem as f64), Some(l.mem as f64), None),
+                tile("fan", "Fan speed", "%", whole(l.fan_pct as f64), Some(l.fan_pct as f64), Some(100.0)),
             ])
         });
         json!({ "name": name, "unit": unit, "caption": caption, "tone": tone, "chips": chips, "error": s.error, "live": live })
