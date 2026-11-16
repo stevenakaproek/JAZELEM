@@ -1,6 +1,7 @@
 //! PC Tuner core: all tuning logic, state and background work, with no UI types.
 //! The egui app (pctuner-egui) and the Tauri app are thin layers on top of this crate.
 
+pub mod bloat;
 pub mod common;
 pub mod defender;
 pub mod network;
