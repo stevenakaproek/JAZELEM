@@ -23,7 +23,13 @@ pub struct OptimizeTab {
 
 impl OptimizeTab {
     pub fn new() -> Self {
-        OptimizeTab { perf: crate::perf::PerfTab::new(), network: crate::network::NetworkTab::new(), tweaks: crate::tweaks::TweaksTab::new(), part: Part::Performance }
+        // PCTUNER_PART=network|windows opens on that part (self-test screenshots of each part)
+        let part = match std::env::var("PCTUNER_PART").unwrap_or_default().to_ascii_lowercase().as_str() {
+            "network" => Part::Network,
+            "windows" => Part::Windows,
+            _ => Part::Performance,
+        };
+        OptimizeTab { perf: crate::perf::PerfTab::new(), network: crate::network::NetworkTab::new(), tweaks: crate::tweaks::TweaksTab::new(), part }
     }
 
     fn get(&mut self, p: Part) -> &mut dyn Tab {

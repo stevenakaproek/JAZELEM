@@ -3,6 +3,7 @@
 
 pub mod common;
 pub mod defender;
+pub mod network;
 pub mod opwin;
 pub mod perf;
 pub mod ramled;
