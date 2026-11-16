@@ -6,6 +6,7 @@ import { runSelftest } from "./lib/selftest";
 import { ShellProvider, useShell } from "./lib/shell";
 import { TABS } from "./tabs";
 import { PowerSheet } from "./tabs/Power";
+import { TelemetryBand } from "./components/TelemetryBand";
 
 /** "#fan" in the address opens that tab (used for screenshots). */
 function initialTab(): string {
@@ -46,6 +47,8 @@ function Frame() {
   const Page = tab.page;
 
   return (
+    <div className="app-frame">
+      <TelemetryBand />
     <div className="app">
       <aside className="sidebar">
         <div className="brand">
@@ -132,6 +135,7 @@ function Frame() {
           }
         />
       )}
+    </div>
     </div>
   );
 }

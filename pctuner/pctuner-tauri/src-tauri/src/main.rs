@@ -7,6 +7,7 @@
 mod backend;
 mod shell;
 mod tabs;
+mod telemetry;
 
 use pctuner_core::common;
 use shell::Shell;
@@ -30,7 +31,7 @@ fn main() {
 
     let app = tauri::Builder::default()
         .manage(Shell::new())
-        .invoke_handler(tauri::generate_handler![shell::tab_state, shell::tab_action, shell::shell_info, shell::shell_action])
+        .invoke_handler(tauri::generate_handler![shell::tab_state, shell::tab_action, shell::shell_info, shell::shell_action, telemetry::telemetry])
         .setup(|app| {
             let handle = app.handle().clone();
             // no tray icon during self-tests
@@ -38,6 +39,7 @@ fn main() {
                 shell::create_tray(&handle)?;
             }
             shell::open_window(&handle)?;
+            telemetry::start(handle.clone());
             shell::start_pump(handle);
             Ok(())
         })

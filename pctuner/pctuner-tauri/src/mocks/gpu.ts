@@ -1,4 +1,4 @@
-import type { Action, GpuCustom, GpuTile, GpuTrial, View } from "../tabs/Gpu";
+import type { Action, GpuCustom, GpuTrial, View } from "../tabs/Gpu";
 import { mockAdmin, mockParams } from "./env";
 import { MockOp, makeOp, opItem } from "./op";
 import type { MockTab } from "./types";
@@ -41,20 +41,6 @@ function sample() {
 }
 for (let i = 0; i < 40; i++) sample();
 
-function live(): GpuTile[] {
-  const l = hist[hist.length - 1];
-  const tile = (key: keyof Sample, label: string, unit: string, max: number | null, digits = 0, scale = 1): GpuTile => ({ key, label, unit, text: (l[key] * scale).toFixed(digits), value: l[key], max });
-  return [
-    tile("temp", "Temperature", "°C", 100),
-    tile("volt", "Core voltage", "V", null, 2, 0.001),
-    tile("power", "Power draw", "W", (360 * powerPct) / 100, 1),
-    tile("util", "GPU load", "%", 100),
-    tile("core", "Core clock", "MHz", 3210),
-    tile("vram", "Memory used", "MB", 16303),
-    tile("memclock", "Memory clock", "MHz", null),
-    tile("fan", "Fan speed", "%", 100),
-  ];
-}
 
 function tuning(i: number) {
   return i === CUSTOM ? { max: custom.maxMhz, core: custom.core, mem: custom.mem, power: custom.power } : { ...PRESETS[i] };
@@ -132,7 +118,7 @@ export const gpu: MockTab<View, Action> = {
         state === "loading"
           ? null
           : noDriver
-            ? { name: "Unknown", unit: "", caption: "The GPU could not be read through the NVIDIA driver.", tone: "Off", chips: [{ text: "The NVIDIA driver could not be read", tone: "Off" }], error: "The NVIDIA driver's management library (nvml.dll) was not found - is the NVIDIA driver installed?", live: null }
+            ? { name: "Unknown", unit: "", caption: "The GPU could not be read through the NVIDIA driver.", tone: "Off", chips: [{ text: "The NVIDIA driver could not be read", tone: "Off" }], error: "The NVIDIA driver's management library (nvml.dll) was not found - is the NVIDIA driver installed?" }
             : {
                 name: name(current),
                 unit: current === CUSTOM ? "settings" : "preset",
@@ -143,7 +129,6 @@ export const gpu: MockTab<View, Action> = {
                   { text: `Memory ${15001 + (cur?.mem ?? 0)} MHz (+${cur?.mem ?? 0} over stock 15001)`, tone: "Dim" },
                 ],
                 error: null,
-                live: live(),
               },
       canReset: !busy,
       presets: PRESETS.map((p, index) => ({

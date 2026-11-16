@@ -18,6 +18,7 @@ pub mod ramled;
 pub mod scheduler;
 pub mod services;
 pub mod startup;
+pub mod sysinfo;
 pub mod svcbackup;
 pub mod tweaks;
 pub mod usb;

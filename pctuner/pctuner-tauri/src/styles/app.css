@@ -103,10 +103,16 @@ textarea {
 
 /* ---------- layout ---------- */
 
+.app-frame {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
 .app {
   display: grid;
   grid-template-columns: var(--sidebar-width) 1fr;
-  height: 100%;
+  flex: 1;
+  min-height: 0;
 }
 
 .sidebar {
@@ -1499,3 +1505,79 @@ html.tauri .sidebar {
   font-weight: 600;
 }
 .fan-presets { gap: 6px; flex-wrap: wrap; }
+
+/* ---------- telemetry band: across the top of the app, on every tab ---------- */
+
+.tele-band {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  flex-shrink: 0;
+  min-height: 62px;
+  padding: var(--s2) var(--s4);
+  row-gap: var(--s2);
+  background: var(--bg-elevated);
+  border-bottom: 0.5px solid var(--separator);
+  user-select: none;
+}
+.tele-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 0 var(--s5);
+  border-left: 0.5px solid var(--separator);
+}
+.tele-group:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+.tele-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--text-base);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.tele-name svg {
+  color: var(--text-secondary);
+}
+.tele-items {
+  display: flex;
+  gap: var(--s4);
+}
+.tele-item {
+  min-width: 58px;
+}
+.tele-read {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+}
+.tele-value {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.tele-unit {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+}
+.tele-bar {
+  height: 3px;
+  margin-top: 3px;
+  border-radius: 2px;
+  background: var(--fill-control);
+  overflow: hidden;
+}
+.tele-bar:empty {
+  background: transparent;
+}
+.tele-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  transition: width var(--t-base) var(--ease-out);
+}

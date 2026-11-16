@@ -1,9 +1,8 @@
 // Fan Tuner: live speeds and temperatures, and each fan's BIOS / Manual / Curve / Trigger setting.
 import { ChevronRight, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Badge, Banner, Button, ErrorState, Group, Hero, LoadingState, NumberField, Page, Progress, Segmented, Slider, Sparkline, Stat, Switch, ToneBadge, cx } from "../components/ui";
+import { Badge, Banner, Button, ErrorState, Group, LoadingState, NumberField, Page, Progress, Segmented, Slider, Sparkline, Stat, Switch, ToneBadge, cx } from "../components/ui";
 import type { Tone } from "../lib/types";
-import { toneClass } from "../lib/types";
 import { useTab } from "../lib/useTab";
 import { CurveEditor, TriggerEditor, type GraphLimits } from "./FanGraphs";
 
@@ -51,11 +50,6 @@ export interface FanTools {
   canTest: boolean;
 }
 
-interface Temp {
-  value: number;
-  tone: Tone;
-}
-
 export interface FanView {
   can: boolean;
   viewOnly: boolean;
@@ -70,16 +64,10 @@ export interface FanView {
     emergency: boolean;
     blind: boolean;
     msg: { seq: number; text: string } | null;
-    hottest: (Temp & { which: string }) | null;
-    cpu: Temp | null;
-    gpu: Temp | null;
     fansFound: number;
     controllable: number;
-    cpuHist: number[];
-    gpuHist: number[];
     fans: FanCardView[];
     empty: FanCardView[];
-    temps: { hw: string; name: string; value: number; tone: Tone }[];
   };
 }
 
@@ -101,8 +89,6 @@ export type FanAction =
 
 type Act = (a: FanAction) => Promise<void>;
 
-const toneVar: Record<Tone, string> = { Ok: "var(--green)", Accent: "var(--accent)", Text: "var(--text)", Dim: "var(--text-secondary)", Faint: "var(--text-tertiary)", Off: "var(--text-tertiary)", Warn: "var(--yellow)", Junk: "var(--orange)", Error: "var(--red)" };
-const deg = (t: Temp | null) => (t ? `${t.value.toFixed(0)} °C` : "-");
 
 const MODES: { value: FanSetting["mode"]; label: string; tip: string }[] = [
   { value: "bios", label: "BIOS", tip: "Hands off: the BIOS (or graphics driver) curve decides." },
@@ -352,31 +338,6 @@ function Body({ view, act }: { view: FanView; act: Act }) {
         </Banner>
       )}
       {s.emergency && <Banner kind="error">Over 90 °C - every controlled fan is at 100 % until the CPU and GPU are back under 80 °C.</Banner>}
-      <Group padded>
-        <div className="stack" style={{ gap: 14 }}>
-          <div className="hstack hero-row">
-            {s.hottest ? (
-              <Hero value={`${s.hottest.value.toFixed(0)} °C`} unit="hottest" caption={`${s.hottest.which} is the warmest right now - 90 °C sends every fan to 100 %`} tone={s.hottest.tone} />
-            ) : (
-              <Hero value="-" unit="no temperature" caption="CPU and GPU temperatures could not be read" tone="Dim" />
-            )}
-            <Stat value={deg(s.cpu)} label="CPU" tone={s.cpu?.tone ?? "Dim"} />
-            <Stat value={deg(s.gpu)} label="GPU" tone={s.gpu?.tone ?? "Dim"} />
-            <Stat value={s.fansFound} label="fans found" />
-            <Stat value={s.controllable} label="can be controlled" />
-          </div>
-          <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-            <div>
-              <div className="stat-label">CPU temperature</div>
-              <Sparkline values={s.cpuHist} color={toneVar[s.cpu?.tone ?? "Accent"]} />
-            </div>
-            <div>
-              <div className="stat-label">GPU temperature</div>
-              <Sparkline values={s.gpuHist} color={toneVar[s.gpu?.tone ?? "Accent"]} />
-            </div>
-          </div>
-        </div>
-      </Group>
       {view.note && <div className="secondary selectable">{view.note}</div>}
       <section className="group-wrap">
         <div className="group-title">
@@ -413,17 +374,7 @@ function Body({ view, act }: { view: FanView; act: Act }) {
           </>
         )}
       </section>
-      <Group title="Temperatures" footer="Sensors: LibreHardwareMonitor with the PawnIO driver, updated every second. Speeds go as low as you set them; at 90 °C every controlled fan goes to 100 %.">
-        {s.temps.map((t, i) => (
-          <div className="row" key={i} style={{ minHeight: 34, padding: "6px var(--s4)" }}>
-            <span className="secondary" style={{ width: 220, flexShrink: 0 }}>
-              {t.hw}
-            </span>
-            <span className="row-main">{t.name}</span>
-            <strong className={toneClass(t.tone)}>{t.value.toFixed(0)} °C</strong>
-          </div>
-        ))}
-      </Group>
+      <div className="group-footer">{s.fansFound} fans found, {s.controllable} can be controlled. Speeds go as low as you set them; at 90 °C every controlled fan goes to 100 %. Temperatures are in the band at the top.</div>
     </>
   );
 }

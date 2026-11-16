@@ -128,3 +128,48 @@ export function onShell(cb: (info: ShellInfo) => void): Unlisten {
     off?.();
   };
 }
+
+/** One reading of the telemetry band: the text as shown, and value / max for its bar (no max = no bar). */
+export interface TeleItem {
+  key: string;
+  label: string;
+  unit: string;
+  text: string;
+  value: number | null;
+  max: number | null;
+}
+
+export interface Telemetry {
+  groups: { kind: "cpu" | "memory" | "gpu"; name: string; items: TeleItem[] }[];
+}
+
+/** Live readings for the band at the top of the app, about once a second. */
+export function onTelemetry(cb: (t: Telemetry) => void): Unlisten {
+  if (!inTauri) {
+    let stop = false;
+    void import("../mocks/telemetry").then((m) => {
+      const tick = () => !stop && cb(m.sample());
+      tick();
+      const id = setInterval(tick, 1000);
+      off = () => clearInterval(id);
+    });
+    let off: Unlisten = () => {};
+    return () => {
+      stop = true;
+      off();
+    };
+  }
+  let off: Unlisten | null = null;
+  let cancelled = false;
+  void import("@tauri-apps/api/core").then(({ invoke }) => invoke<Telemetry | null>("telemetry").then((t) => t && !cancelled && cb(t)));
+  void import("@tauri-apps/api/event").then(({ listen }) =>
+    listen<Telemetry>("telemetry", (e) => cb(e.payload)).then((u) => {
+      if (cancelled) u();
+      else off = u;
+    }),
+  );
+  return () => {
+    cancelled = true;
+    off?.();
+  };
+}

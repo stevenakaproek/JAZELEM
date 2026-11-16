@@ -47,6 +47,26 @@ pub struct FanInfo {
     pub rpm_id: String,
 }
 
+/// The helper's newest status line, for readers outside the Fan Tuner page (the telemetry band).
+static LATEST: Mutex<Option<(Status, Instant)>> = Mutex::new(None);
+
+/// The newest status when it is fresh (the helper sends one a second); None when the helper is not running.
+pub fn latest_status() -> Option<Status> {
+    let l = LATEST.lock().ok()?;
+    l.as_ref().filter(|(_, at)| at.elapsed() < STALE_AFTER).map(|(s, _)| s.clone())
+}
+
+/// The processor as the helper reads it: core voltage (V), package power (W), total load (%), highest core clock (MHz).
+#[derive(Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default)]
+pub struct CpuInfo {
+    pub name: String,
+    pub volt: Option<f32>,
+    pub power: Option<f32>,
+    pub load: Option<f32>,
+    pub clock: Option<f32>,
+}
+
 /// One fan speed sensor (every one the helper sees, paired or not).
 #[derive(Deserialize, Serialize, Clone, Default, Debug, PartialEq)]
 #[serde(default)]
@@ -132,6 +152,9 @@ pub struct Status {
     pub msg_seq: u64,
     pub fans: Vec<FanInfo>,
     pub temps: Vec<TempInfo>,
+    /// The processor's own readings (for the telemetry band).
+    #[serde(rename = "cpuInfo")]
+    pub cpu_info: Option<CpuInfo>,
     /// Every fan speed sensor (for pairing).
     pub rpms: Vec<RpmInfo>,
     pub job: Option<JobInfo>,
@@ -647,6 +670,9 @@ pub fn gone_message(stuck: bool, tail: &str) -> String {
 impl Shared {
     /// Forget the live data (the helper is gone for good).
     pub fn clear(&mut self) {
+        if let Ok(mut l) = LATEST.lock() {
+            *l = None;
+        }
         self.status = None;
         self.rpm.clear();
         self.cpu.clear();
@@ -656,6 +682,9 @@ impl Shared {
 
     pub fn take_status(&mut self, s: Status) {
         self.last = Some(Instant::now());
+        if let Ok(mut l) = LATEST.lock() {
+            *l = Some((s.clone(), Instant::now()));
+        }
         for f in &s.fans {
             if let Some(r) = f.rpm {
                 push(self.rpm.entry(f.id.clone()).or_default(), r);
@@ -940,6 +969,7 @@ pub fn demo_status(t: f64) -> Status {
             .map(|(id, name, rpm)| RpmInfo { id: (*id).into(), hw: board.into(), name: (*name).into(), rpm: Some(*rpm) })
             .collect(),
         job: None,
+        cpu_info: None,
         temps: vec![
             TempInfo { id: "c".into(), hw: "AMD Ryzen 7 9800X3D".into(), kind: "Cpu".into(), name: "Core (Tctl/Tdie)".into(), value: Some(cpu) },
             TempInfo { id: "g".into(), hw: "NVIDIA GeForce RTX 5080".into(), kind: "GpuNvidia".into(), name: "GPU Core".into(), value: Some(gpu) },
@@ -2036,6 +2066,9 @@ mod tests {
         // the helper's status line
         let s = parse_status(r#"{"fans":[{"id":"a","rpmId":"s1"}],"rpms":[{"id":"s1","hw":"x","name":"Fan #1","rpm":800}],"job":{"seq":4,"kind":"pair","id":"a","step":1,"steps":2,"duty":100,"done":false,"error":"","paired":"","start":null,"stop":null,"max":null,"points":[]}}"#).unwrap();
         assert_eq!((s.fans[0].rpm_id.as_str(), s.rpms[0].rpm, s.job.as_ref().map(|j| j.duty)), ("s1", Some(800.0), Some(Some(100.0))));
+        assert_eq!(s.cpu_info, None, "older helpers send no cpuInfo");
+        let c = parse_status(r#"{"cpu":51.3,"cpuInfo":{"name":"AMD Ryzen 7 9800X3D","volt":1.262,"power":64.8,"load":19.1,"clock":3778}}"#).unwrap().cpu_info.unwrap();
+        assert_eq!((c.name.as_str(), c.volt, c.power, c.load, c.clock), ("AMD Ryzen 7 9800X3D", Some(1.262), Some(64.8), Some(19.1), Some(3778.0)));
     }
 
     #[test]

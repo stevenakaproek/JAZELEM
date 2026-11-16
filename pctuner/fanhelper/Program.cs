@@ -888,6 +888,23 @@ namespace PCTunerFan
             return b.ToString();
         }
 
+        /// <summary>The processor's name, core voltage, package power, total load and highest core clock, for PC Tuner's
+        /// telemetry band (read-only; null values when a sensor is missing).</summary>
+        static string CpuJson()
+        {
+            var h = AllHardware().FirstOrDefault(x => x.HardwareType == HardwareType.Cpu);
+            if (h == null) return "null";
+            float? One(SensorType t, Func<ISensor, bool> pick) => h.Sensors.Where(s => s.SensorType == t && s.Value.HasValue && pick(s)).Select(s => s.Value).FirstOrDefault();
+            float? volt = One(SensorType.Voltage, s => s.Name.Contains("Core") && !s.Name.Contains("#")) ?? One(SensorType.Voltage, s => s.Name.Contains("Core") || s.Name.Contains("VID"));
+            float? power = One(SensorType.Power, s => s.Name.Contains("Package"));
+            float? load = One(SensorType.Load, s => s.Name == "CPU Total");
+            var clocks = h.Sensors.Where(s => s.SensorType == SensorType.Clock && s.Value.HasValue && !s.Name.Contains("Bus")).Select(s => s.Value.Value).ToList();
+            float? clock = clocks.Count > 0 ? clocks.Max() : (float?)null;
+            return "{\"name\":" + Str(h.Name) + ",\"volt\":" + Num3(volt) + ",\"power\":" + Num(power) + ",\"load\":" + Num(load) + ",\"clock\":" + Num(clock) + "}";
+        }
+
+        static string Num3(float? v) => v.HasValue && !float.IsNaN(v.Value) && !float.IsInfinity(v.Value) ? v.Value.ToString("0.###", CultureInfo.InvariantCulture) : "null";
+
         static string Status(float? cpu, float? gpu)
         {
             var b = new StringBuilder();
@@ -919,7 +936,8 @@ namespace PCTunerFan
                  .Append(",\"curve\":").Append(ctl.HasCurve(f.Id) ? "true" : "false")
                  .Append('}');
             }
-            b.Append("],\"rpms\":[");
+            b.Append("],\"cpuInfo\":").Append(CpuJson());
+            b.Append(",\"rpms\":[");
             first = true;
             foreach (var h in AllHardware())
                 foreach (var s in h.Sensors.Where(x => x.SensorType == SensorType.Fan))

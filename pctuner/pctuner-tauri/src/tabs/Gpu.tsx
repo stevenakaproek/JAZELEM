@@ -1,9 +1,9 @@
 // RTX 5080 Profiles: which tune is applied right now (with live graphs), the four presets, custom values and
 // the safety trial. Everything is set straight through the NVIDIA driver - no MSI Afterburner needed.
-import { Plus, RefreshCw, RotateCcw, SlidersHorizontal, X } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { RefreshCw, RotateCcw, SlidersHorizontal, X } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 import { OpSheet } from "../components/OpSheet";
-import { Badge, Banner, Button, ContextMenu, ErrorState, Group, Hero, LoadingState, NumberField, Page, Sheet, Slider, Spinner, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
+import { Badge, Banner, Button, ErrorState, Group, Hero, LoadingState, NumberField, Page, Sheet, Slider, Spinner, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow, Tone } from "../lib/types";
 import { useTab } from "../lib/useTab";
@@ -16,18 +16,6 @@ export type GpuTrial =
   | { kind: "pending"; preset: string; previous: string; appliedAt: string; unguarded: boolean; canKeep: boolean; canRevert: boolean }
   | { kind: "reverted"; preset: string; text: string; reason: string; lastError: string };
 
-/** One live reading, shown as a tile (the page keeps which ones and their order). */
-export interface GpuTile {
-  key: string;
-  label: string;
-  unit: string;
-  /** the value as shown ("62.5", "1.01") */
-  text: string;
-  value: number | null;
-  /** the value that fills the bar (null: no bar) */
-  max: number | null;
-}
-
 export interface GpuHero {
   name: string;
   unit: string;
@@ -36,7 +24,6 @@ export interface GpuHero {
   chips: { text: string; tone: Tone }[];
   /** the NVIDIA driver could not be read */
   error: string | null;
-  live: GpuTile[] | null;
 }
 
 export interface GpuPreset {
@@ -135,125 +122,6 @@ function TrialNotice({ t, act }: { t: GpuTrial; act: Act }) {
   );
 }
 
-const TILE_KEY = "pctuner.gpu.tiles";
-const DEFAULT_TILES = ["temp", "volt", "power", "util", "core", "vram"];
-
-/** Bar colour per reading: temperature goes green, orange, red as it rises. */
-function barColor(t: GpuTile): string {
-  if (t.key === "temp") return (t.value ?? 0) >= 85 ? "var(--red)" : (t.value ?? 0) >= 70 ? "var(--orange)" : "var(--green)";
-  if (t.key === "power") return "color-mix(in srgb, var(--green), var(--yellow))";
-  if (t.key === "vram") return "var(--green)";
-  return "var(--accent)";
-}
-
-function loadTiles(): string[] {
-  try {
-    const v = JSON.parse(localStorage.getItem(TILE_KEY) ?? "null");
-    if (Array.isArray(v) && v.every((x) => typeof x === "string")) return v;
-  } catch {
-    // no saved layout (or storage blocked): the default
-  }
-  return DEFAULT_TILES;
-}
-
-function saveTiles(keys: string[]) {
-  try {
-    localStorage.setItem(TILE_KEY, JSON.stringify(keys));
-  } catch {
-    // the layout just is not remembered
-  }
-}
-
-/** Live readings as one compact strip (number, unit, a thin bar): drag a reading to move it, the cross removes it, "Add" brings one back. */
-function TelemetryTiles({ tiles }: { tiles: GpuTile[] }) {
-  const [order, setOrder] = useState<string[]>(loadTiles);
-  const [dragging, setDragging] = useState<string | null>(null);
-  const [over, setOver] = useState<string | null>(null);
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-  const byKey = new Map(tiles.map((t) => [t.key, t]));
-  const shown = order.filter((k) => byKey.has(k));
-  const hidden = tiles.filter((t) => !shown.includes(t.key));
-  const update = (next: string[]) => {
-    setOrder(next);
-    saveTiles(next);
-  };
-  const moveTo = (key: string, target: string) => {
-    if (key === target) return;
-    const next = shown.filter((k) => k !== key);
-    next.splice(next.indexOf(target), 0, key);
-    update(next);
-  };
-  // Dragging is done with pointer events: the browser's own drag and drop never reaches the page inside
-  // the app window (the window takes it for file drops). A press only becomes a drag after 5 px.
-  const press = useRef<{ key: string; x: number; y: number; active: boolean } | null>(null);
-  const tileAt = (x: number, y: number) => document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-tile]")?.dataset.tile ?? null;
-  const end = () => {
-    press.current = null;
-    setDragging(null);
-    setOver(null);
-  };
-  useEffect(() => {
-    if (!dragging) return;
-    const key = (e: KeyboardEvent) => e.key === "Escape" && end();
-    window.addEventListener("keydown", key);
-    return () => window.removeEventListener("keydown", key);
-  }, [dragging]);
-  return (
-    <div className={cx("gpu-tiles", dragging && "is-dragging")}>
-      {shown.map((k) => {
-        const t = byKey.get(k)!;
-        return (
-          <div
-            key={k}
-            data-tile={k}
-            className={cx("gpu-tile", dragging === k && "dragging", over === k && dragging !== k && "drop-target")}
-            title={`${t.label} - drag to move`}
-            onPointerDown={(e) => {
-              if (e.button !== 0 || (e.target as HTMLElement).closest(".gpu-tile-remove")) return;
-              press.current = { key: k, x: e.clientX, y: e.clientY, active: false };
-              e.currentTarget.setPointerCapture(e.pointerId);
-            }}
-            onPointerMove={(e) => {
-              const p = press.current;
-              if (!p) return;
-              if (!p.active && Math.hypot(e.clientX - p.x, e.clientY - p.y) < 5) return;
-              if (!p.active) {
-                p.active = true;
-                setDragging(p.key);
-              }
-              setOver(tileAt(e.clientX, e.clientY));
-            }}
-            onPointerUp={(e) => {
-              const p = press.current;
-              const target = p?.active ? tileAt(e.clientX, e.clientY) : null;
-              end();
-              if (p && target) moveTo(p.key, target);
-            }}
-            onPointerCancel={end}
-          >
-            <button type="button" className="gpu-tile-remove" title={`Remove ${t.label}`} aria-label={`Remove ${t.label}`} onClick={() => update(shown.filter((x) => x !== k))}>
-              <X size={12} />
-            </button>
-            <div className="gpu-read">
-              <span className="gpu-read-value">{t.text}</span>
-              <span className="gpu-read-unit">{t.unit}</span>
-            </div>
-            <div className="gpu-read-bar" aria-hidden>{t.max !== null && t.value !== null && <span style={{ width: `${Math.min(100, Math.max(0, (t.value / t.max) * 100))}%`, background: barColor(t) }} />}</div>
-            <div className="gpu-read-label">{t.label}</div>
-          </div>
-        );
-      })}
-      {hidden.length > 0 && (
-        <button type="button" className="gpu-tile gpu-tile-add" onClick={(e) => setMenu({ x: e.clientX, y: e.clientY })}>
-          <Plus size={16} />
-          Add reading
-        </button>
-      )}
-      {menu && <ContextMenu x={menu.x} y={menu.y} items={hidden.map((t) => ({ label: t.label, onClick: () => update([...shown, t.key]) }))} onClose={() => setMenu(null)} />}
-    </div>
-  );
-}
-
 /** Power limit, on its own: set at once for whatever tune is on, and kept after restarts. */
 function PowerSlider({ p, act }: { p: NonNullable<View["power"]>; act: Act }) {
   const [v, setV] = useState(p.pct);
@@ -311,7 +179,6 @@ function HeroCard({ view, act }: { view: View; act: Act }) {
           ))}
         </div>
         {h.error && <Banner kind="error">{h.error}</Banner>}
-        {h.live && <TelemetryTiles tiles={h.live} />}
         {view.power && <PowerSlider p={view.power} act={act} />}
       </div>
     </Group>

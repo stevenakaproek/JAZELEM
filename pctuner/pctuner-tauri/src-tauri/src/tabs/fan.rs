@@ -38,18 +38,16 @@ fn hist(h: Option<&VecDeque<f32>>) -> Vec<f32> {
     h.map(|h| h.iter().copied().collect()).unwrap_or_default()
 }
 
-fn temp(v: Option<f32>) -> Value {
-    match v {
-        Some(t) => json!({ "value": t, "tone": temp_color(t) }),
-        None => Value::Null,
-    }
-}
-
 impl FanTab {
     pub fn new() -> Self {
         let mut fan = Fan::new();
         // presets are set per fan here: fans that followed a profile keep their setting as their own
         fan.adopt_profile_settings();
+        // the telemetry band shows the CPU at all times: as administrator the helper starts with the app (it only
+        // reads sensors until a fan is set)
+        if common::is_admin() {
+            fan.ensure_started();
+        }
         FanTab { e: FanEngine::new(fan) }
     }
 
@@ -162,7 +160,7 @@ impl Backend for FanTab {
         // the page is open: start the helper the first time (view-only shows the graphics card)
         f.ensure_started();
         let can = f.can();
-        let (status, rpm_hist, cpu_hist, gpu_hist, stale_for) = f.snapshot();
+        let (status, rpm_hist, _, _, stale_for) = f.snapshot();
         let (helper_gone, stuck) = (f.helper_is_gone(), f.fans_stuck());
         let sources: Vec<Value> = [Source::Cpu, Source::Gpu, Source::Hottest].iter().map(|s| json!({ "key": s, "label": s.label() })).collect();
         let mut v = json!({
@@ -189,8 +187,6 @@ impl Backend for FanTab {
             }
             return v;
         };
-        let hottest = s.cpu.into_iter().chain(s.gpu).fold(f32::NAN, f32::max);
-        let which = if s.gpu.unwrap_or(f32::MIN) >= s.cpu.unwrap_or(f32::MIN) { "GPU" } else { "CPU" };
         // headers that have never spun (nothing plugged in) go into a folded group at the end
         let (shown, empty): (Vec<&FanInfo>, Vec<&FanInfo>) = s.fans.iter().partition(|x| {
             x.gpu
@@ -203,16 +199,10 @@ impl Backend for FanTab {
             "emergency": s.emergency,
             "blind": s.blind,
             "msg": if !s.msg.is_empty() && s.msg_seq != f.msg_dismissed { json!({ "seq": s.msg_seq, "text": s.msg }) } else { Value::Null },
-            "hottest": if hottest.is_nan() { Value::Null } else { json!({ "value": hottest, "which": which, "tone": temp_color(hottest) }) },
-            "cpu": temp(s.cpu),
-            "gpu": temp(s.gpu),
             "fansFound": s.fans.len(),
             "controllable": s.fans.iter().filter(|x| x.controllable).count(),
-            "cpuHist": hist(Some(&cpu_hist)),
-            "gpuHist": hist(Some(&gpu_hist)),
             "fans": cards(&shown),
             "empty": cards(&empty),
-            "temps": s.temps.iter().map(|t| { let val = t.value.unwrap_or(0.0); json!({ "hw": t.hw, "name": t.name, "value": val, "tone": temp_color(val) }) }).collect::<Vec<_>>(),
         });
         v
     }
