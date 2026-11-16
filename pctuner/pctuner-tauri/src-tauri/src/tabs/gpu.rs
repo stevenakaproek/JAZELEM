@@ -136,9 +136,9 @@ impl Backend for GpuTab {
                 let detail = if i == 0 {
                     "no offsets, no clock limit".to_string()
                 } else if lifts.len() == PRESETS.len() {
-                    format!("max {} MHz · core {:+} · memory +{}", p.target_mhz, lifts[i], p.mem)
+                    format!("{} mV · max {} MHz · core {:+} · power {} %", p.target_mv, p.target_mhz, lifts[i], p.power)
                 } else {
-                    format!("max {} MHz · memory +{}", p.target_mhz, p.mem)
+                    format!("{} mV · max {} MHz · power {} %", p.target_mv, p.target_mhz, p.power)
                 };
                 json!({
                     "index": i,

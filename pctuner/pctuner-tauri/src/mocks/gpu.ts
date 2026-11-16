@@ -5,26 +5,28 @@ import type { MockTab } from "./types";
 
 // this RTX 5080: core offsets worked out from its own curve
 const PRESETS = [
-  { name: "Stock", max: 0, core: 0, mem: 0, text: "Factory behaviour - no undervolt, no memory overclock. Use this to reset or to compare." },
-  { name: "Efficiency", max: 2700, core: 135, mem: 1000, text: "Coolest and quietest. 2700 MHz at 900 mV, memory +1000." },
-  { name: "Balanced", max: 2800, core: 138, mem: 1500, text: "Everyday gaming. 2800 MHz at 925 mV, memory +1500." },
-  { name: "Performance", max: 2900, core: 148, mem: 2000, text: "Most fps. 2900 MHz at 950 mV, memory +2000. Runs warmest of the three undervolts." },
+  { name: "Stock", mv: 0, max: 0, core: 0, mem: 0, power: 100, text: "Factory behaviour - no undervolt, no memory overclock. Use this to reset or to compare." },
+  { name: "Eco", mv: 850, max: 2650, core: 288, mem: 0, power: 88, text: "Coolest and quietest. 2650 MHz at 850 mV, power limit 88 %." },
+  { name: "MFG", mv: 850, max: 2650, core: 288, mem: 0, power: 100, text: "For DLSS Multi Frame Generation. The Eco curve (2650 MHz at 850 mV) with the full power limit." },
+  { name: "Balanced", mv: 900, max: 2750, core: 185, mem: 0, power: 90, text: "Everyday gaming. 2750 MHz at 900 mV, power limit 90 %." },
+  { name: "Performance", mv: 925, max: 2980, core: 318, mem: 0, power: 100, text: "High fps. 2980 MHz at 925 mV, full power limit." },
+  { name: "Max", mv: 975, max: 3150, core: 330, mem: 0, power: 100, text: "Most fps. 3150 MHz at 975 mV, full power limit. Runs warmest of the undervolts." },
 ];
-const CUSTOM = 4;
+const CUSTOM = 6;
 const name = (i: number) => (i === CUSTOM ? "Custom" : PRESETS[i].name);
 
 // "?state=trial | unguarded | reverted | loading | error | afterburner | nodriver" shows the other faces of the tab
 const state = mockParams.get("state");
 const op = new MockOp();
-let current = state === "nodriver" ? -1 : 2;
-let confirmed = "Balanced";
-let selected: number | null = 2;
+let current = state === "nodriver" ? -1 : 4;
+let confirmed = "Performance";
+let selected: number | null = 4;
 const custom = { maxMhz: 2750, core: 120, mem: 1000, power: 100 };
 let status = "";
 let error: string | null = state === "error" ? "Could not work out Performance for this card:\nA core offset is set on the card right now, so its stock curve cannot be read. Use Reset to stock once, then try again." : null;
 let trial: { preset: string; previous: string; status: "pending" | "reverted" } | null =
-  state === "trial" || state === "unguarded" ? { preset: "Performance", previous: "Balanced", status: "pending" } : state === "reverted" ? { preset: "Performance", previous: "Balanced", status: "reverted" } : null;
-if (trial?.status === "pending") current = 3;
+  state === "trial" || state === "unguarded" ? { preset: "Max", previous: "Performance", status: "pending" } : state === "reverted" ? { preset: "Max", previous: "Performance", status: "reverted" } : null;
+if (trial?.status === "pending") current = 5;
 if (trial?.status === "reverted") current = 0;
 
 const hist: { core: number; temp: number; power: number; util: number }[] = [];
@@ -43,7 +45,7 @@ function live(): GpuLive {
 }
 
 function tuning(i: number) {
-  return i === CUSTOM ? { max: custom.maxMhz, core: custom.core, mem: custom.mem, power: custom.power } : { ...PRESETS[i], power: 100 };
+  return i === CUSTOM ? { max: custom.maxMhz, core: custom.core, mem: custom.mem, power: custom.power } : { ...PRESETS[i] };
 }
 
 function describe(i: number): string {
@@ -53,7 +55,7 @@ function describe(i: number): string {
 }
 
 function customView(): GpuCustom {
-  return { ...custom, powerWatts: Math.round((360 * custom.power) / 100), limits: { maxMhz: [1500, 3210], core: [-500, 300], mem: [0, 3000], power: [70, 125] }, summary: describe(CUSTOM) };
+  return { ...custom, powerWatts: Math.round((360 * custom.power) / 100), limits: { maxMhz: [1500, 3210], core: [-500, 450], mem: [0, 3000], power: [70, 125] }, summary: describe(CUSTOM) };
 }
 
 function trialView(): GpuTrial | null {
@@ -79,7 +81,7 @@ function openApply(idx: number, kicker: string) {
   if (endsTrial) items.push(opItem("endtrial", "End the safety trial", ""));
   items.push(opItem("save", idx === 0 ? "Stop setting a tune at sign-in" : "Set it again at every sign-in", ""));
   const warn: string[] = [];
-  if (n === "Performance") warn.push("Runs warmest - test stability before long sessions.");
+  if (n === "Performance" || n === "Max") warn.push("Runs warmest - test stability before long sessions.");
   if (idx === CUSTOM) warn.push("Custom values are not tested by PC Tuner - test stability before long sessions.");
   if (state === "afterburner") warn.push("MSI Afterburner is running and may overwrite these settings - close it first.");
   op.open(
@@ -135,7 +137,7 @@ export const gpu: MockTab<View, Action> = {
       presets: PRESETS.map((p, index) => ({
         index,
         name: p.name,
-        detail: index === 0 ? "no offsets, no clock limit" : `max ${p.max} MHz · core +${p.core} · memory +${p.mem}`,
+        detail: index === 0 ? "no offsets, no clock limit" : `${p.mv} mV · max ${p.max} MHz · core +${p.core} · power ${p.power} %`,
         text: p.text,
         selected: selected === index,
         current: current === index,

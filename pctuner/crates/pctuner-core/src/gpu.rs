@@ -33,20 +33,27 @@ pub struct Preset {
 pub const PRESETS: &[Preset] = &[
     Preset { name: "Stock", target_mhz: 0, target_mv: 0, mem: 0, power: 100,
         text: "Factory behaviour - no undervolt, no memory overclock. Use this to reset or to compare." },
-    Preset { name: "Efficiency", target_mhz: 2700, target_mv: 900, mem: 1000, power: 100,
-        text: "Coolest and quietest. 2700 MHz at 900 mV, memory +1000." },
-    Preset { name: "Balanced", target_mhz: 2800, target_mv: 925, mem: 1500, power: 100,
-        text: "Everyday gaming. 2800 MHz at 925 mV, memory +1500." },
-    Preset { name: "Performance", target_mhz: 2900, target_mv: 950, mem: 2000, power: 100,
-        text: "Most fps. 2900 MHz at 950 mV, memory +2000. Runs warmest of the three undervolts." },
+    // NV-UV-Play's RTX 5080 tiers (v2.1.11.1, read from its log on this card, 2026-11-16)
+    Preset { name: "Eco", target_mhz: 2650, target_mv: 850, mem: 0, power: 88,
+        text: "Coolest and quietest. 2650 MHz at 850 mV, power limit 88 %." },
+    Preset { name: "MFG", target_mhz: 2650, target_mv: 850, mem: 0, power: 100,
+        text: "For DLSS Multi Frame Generation. The Eco curve (2650 MHz at 850 mV) with the full power limit." },
+    Preset { name: "Balanced", target_mhz: 2750, target_mv: 900, mem: 0, power: 90,
+        text: "Everyday gaming. 2750 MHz at 900 mV, power limit 90 %." },
+    Preset { name: "Performance", target_mhz: 2980, target_mv: 925, mem: 0, power: 100,
+        text: "High fps. 2980 MHz at 925 mV, full power limit." },
+    Preset { name: "Max", target_mhz: 3150, target_mv: 975, mem: 0, power: 100,
+        text: "Most fps. 3150 MHz at 975 mV, full power limit. Runs warmest of the undervolts." },
 ];
 
 /// The fifth choice after the presets: values the user sets.
-pub const CUSTOM: usize = 4;
+pub const CUSTOM: usize = 6;
 pub const CUSTOM_NAME: &str = "Custom";
 
-/// The most a preset may lift the card's stock curve (as before: anything more is too aggressive).
-pub const MAX_LIFT: i32 = 300;
+/// The most a preset may lift the card's stock curve. NV-UV-Play's tiers need up to +405 MHz at their voltage on
+/// this card (Max at 975 mV); PC Tuner lifts the whole curve by that one amount, while NV-UV-Play lifts the lower
+/// voltages even more (+368 MHz at 850 mV for Performance). So the limit is +450.
+pub const MAX_LIFT: i32 = 450;
 
 pub fn tune_name(idx: usize) -> &'static str {
     PRESETS.get(idx).map(|p| p.name).unwrap_or(CUSTOM_NAME)
@@ -152,9 +159,21 @@ pub fn mem_raw(mem: i32, factor: f64) -> i32 {
     (mem as f64 * factor).round() as i32
 }
 
+pub const CURVE_CHANGED: &str = "Another program has changed the card's voltage/frequency curve (NV-UV-Play, MSI Afterburner or similar), so its stock curve cannot be read. Close that program - or restart the PC - then try again.";
+
+/// The stock curve keeps rising to its last point; one that ends in a flat line was undervolted by another
+/// program (the driver's global offset does not show per-point changes).
+pub fn curve_is_flattened(curve: &[crate::nvapi::VfPoint]) -> bool {
+    let top: Vec<f32> = curve.iter().rev().take(8).map(|p| p.mhz).collect();
+    top.len() == 8 && top.iter().fold(f32::MIN, |a, b| a.max(*b)) - top.iter().fold(f32::MAX, |a, b| a.min(*b)) < 10.0
+}
+
 /// Each preset's core offset from the card's stock curve: target clock minus the stock clock at the
 /// target voltage (the first point at or above it). Stock is 0.
 pub fn preset_lifts(curve: &[crate::nvapi::VfPoint]) -> Result<Vec<i32>, String> {
+    if curve_is_flattened(curve) {
+        return Err(CURVE_CHANGED.into());
+    }
     PRESETS
         .iter()
         .map(|p| {
@@ -192,15 +211,19 @@ pub fn tuning_of(idx: usize, lifts: &[i32], custom: Option<Tuning>) -> Tuning {
     match PRESETS.get(idx) {
         Some(p) if p.target_mhz == 0 => STOCK,
         Some(p) => Tuning { max_mhz: p.target_mhz as u32, core: lifts.get(idx).copied().unwrap_or(0), mem: p.mem, power: p.power as u32 },
-        None => custom.unwrap_or_else(|| tuning_of(2, lifts, None)),
+        None => custom.unwrap_or_else(|| tuning_of(3, lifts, None)),
     }
 }
 
 // ------------------------------------------------------------------ Afterburner (only to warn about it)
 
+/// Another GPU tuner is running (MSI Afterburner or NV-UV-Play): it sets the card too.
 pub fn ab_running() -> bool {
-    common::run("tasklist", &["/FI", "IMAGENAME eq MSIAfterburner.exe", "/NH"])
-        .map(|(_, o)| o.to_lowercase().contains("msiafterburner.exe"))
+    common::run("tasklist", &["/NH", "/FO", "CSV"])
+        .map(|(_, o)| {
+            let o = o.to_lowercase();
+            o.contains("\"msiafterburner.exe\"") || o.contains("\"nv-uv-play.exe\"")
+        })
         .unwrap_or(false)
 }
 
@@ -222,6 +245,7 @@ pub fn ab_autostart() -> bool {
 }
 
 pub fn close_ab() -> Result<(), String> {
+    let _ = common::run("taskkill", &["/IM", "NV-UV-Play.exe"]);
     common::run("taskkill", &["/F", "/IM", "MSIAfterburner.exe"]).map(|_| ())
 }
 
@@ -880,14 +904,14 @@ pub fn apply_window(kicker: &str, idx: usize, t: &Tuning, after: &After, ab_runn
     w.running_text = format!("Applying {name}...");
     w.go_label = if idx == 0 { "Reset to stock".into() } else { format!("Apply {name}") };
     let mut warn: Vec<String> = vec![];
-    if name == "Performance" {
+    if name == "Max" || name == "Performance" {
         warn.push("Runs warmest - test stability before long sessions.".into());
     }
     if idx == CUSTOM {
         warn.push("Custom values are not tested by PC Tuner - test stability before long sessions.".into());
     }
     if ab_running {
-        warn.push("MSI Afterburner is running and may overwrite these settings - close it first.".into());
+        warn.push("MSI Afterburner or NV-UV-Play is running and may overwrite these settings - close it first.".into());
     }
     if !warn.is_empty() {
         w.warning = Some(warn.join("\n"));
@@ -917,7 +941,7 @@ pub struct Gpu {
     pub sampler: Option<Job<Option<Live>>>,
     pub next_sample: Instant,
     pub history: VecDeque<Live>,
-    /// 0..=3 a preset, CUSTOM the custom values
+    /// 0..CUSTOM a preset, CUSTOM the custom values
     pub selected: Option<usize>,
     /// the custom values being edited (None until the card has been read)
     pub custom: Option<Tuning>,
@@ -1084,8 +1108,8 @@ impl Gpu {
             _ => {
                 let Some(stage) = crate::opwin::demo_stage("gpu") else { return };
                 self.demo = true;
-                let t = Tuning { max_mhz: 2900, core: 148, mem: 2000, power: 100 };
-                let mut w = apply_window("APPLY PERFORMANCE", 3, &t, &After::StartTrial { previous: "Balanced".into(), previous_tuning: None }, false);
+                let t = Tuning { max_mhz: 2980, core: 318, mem: 0, power: 100 };
+                let mut w = apply_window("APPLY PERFORMANCE", 4, &t, &After::StartTrial { previous: "Balanced".into(), previous_tuning: None }, false);
                 match stage {
                     Stage::Preview => {}
                     Stage::Running => {
@@ -1095,7 +1119,7 @@ impl Gpu {
                     }
                     Stage::Done => {
                         w.finish(|it| match it.id.as_str() {
-                            STEP_CONFIRM => Some(Ok("The driver reports core +148 MHz, memory +2000 MHz.".into())),
+                            STEP_CONFIRM => Some(Ok("The driver reports core +318 MHz, memory +0 MHz.".into())),
                             STEP_TRIAL => Some(Ok("If the PC crashes, the GPU goes back to Stock at your next sign-in.".into())),
                             _ => None,
                         });
@@ -1398,17 +1422,12 @@ mod tests {
     use super::*;
     use crate::nvapi::VfPoint;
 
-    /// This card's curve around the presets (read from the driver on 2026-11-16).
+    /// This card's curve around the presets (read from the driver on 2026-11-16; 975 mV approximate).
     fn curve() -> Vec<VfPoint> {
-        vec![
-            VfPoint { mv: 450.0, mhz: 300.0 },
-            VfPoint { mv: 895.0, mhz: 2542.0 },
-            VfPoint { mv: 900.0, mhz: 2565.0 },
-            VfPoint { mv: 925.0, mhz: 2662.0 },
-            VfPoint { mv: 945.0, mhz: 2730.0 },
-            VfPoint { mv: 950.0, mhz: 2752.0 },
-            VfPoint { mv: 1240.0, mhz: 3345.0 },
-        ]
+        [(450.0, 300.0), (845.0, 2265.0), (850.0, 2355.0), (900.0, 2565.0), (925.0, 2662.0), (950.0, 2752.0), (975.0, 2830.0), (1240.0, 3345.0)]
+            .iter()
+            .map(|&(mv, mhz)| VfPoint { mv, mhz })
+            .collect()
     }
 
     fn live(core_ofs: i32, mem_ofs_raw: i32) -> Live {
@@ -1417,20 +1436,29 @@ mod tests {
 
     #[test]
     fn gpu_preset_lifts_from_the_curve() {
-        assert_eq!(preset_lifts(&curve()).unwrap(), vec![0, 135, 138, 148]);
-        let lifts = vec![0, 135, 138, 148];
+        // NV-UV-Play's tiers: Eco, MFG, Balanced, Performance, Max
+        assert_eq!(preset_lifts(&curve()).unwrap(), vec![0, 295, 295, 185, 318, 320]);
+        let lifts = vec![0, 295, 295, 185, 318, 320];
         assert_eq!(tuning_of(0, &lifts, None), STOCK);
-        assert_eq!(tuning_of(2, &lifts, None), Tuning { max_mhz: 2800, core: 138, mem: 1500, power: 100 });
+        assert_eq!(tuning_of(1, &lifts, None), Tuning { max_mhz: 2650, core: 295, mem: 0, power: 88 });
+        assert_eq!(tuning_of(2, &lifts, None), Tuning { max_mhz: 2650, core: 295, mem: 0, power: 100 });
+        assert_eq!(tuning_of(3, &lifts, None), Tuning { max_mhz: 2750, core: 185, mem: 0, power: 90 });
+        assert_eq!(tuning_of(5, &lifts, None), Tuning { max_mhz: 3150, core: 320, mem: 0, power: 100 });
         // custom: the saved values, else Balanced to start from
         let mine = Tuning { max_mhz: 2750, core: 100, mem: 500, power: 90 };
         assert_eq!(tuning_of(CUSTOM, &lifts, Some(mine)), mine);
-        assert_eq!(tuning_of(CUSTOM, &lifts, None), tuning_of(2, &lifts, None));
-        // a slow chip: more than +300 is refused
-        let slow: Vec<VfPoint> = curve().iter().map(|p| VfPoint { mhz: p.mhz - 400.0, ..*p }).collect();
+        assert_eq!(tuning_of(CUSTOM, &lifts, None), tuning_of(3, &lifts, None));
+        // a slow chip: more than +450 is refused
+        let slow: Vec<VfPoint> = curve().iter().map(|p| VfPoint { mhz: p.mhz - 200.0, ..*p }).collect();
         assert!(preset_lifts(&slow).unwrap_err().contains("too aggressive"));
         // no point at the preset's voltage
-        assert!(preset_lifts(&curve()[..2]).unwrap_err().contains("No curve point at or above 900 mV"));
-        assert_eq!((tune_name(CUSTOM), tune_index("Custom"), tune_index("Balanced"), tune_index("x")), ("Custom", Some(CUSTOM), Some(2), None));
+        assert!(preset_lifts(&curve()[..2]).unwrap_err().contains("No curve point at or above 850 mV"));
+        // a curve another program flattened (NV-UV-Play's Eco: 2650 MHz from 850 mV up) is refused
+        let mut flat: Vec<VfPoint> = (0..20).map(|k| VfPoint { mv: 850.0 + 10.0 * k as f32, mhz: 2650.0 }).collect();
+        flat.insert(0, VfPoint { mv: 450.0, mhz: 300.0 });
+        assert_eq!(preset_lifts(&flat).unwrap_err(), CURVE_CHANGED);
+        assert!(!curve_is_flattened(&curve()));
+        assert_eq!((tune_name(CUSTOM), tune_index("Custom"), tune_index("Balanced"), tune_index("x")), ("Custom", Some(CUSTOM), Some(3), None));
     }
 
     #[test]
@@ -1439,12 +1467,12 @@ mod tests {
         let core = nvml::Offset { mhz: 0, min: -1000, max: 1000 };
         let mem = nvml::Offset { mhz: 0, min: -2000, max: 6000 };
         let l = limits_from(core, mem, 1.0, (300, 3210), (250, 450, 360));
-        assert_eq!(l, Limits { clock: (1500, 3210), core: (-500, 300), mem: (0, 3000), power: (70, 125), power_default_w: 360 });
+        assert_eq!(l, Limits { clock: (1500, 3210), core: (-500, 450), mem: (0, 3000), power: (70, 125), power_default_w: 360 });
         // a memory scale of 2 halves what the card allows in nvidia-smi MHz
         assert_eq!(limits_from(core, mem, 2.0, (300, 3210), (250, 450, 360)).mem, (0, 3000));
         assert_eq!(limits_from(core, nvml::Offset { mhz: 0, min: 0, max: 2000 }, 2.0, (300, 3210), (250, 450, 360)).mem, (0, 1000));
         let wild = Tuning { max_mhz: 4000, core: 900, mem: -50, power: 10 };
-        assert_eq!(wild.clamp(&l), Tuning { max_mhz: 3210, core: 300, mem: 0, power: 70 });
+        assert_eq!(wild.clamp(&l), Tuning { max_mhz: 3210, core: 450, mem: 0, power: 70 });
         assert_eq!(STOCK.describe(), "no offsets, no clock limit, power 100%");
         assert_eq!(Tuning { max_mhz: 2800, core: 138, mem: 1500, power: 100 }.describe(), "max 2800 MHz, core +138 MHz, memory +1500 MHz, power 100%");
         assert_eq!((mem_raw(1500, 1.0), mem_raw(1500, 2.0), mem_raw(1500, 0.5)), (1500, 3000, 750));
@@ -1456,19 +1484,19 @@ mod tests {
         let bal = Tuning { max_mhz: 2800, core: 138, mem: 1500, power: 100 };
         let saved = Saved { applied: "Balanced".into(), tuning: Some(bal), mem_factor: 2.0, ..Default::default() };
         // the driver reports the saved tune's offsets (memory in NVML's scale)
-        assert_eq!(current_tune(&saved, Some(&live(138, 3000))), Some(2));
+        assert_eq!(current_tune(&saved, Some(&live(138, 3000))), Some(3));
         // restarted and not set again yet: the card is on Stock
         assert_eq!(current_tune(&saved, Some(&live(0, 0))), Some(0));
         // something else set offsets
         assert_eq!(current_tune(&saved, Some(&live(200, 1000))), None);
         // no reading: the last applied tune
-        assert_eq!(current_tune(&saved, None), Some(2));
+        assert_eq!(current_tune(&saved, None), Some(3));
         assert_eq!(current_tune(&Saved::default(), None), None);
-        let (name, unit, cap, tone) = hero_text(Some(2), &saved, Some(&live(138, 3000)));
+        let (name, unit, cap, tone) = hero_text(Some(3), &saved, Some(&live(138, 3000)));
         assert_eq!((name.as_str(), unit.as_str(), tone), ("Balanced", "preset", Tone::Accent));
         assert!(cap.contains("max 2800 MHz"));
         assert_eq!(hero_text(None, &saved, Some(&live(200, 0))).0, "Other");
-        assert_eq!(hero_text(Some(2), &saved, None).0, "Unknown");
+        assert_eq!(hero_text(Some(3), &saved, None).0, "Unknown");
         assert_eq!(live_chip(Some(&live(138, 3000)), 2.0).0, "Driver reports: core +138 MHz, memory +1500 MHz");
         // the sign-in task only has work for a tune other than Stock, or an armed trial
         assert!(task_needed(&saved, None));
@@ -1530,20 +1558,20 @@ mod tests {
         // Stock always ends a trial; the confirmed preset ends a pending one; anything else starts a trial
         assert_eq!(plan_after(0, Some("Balanced"), true), After::EndTrial { visible: true });
         assert_eq!(plan_after(0, None, false), After::EndTrial { visible: false });
-        assert_eq!(plan_after(2, Some("Balanced"), false), After::Nothing);
-        assert_eq!(plan_after(2, Some("Balanced"), true), After::EndTrial { visible: true });
-        assert_eq!(plan_after(3, Some("Balanced"), false), After::StartTrial { previous: "Balanced".into(), previous_tuning: None });
+        assert_eq!(plan_after(3, Some("Balanced"), false), After::Nothing);
+        assert_eq!(plan_after(3, Some("Balanced"), true), After::EndTrial { visible: true });
+        assert_eq!(plan_after(4, Some("Balanced"), false), After::StartTrial { previous: "Balanced".into(), previous_tuning: None });
         assert_eq!(plan_after(1, None, false), After::StartTrial { previous: "Stock".into(), previous_tuning: None });
         // custom values always start a trial: they may differ from the ones kept before
         assert!(matches!(plan_after(CUSTOM, Some("Custom"), false), After::StartTrial { .. }));
 
         let t = Tuning { max_mhz: 2900, core: 148, mem: 2000, power: 100 };
-        let w = apply_window("APPLY PERFORMANCE", 3, &t, &After::StartTrial { previous: "Balanced".into(), previous_tuning: None }, true);
+        let w = apply_window("APPLY PERFORMANCE", 4, &t, &After::StartTrial { previous: "Balanced".into(), previous_tuning: None }, true);
         assert_eq!(w.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec![STEP_TRIAL, STEP_SET, STEP_CONFIRM, STEP_SAVE]);
         assert!(w.items.iter().all(|i| i.group.is_empty()));
         assert!(w.show_steps && w.stage == Stage::Preview);
         let warn = w.warning.unwrap();
-        assert!(warn.contains("Runs warmest") && warn.contains("Afterburner is running"));
+        assert!(warn.contains("Runs warmest") && warn.contains("Afterburner or NV-UV-Play is running"));
         let w = apply_window("RESET GPU TO STOCK", 0, &STOCK, &After::EndTrial { visible: false }, false);
         assert_eq!(w.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec![STEP_SET, STEP_CONFIRM, STEP_SAVE]);
         assert!(w.warning.is_none());

@@ -89,7 +89,7 @@ export type Action =
 type Act = (a: Action) => Promise<void>;
 
 /** Index of the Custom card (after the four presets). */
-const CUSTOM = 4;
+const CUSTOM = 6;
 
 function TrialNotice({ t, act }: { t: GpuTrial; act: Act }) {
   if (t.kind === "pending") {
@@ -281,11 +281,11 @@ function AfterburnerBanner({ ab, act }: { ab: View["afterburner"]; act: Act }) {
           kind="warn"
           action={
             <Button icon={<X />} disabled={!ab.canClose} onClick={() => act({ kind: "click", click: "CloseAfterburner" })}>
-              Close Afterburner
+              Close it
             </Button>
           }
         >
-          MSI Afterburner is running. It sets the GPU too and can overwrite what PC Tuner sets - close it while you use this tab.
+          MSI Afterburner or NV-UV-Play is running. It sets the GPU too and can overwrite what PC Tuner sets - close it while you use this tab.
         </Banner>
       )}
       {ab.autostart && (
