@@ -1,7 +1,6 @@
 // Graphics card LED control for PC Tuner's RAM LED tab: the same one-shot commands and JSON as --ramled.
 //
 //   --gpuled detect | off | static RRGGBB | rainbow | restore <snapshot> ...  [--save]
-//   --gpuled probe                                   read-only diagnostics on stderr
 //
 // The LED controller sits on the card's own I2C bus, reached through the NVIDIA driver (nvapi64.dll:
 // NvAPI_I2CReadEx / NvAPI_I2CWriteEx on port 1 - the layout OpenRGB's i2c_smbus_nvapi uses). Two kinds:
@@ -143,16 +142,12 @@ namespace PCTunerFan
                     Size = size,
                     Speed = 0xFFFF,
                     SpeedKhz = 0,
-                    PortId = Port,
-                    IsPortIdSet = PortSet,
-                    IsDdcPort = Ddc,
+                    PortId = 1,
+                    IsPortIdSet = 1,
                 };
             }
 
             public int LastStatus;
-            // normally port 1 (where the RGB controllers are); the probe tries the others, read-only
-            public byte Port = 1, Ddc = 0;
-            public uint PortSet = 1;
 
             int Call(I2CFn f, NvI2cInfoV3 i)
             {
@@ -259,8 +254,6 @@ namespace PCTunerFan
             }
         }
 
-        static bool IsAdmin() => new System.Security.Principal.WindowsPrincipal(System.Security.Principal.WindowsIdentity.GetCurrent()).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
-
         public static int Run(string[] args)
         {
             int i = Array.IndexOf(args, "--gpuled");
@@ -295,25 +288,10 @@ namespace PCTunerFan
                 {
                     int pr = pci(handles[g], out uint dev, out uint sub, out _, out _);
                     string busName = $"NVIDIA {dev >> 16:X4} subsystem {sub & 0xFFFF:X4}:{sub >> 16:X4} I2C port 1";
-                    if (cmd == "probe") Console.Error.WriteLine($"gpu {g}: PCI ids call {pr}, device {dev:X8}, subsystem {sub:X8}, admin={IsAdmin()}");
                     if (pr != 0) continue;
                     if (!IsAsusNvidia(dev, sub) && !IsGigabyteNvidia(dev, sub)) continue;
                     var bus = new NvBus(handles[g], read, write);
                     buses.Add(bus);
-                    if (cmd == "probe")
-                    {
-                        // read-only: what answers a plain 1-byte read on each port, then the ENE identity at 0x67
-                        for (byte port = 0; port < 8; port++)
-                            for (byte a = 0x08; a <= 0x77; a++)
-                            {
-                                bus.Port = port;
-                                var got = bus.Read(a, 1);
-                                if (bus.LastStatus == 0) Console.Error.WriteLine($"gpu {g}: port {port} addr 0x{a:X2} answers: {RamLed.Hex(got)}");
-                            }
-                        bus.Port = 1;
-                        Console.Error.WriteLine($"gpu {g}: ENE name at 0x67: {EneDevice.NameAt(bus, EneDevice.GpuAddr, true) ?? "(no ENE pattern)"}");
-                        continue;
-                    }
                     // ENE controller at 0x67 (ASUS cards, and this Gigabyte RTX 5080: AUMA0-E6K5-1107)
                     var ed = EneDevice.Probe(bus, EneDevice.GpuAddr, out var s, gpu: true);
                     if (ed != null)

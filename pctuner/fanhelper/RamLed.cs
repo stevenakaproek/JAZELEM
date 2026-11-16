@@ -142,21 +142,6 @@ namespace PCTunerFan
             return d;
         }
 
-        /// <summary>Diagnostics: the controller name at an address that answered with the ENE pattern (null otherwise).</summary>
-        public static string NameAt(IEneBus bus, byte addr, bool gpu)
-        {
-            var d = new EneDevice(bus, addr, gpu);
-            for (int i = 0; i < 16; i++)
-                if (bus.ReadByteData(addr, (byte)(0xA0 + i)) != i) return null;
-            var raw = new StringBuilder();
-            for (int i = 0; i < 16; i++)
-            {
-                int c = d.R((ushort)(RegName + i));
-                raw.Append(c >= 0x20 && c <= 0x7E ? ((char)c).ToString() : $"<{c:X2}>");
-            }
-            return raw.ToString();
-        }
-
         public void ReadState(EneStick s)
         {
             s.Mode = R(RegMode);

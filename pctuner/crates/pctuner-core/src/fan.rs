@@ -1454,12 +1454,6 @@ impl Fan {
         sh.status.as_ref()?.job.clone().filter(|j| !j.done)
     }
 
-    /// The last finished test, while it is the newest one (for its message on the card).
-    pub fn last_test(&self) -> Option<JobInfo> {
-        let sh = self.shared.lock().ok()?;
-        sh.status.as_ref()?.job.clone().filter(|j| j.done)
-    }
-
     /// Start a fan test on one fan: "calibrate" or "pair". Administrator only; one at a time.
     pub fn start_test(&mut self, kind: &str, id: &str) -> Result<(), String> {
         if !common::is_admin() {
