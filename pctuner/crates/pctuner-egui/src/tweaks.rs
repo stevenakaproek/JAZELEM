@@ -5,7 +5,7 @@ use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 
-const SCRIPT: &str = include_str!("../assets/PostInstall-Tweaks.ps1");
+const SCRIPT: &str = pctuner_core::scripts::POST_INSTALL_TWEAKS;
 
 const G_TASKS: &str = "Scheduled tasks";
 const G_EDGE: &str = "Edge";

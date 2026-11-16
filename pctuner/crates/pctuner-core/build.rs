@@ -1,19 +1,8 @@
-// Release builds ask for administrator rights (UAC) when started, like the PowerShell tools did.
-// Debug builds run without elevation so the app can be tested in view-only mode.
-// The fan helper (fanhelper/out, built with `dotnet publish`) is embedded into the exe.
-use embed_manifest::{embed_manifest, manifest::ExecutionLevel, new_manifest};
+// The fan helper (fanhelper/out, built with `dotnet publish`) is embedded into the core library.
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 fn main() {
-    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
-        let level = if std::env::var("PROFILE").as_deref() == Ok("release") {
-            ExecutionLevel::RequireAdministrator
-        } else {
-            ExecutionLevel::AsInvoker
-        };
-        embed_manifest(new_manifest("PCTuner").requested_execution_level(level)).expect("unable to embed manifest");
-    }
     println!("cargo:rerun-if-changed=build.rs");
     embed_fan_helper();
 }
@@ -21,7 +10,9 @@ fn main() {
 /// Writes $OUT_DIR/fan_files.rs: `pub const FILES: &[(&str, &[u8])]` with every file of fanhelper/out.
 /// Empty when the helper has not been built (the Fan Tuner tab then says so).
 fn embed_fan_helper() {
-    let dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("fanhelper").join("out");
+    // crates/pctuner-core -> pctuner/fanhelper/out
+    let dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("..").join("..").join("fanhelper").join("out");
+    let dir = dir.canonicalize().unwrap_or(dir);
     println!("cargo:rerun-if-changed={}", dir.display());
     let mut code = String::from("pub const FILES: &[(&str, &[u8])] = &[\n");
     if let Ok(entries) = std::fs::read_dir(&dir) {

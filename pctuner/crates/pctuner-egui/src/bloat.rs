@@ -7,7 +7,7 @@ use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 
-const SCRIPT: &str = include_str!("../assets/Remove-Bloat.ps1");
+const SCRIPT: &str = pctuner_core::scripts::REMOVE_BLOAT;
 
 /// The script's `Kind` for a target: appx -> App, capability -> Capability, system -> System.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -881,9 +881,9 @@ mod tests {
 
     #[test]
     fn root_script_copies_match_the_embedded_ones() {
-        assert!(lf(include_str!("../../Remove-Bloat.ps1")) == lf(SCRIPT), "Remove-Bloat.ps1: the root copy differs from pctuner/assets");
+        assert!(lf(include_str!("../../../../Remove-Bloat.ps1")) == lf(SCRIPT), "Remove-Bloat.ps1: the root copy differs from pctuner/assets");
         assert!(
-            lf(include_str!("../../PostInstall-Tweaks.ps1")) == lf(include_str!("../assets/PostInstall-Tweaks.ps1")),
+            lf(include_str!("../../../../PostInstall-Tweaks.ps1")) == lf(pctuner_core::scripts::POST_INSTALL_TWEAKS),
             "PostInstall-Tweaks.ps1: the root copy differs from pctuner/assets"
         );
     }
@@ -907,6 +907,6 @@ mod tests {
     #[test]
     fn embedded_scripts_parse() {
         assert_eq!(parse_errors("Remove-Bloat.ps1", SCRIPT), 0);
-        assert_eq!(parse_errors("PostInstall-Tweaks.ps1", include_str!("../assets/PostInstall-Tweaks.ps1")), 0);
+        assert_eq!(parse_errors("PostInstall-Tweaks.ps1", pctuner_core::scripts::POST_INSTALL_TWEAKS), 0);
     }
 }

@@ -15,9 +15,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-mod embedded {
-    include!(concat!(env!("OUT_DIR"), "/fan_files.rs"));
-}
+use pctuner_core::fan_files as embedded;
 
 const HISTORY: usize = 60;
 
