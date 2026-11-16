@@ -1,8 +1,10 @@
 // Optimization: Performance, Network and Windows tweaks in one place, one part each.
 import { useState } from "react";
-import { EmptyState, Page, Segmented, ViewOnlyBanner } from "../components/ui";
+import { Page, Segmented, ViewOnlyBanner } from "../components/ui";
 import { useShell } from "../lib/shell";
+import { Network } from "./Network";
 import { Performance } from "./Performance";
+import { Tweaks } from "./Tweaks";
 
 type Part = "performance" | "network" | "windows";
 
@@ -28,8 +30,8 @@ export function Optimize() {
         <Segmented value={part} options={PARTS} onChange={setPart} />
       </div>
       {part === "performance" && <Performance />}
-      {part === "network" && <EmptyState title="Not rebuilt yet" text="Network is still being moved to the new interface." />}
-      {part === "windows" && <EmptyState title="Not rebuilt yet" text="Windows tweaks are still being moved to the new interface." />}
+      {part === "network" && <Network />}
+      {part === "windows" && <Tweaks />}
     </Page>
   );
 }

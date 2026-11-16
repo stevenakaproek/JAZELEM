@@ -1,9 +1,16 @@
 // The tab registry: sidebar order, icons, and which backends each page listens to.
-import { CircuitBoard, Cpu, Fan, Lightbulb, Rocket, ScrollText, Settings2, Trash2, Usb, Zap, type LucideIcon } from "lucide-react";
+import { CircuitBoard, Cpu, Fan as FanIcon, Lightbulb, Rocket, ScrollText, Settings2, Trash2, Usb as UsbIcon, Zap, type LucideIcon } from "lucide-react";
 import type { ComponentType } from "react";
-import { ComingSoon } from "./ComingSoon";
-import { Fan as FanPage } from "./Fan";
+import { Bloat } from "./Bloat";
+import { Fan } from "./Fan";
+import { Gpolicy } from "./Gpolicy";
+import { Gpu } from "./Gpu";
 import { Optimize } from "./Optimize";
+import { Ramled } from "./Ramled";
+import { Scheduler } from "./Scheduler";
+import { Services } from "./Services";
+import { Startup } from "./Startup";
+import { Usb } from "./Usb";
 
 export interface TabDef {
   id: string;
@@ -14,17 +21,15 @@ export interface TabDef {
   page: ComponentType;
 }
 
-const soon = (title: string) => () => <ComingSoon title={title} />;
-
 export const TABS: TabDef[] = [
-  { id: "services", title: "Services", icon: Settings2, backends: ["services"], page: soon("Services") },
-  { id: "startup", title: "Startup Cleaner", icon: Rocket, backends: ["startup"], page: soon("Startup Cleaner") },
-  { id: "bloat", title: "Remove Bloat", icon: Trash2, backends: ["bloat"], page: soon("Remove Bloat") },
+  { id: "services", title: "Services", icon: Settings2, backends: ["services"], page: Services },
+  { id: "startup", title: "Startup Cleaner", icon: Rocket, backends: ["startup"], page: Startup },
+  { id: "bloat", title: "Remove Bloat", icon: Trash2, backends: ["bloat"], page: Bloat },
   { id: "optimize", title: "Optimization", icon: Zap, backends: ["perf", "network", "tweaks"], page: Optimize },
-  { id: "gpolicy", title: "Group Policy", icon: ScrollText, backends: ["gpolicy"], page: soon("Group Policy") },
-  { id: "scheduler", title: "CPU Scheduler", icon: Cpu, backends: ["scheduler"], page: soon("CPU Scheduler") },
-  { id: "gpu", title: "RTX 5080 Profiles", icon: CircuitBoard, backends: ["gpu"], page: soon("RTX 5080 Profiles") },
-  { id: "fan", title: "Fan Tuner", icon: Fan, backends: ["fan"], page: FanPage },
-  { id: "ramled", title: "RAM LED", icon: Lightbulb, backends: ["ramled"], page: soon("RAM LED") },
-  { id: "usb", title: "USB Port Finder", icon: Usb, backends: ["usb"], page: soon("USB Port Finder") },
+  { id: "gpolicy", title: "Group Policy", icon: ScrollText, backends: ["gpolicy"], page: Gpolicy },
+  { id: "scheduler", title: "CPU Scheduler", icon: Cpu, backends: ["scheduler"], page: Scheduler },
+  { id: "gpu", title: "RTX 5080 Profiles", icon: CircuitBoard, backends: ["gpu"], page: Gpu },
+  { id: "fan", title: "Fan Tuner", icon: FanIcon, backends: ["fan"], page: Fan },
+  { id: "ramled", title: "RAM LED", icon: Lightbulb, backends: ["ramled"], page: Ramled },
+  { id: "usb", title: "USB Port Finder", icon: UsbIcon, backends: ["usb"], page: Usb },
 ];
