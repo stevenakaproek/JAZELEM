@@ -205,6 +205,16 @@ function undo(indices: number[]) {
   );
 }
 
+// a few of PC Tuner's plain-English descriptions (pctuner_core::explain)
+const SVC_TEXT: Record<string, string> = {
+  Spooler: "Print Spooler: needed to print (also 'Print to PDF').",
+  DiagTrack: "Connected User Experiences and Telemetry: sends usage and diagnostic data to Microsoft.",
+  XblAuthManager: "Signs you in to Xbox Live for games and the Xbox app.",
+  RpcSs: "The switchboard that lets parts of Windows talk to each other. Almost everything depends on it.",
+  WSearch: "Windows Search: indexes your files so Start and File Explorer find them instantly. Without it searching is slower.",
+  SysMain: "SysMain (Superfetch): preloads apps you use often. Little benefit on fast SSDs, some disk activity.",
+};
+
 export const services: MockTab<View, Action> = {
   view() {
     const busy = op.op?.stage === "Running" || backupOp.op?.stage === "Running";
@@ -221,6 +231,11 @@ export const services: MockTab<View, Action> = {
       suggested: s.suggested,
       suggestedDone: s.suggested === s.start,
       selected: selected.has(s.name),
+      about: {
+        what: SVC_TEXT[s.name] ?? `${s.display}: a Windows service.`,
+        off: s.note.startsWith("Core") ? "Core Windows: switching it off can stop Windows from starting or signing in. PC Tuner never changes it." : s.note.startsWith("Gaming") ? "Games, Xbox / Game Pass, Steam, anti-cheat or controllers depend on it - leave it as it is." : s.suggested === "Disabled" ? "Safe to disable if you do not use this feature; Undo puts it back." : s.suggested === "Manual" ? "Safe on Manual: Windows still starts it when something needs it." : "PC Tuner has no advice for this one. Manual is usually safe (it starts when needed); only disable it if you know what it does.",
+        windows: s.name === "Spooler" ? "This service spools print jobs and handles interaction with the printer. If you turn off this service, you won't be able to print or see your printers." : "",
+      },
     }));
     const vis = rows.filter((r) => r.selected).length;
     const total = selected.size;

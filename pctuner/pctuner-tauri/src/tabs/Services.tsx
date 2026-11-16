@@ -1,6 +1,7 @@
 // Services: change startup types with full undo, plus the History and Backups sheets.
 import { Check as CheckIcon, ChevronDown, ChevronUp, FolderOpen, History as HistoryIcon, RefreshCw, Save } from "lucide-react";
-import { useState } from "react";
+import { Fragment, useState } from "react";
+import { ABOUT_HINT, AboutRow, useOpenRows, type About } from "../components/About";
 import { OpSheet } from "../components/OpSheet";
 import { Badge, Banner, Button, Check, Dot, EmptyState, ErrorState, Group, Hero, LoadingState, Page, Row, SearchField, Sheet, Spinner, Stat, Switch, ViewOnlyBanner, cx, type BadgeColor } from "../components/ui";
 import { useShell } from "../lib/shell";
@@ -23,6 +24,8 @@ export interface ServiceRow {
   suggested: string | null;
   suggestedDone: boolean;
   selected: boolean;
+  /** shown when the row is right-clicked */
+  about: About;
 }
 
 export interface HistoryRow {
@@ -106,8 +109,10 @@ const COLUMNS: { col: SortCol; label: string; width: string }[] = [
 const TONE_DOT: Record<RowTone, BadgeColor> = { safe: "green", gaming: "orange", locked: "red", disabled: "", "": "" };
 
 function ServiceTable({ view, act }: { view: View; act: Act }) {
+  const { open, toggle } = useOpenRows();
   return (
     <table className="table svc-table">
+      <caption className="table-hint">{ABOUT_HINT}</caption>
       <colgroup>
         <col className="col-check" />
         {COLUMNS.map((c) => (
@@ -131,8 +136,20 @@ function ServiceTable({ view, act }: { view: View; act: Act }) {
       <tbody>
         {view.rows.map((r) => {
           const dim = r.tone === "disabled";
+          const expanded = open.has(r.name);
           return (
-            <tr key={r.name} className={cx("clickable", r.selected && "selected")} aria-selected={r.selected} onClick={() => act({ kind: "toggle", name: r.name })}>
+            <Fragment key={r.name}>
+            <tr
+              className={cx("clickable", r.selected && "selected", expanded && "expanded")}
+              aria-selected={r.selected}
+              aria-expanded={expanded}
+              title={ABOUT_HINT}
+              onClick={() => act({ kind: "toggle", name: r.name })}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                toggle(r.name);
+              }}
+            >
               <td>
                 <Check on={r.selected} />
               </td>
@@ -153,6 +170,8 @@ function ServiceTable({ view, act }: { view: View; act: Act }) {
                 {r.suggestedDone && <CheckIcon className="svc-done" aria-label="already set" />}
               </td>
             </tr>
+            {expanded && <AboutRow about={r.about} cols={COLUMNS.length + 1} />}
+            </Fragment>
           );
         })}
       </tbody>

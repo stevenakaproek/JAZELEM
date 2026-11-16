@@ -1,7 +1,8 @@
 // Startup Cleaner: everything that starts with Windows. Click rows to select them, switch them off or on,
 // and take changes back from the history.
 import { History as HistoryIcon, RefreshCw, SearchX } from "lucide-react";
-import { useState } from "react";
+import { Fragment, useState } from "react";
+import { ABOUT_HINT, AboutRow, useOpenRows, type About } from "../components/About";
 import { OpSheet } from "../components/OpSheet";
 import { Badge, Banner, Button, Check, EmptyState, ErrorState, Group, Hero, LoadingState, Page, SearchField, Sheet, Spinner, Stat, Switch, ViewOnlyBanner, cx } from "../components/ui";
 import { useShell } from "../lib/shell";
@@ -25,6 +26,8 @@ export interface StartupRow {
   /** Colour of the name and advice (category, or dim when switched off). */
   tone: Tone;
   selected: boolean;
+  /** shown when the row is right-clicked */
+  about: About;
 }
 
 export interface StartupHistRow {
@@ -180,8 +183,10 @@ function HistorySheet({ h, act }: { h: StartupHistory; act: Act }) {
 }
 
 function ItemTable({ rows, act }: { rows: StartupRow[]; act: Act }) {
+  const { open, toggle } = useOpenRows();
   return (
     <table className="table">
+      <caption className="table-hint">{ABOUT_HINT}</caption>
       <colgroup>
         <col style={{ width: 36 }} />
         <col style={{ width: 44 }} />
@@ -204,8 +209,20 @@ function ItemTable({ rows, act }: { rows: StartupRow[]; act: Act }) {
         {rows.map((r) => {
           const main = toneClass(r.tone);
           const quiet = r.on ? "secondary" : "tertiary";
+          const expanded = open.has(r.id);
           return (
-            <tr key={r.id} className={cx("clickable", r.selected && "selected")} aria-selected={r.selected} onClick={() => act({ kind: "toggle", id: r.id })}>
+            <Fragment key={r.id}>
+            <tr
+              className={cx("clickable", r.selected && "selected", expanded && "expanded")}
+              aria-selected={r.selected}
+              aria-expanded={expanded}
+              title={ABOUT_HINT}
+              onClick={() => act({ kind: "toggle", id: r.id })}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                toggle(r.id);
+              }}
+            >
               <td className="check-cell">
                 <Check on={r.selected} />
               </td>
@@ -227,6 +244,8 @@ function ItemTable({ rows, act }: { rows: StartupRow[]; act: Act }) {
                 {r.command}
               </td>
             </tr>
+            {expanded && <AboutRow about={r.about} cols={8} />}
+            </Fragment>
           );
         })}
       </tbody>

@@ -157,6 +157,8 @@ impl Backend for StartupTab {
                     "command": e.command,
                     "tone": tone,
                     "selected": selected,
+                    // shown when the row is right-clicked
+                    "about": pctuner_core::explain::startup(&e.name, &e.command, &e.publisher, e.kind.label(), e.category, e.advice),
                 })
             })
             .collect();

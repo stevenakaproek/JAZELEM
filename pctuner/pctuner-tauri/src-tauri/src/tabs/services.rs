@@ -111,6 +111,8 @@ impl ServicesTab {
                     "suggested": suggested,
                     "suggestedDone": suggested.is_some_and(|t| *t == v.start),
                     "selected": s.selected.contains(&v.name),
+                    // shown when the row is right-clicked
+                    "about": pctuner_core::explain::service(&v.name, &v.display, &v.desc, v.note, suggested.map(|t| t.as_ref())),
                 })
             })
             .collect()

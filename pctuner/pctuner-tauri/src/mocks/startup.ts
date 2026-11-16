@@ -139,6 +139,38 @@ function applyToggle(items: Entry[], on: boolean) {
   undoOpen = () => openUndo(history.map((h, i) => (h.batch === batch && !h.undone ? i : -1)).filter((i) => i >= 0), "Undo", true);
 }
 
+// what pctuner_core::explain::startup says (shortened)
+function about(e: { name: string; kind: string; publisher: string; command: string; category: string; advice: string }) {
+  const known: [string, string][] = [
+    ["7-zip", "7-Zip's right-click menu in File Explorer (Extract here, Add to archive)."],
+    ["discord", "Discord chat and voice. Off: you are not shown online until you open it."],
+    ["steam", "Steam opens at sign-in so updates and friends are ready. Off: Steam starts when you open it or a game."],
+    ["onedrive", "OneDrive: syncs your files with Microsoft's cloud. Off: files stop syncing until you open OneDrive."],
+    ["edge", "Microsoft Edge preloading itself in the background so it opens faster. Off: Edge opens a moment slower."],
+    ["nvidia", "NVIDIA app / driver helper (overlay, recording, driver updates). Off: those extras start when you open the NVIDIA app."],
+  ];
+  const hay = `${e.name} ${e.command}`.toLowerCase();
+  const hit = known.find(([k]) => hay.includes(k));
+  const when =
+    e.kind === "Task"
+      ? "A scheduled task: Windows runs it at set times or events (for example at sign-in or once a day)."
+      : e.kind === "ShellExt"
+        ? "An add-on loaded into File Explorer (for example extra right-click menu items)."
+        : "It starts every time you sign in to Windows.";
+  const path = e.command.startsWith('"') ? e.command.slice(1).split('"')[0] : e.command.split(" -")[0].split(" /")[0];
+  const prog = path.split(/[\\/]/).pop() ?? "";
+  const [hw, ho] = hit ? hit[1].split(" Off: ") : ["", ""];
+  const what = hit ? `${hw} ${when}` : `${e.name}. ${when}${prog ? ` It runs ${prog}${e.publisher ? `, made by ${e.publisher}` : ""}.` : ""}`;
+  const off =
+    e.kind === "ShellExt"
+      ? "Switching it off removes its extra menu items or icons from File Explorer; the program itself keeps working, nothing is deleted, and it can be undone."
+      : e.category === "Junk"
+      ? "Safe to switch off: Windows or the program works without it. Switching off never deletes anything and can be undone."
+      : "Switching it off only stops it starting by itself: you can still open the program yourself, nothing is deleted, and it can be undone.";
+  const off2 = ho ? `${ho[0].toUpperCase()}${ho.slice(1)} ${off}` : off;
+  return { what, off: e.advice ? `${off2} PC Tuner's advice: ${e.advice}.` : off2, windows: "" };
+}
+
 function openUndo(idx: number[], title: string, run = false) {
   const w = makeOp(
     title,
@@ -191,7 +223,7 @@ export const startup: MockTab<StartupView, StartupAction> = {
       kinds: KIND_ORDER.map((value) => ({ value, label: KIND_LABEL[value] })),
       enabledOnly,
       showWindows,
-      rows: ready ? rows.map((e) => ({ id: e.id, on: e.on, name: e.name, type: KIND_LABEL[e.kind], location: e.location, publisher: e.publisher, advice: e.advice, command: e.command, tone: tone(e), selected: selected.has(e.id) })) : [],
+      rows: ready ? rows.map((e) => ({ id: e.id, on: e.on, name: e.name, type: KIND_LABEL[e.kind], location: e.location, publisher: e.publisher, advice: e.advice, command: e.command, tone: tone(e), selected: selected.has(e.id), about: about(e) })) : [],
       selected: sel.length,
       cleanCount,
       canClean: !busy && cleanCount > 0,

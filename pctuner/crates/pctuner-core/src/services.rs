@@ -307,6 +307,8 @@ pub struct Svc {
     pub start: String,
     pub state: String,
     pub note: &'static str,
+    /// Windows' own description of the service.
+    pub desc: String,
     pub name_lc: String,
     pub display_lc: String,
 }
@@ -319,11 +321,13 @@ pub struct RawSvc {
     pub display: Option<String>,
     #[serde(rename = "S", default)]
     pub state: Option<String>,
+    #[serde(rename = "X", default)]
+    pub desc: Option<String>,
 }
 
 pub fn load_services() -> Result<Vec<Svc>, String> {
     let raw = common::ps_json::<RawSvc>(
-        "Get-CimInstance Win32_Service | Select-Object @{n='N';e={$_.Name}},@{n='D';e={$_.DisplayName}},@{n='S';e={$_.State}}",
+        "Get-CimInstance Win32_Service | Select-Object @{n='N';e={$_.Name}},@{n='D';e={$_.DisplayName}},@{n='S';e={$_.State}},@{n='X';e={$_.Description}}",
     )?;
     Ok(raw
         .into_iter()
@@ -333,6 +337,7 @@ pub fn load_services() -> Result<Vec<Svc>, String> {
                 start: start_type(&System, &r.name),
                 note: note_for(&r.name),
                 state: r.state.unwrap_or_default(),
+                desc: r.desc.unwrap_or_default(),
                 name_lc: r.name.to_lowercase(),
                 display_lc: display.to_lowercase(),
                 name: r.name,

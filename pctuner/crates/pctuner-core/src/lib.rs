@@ -4,6 +4,7 @@
 pub mod bloat;
 pub mod common;
 pub mod defender;
+pub mod explain;
 pub mod fan;
 pub mod gpolicy;
 pub mod gpu;
