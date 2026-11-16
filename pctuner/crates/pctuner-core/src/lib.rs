@@ -5,6 +5,7 @@ pub mod bloat;
 pub mod common;
 pub mod defender;
 pub mod gpolicy;
+pub mod gpu;
 pub mod network;
 pub mod opwin;
 pub mod perf;

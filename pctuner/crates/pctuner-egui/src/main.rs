@@ -413,7 +413,7 @@ fn main() -> eframe::Result<()> {
     }));
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--gpu-guard") {
-        std::process::exit(gpu::guard_main(args.iter().any(|a| a == "--dry-run")));
+        std::process::exit(pctuner_core::gpu::guard_main(args.iter().any(|a| a == "--dry-run")));
     }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("PC Tuner")

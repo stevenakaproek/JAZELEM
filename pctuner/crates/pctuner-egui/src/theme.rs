@@ -47,6 +47,7 @@ pub fn tone(t: pctuner_core::common::Tone) -> Color32 {
         Tone::Text => TEXT,
         Tone::Dim => TEXT_DIM,
         Tone::Faint => TEXT_FAINT,
+        Tone::Off => DIM,
         Tone::Warn => GAMING,
         Tone::Junk => JUNK,
         Tone::Error => LOCKED,

@@ -743,6 +743,8 @@ pub enum Tone {
     Text,
     Dim,
     Faint,
+    /// Switched off / nothing applied (grey).
+    Off,
     Warn,
     /// Something left over that is safe to clean up (orange).
     Junk,
