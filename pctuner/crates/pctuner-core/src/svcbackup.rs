@@ -291,10 +291,15 @@ impl Backups {
                 }
             }
             if !running {
+                // what PowerShell said last (the reason, when it stopped early)
+                let why = stream.lines.iter().rev().find(|l| !l.trim().is_empty() && parse_result(l).is_none()).map(|l| common::cap_text(l.trim(), 300));
                 self.run = None;
                 if let Some(op) = &mut self.op {
                     for it in op.items.iter_mut().filter(|i| i.result.is_none()) {
-                        it.result = Some(Err("No result - the restore stopped early.".into()));
+                        it.result = Some(Err(match &why {
+                            Some(w) => format!("No result - the restore stopped early: {w}"),
+                            None => "No result - the restore stopped early.".into(),
+                        }));
                     }
                     op.notes.push("Restart the PC so every service starts the way the backup says.".into());
                     op.done();
@@ -319,7 +324,11 @@ impl Backups {
                     match common::secure_dir() {
                         Ok(d) => {
                             let script = restore_script(&diffs, &d.display().to_string());
-                            self.run = Some((common::ps_stream(&script), 0));
+                            // from a file: with a few dozen services the script is far too long for a
+                            // command line (-EncodedCommand doubles it twice over the 32767-character limit),
+                            // so PowerShell never started and every row said "stopped early"
+                            let path = common::write_script("restore-services.ps1", &script);
+                            self.run = Some((Stream::run_ps_file(&path, &[]), 0));
                             if let Some(op) = &mut self.op {
                                 op.stage = Stage::Running;
                             }
@@ -401,6 +410,20 @@ mod tests {
         // the generated script must parse
         let check = format!("$e = $null; [void][System.Management.Automation.Language.Parser]::ParseInput({}, [ref]$null, [ref]$e); $e.Count", q(&r));
         assert_eq!(crate::common::ps(&check).unwrap().trim(), "0", "restore script has PowerShell syntax errors");
+    }
+
+    /// The bug: a restore of a few dozen services was passed with -EncodedCommand and went over the
+    /// 32767-character command-line limit, so PowerShell never started. It now runs from a file; this
+    /// checks that the real script for a typical restore is far beyond what a command line could carry.
+    #[test]
+    fn svcbackup_big_restore_does_not_fit_a_command_line() {
+        let diffs: Vec<(Svc, Svc)> = (0..25).map(|i| (s(&format!("Service{i}"), 2, Some(1)), s(&format!("Service{i}"), 4, None))).collect();
+        let r = restore_script(&diffs, r"C:\ProgramData\PCTuner");
+        let encoded = (r.encode_utf16().count() * 2).div_ceil(3) * 4;
+        assert!(encoded > 32767, "the 25-service script ({encoded} encoded characters) must not be passed on a command line");
+        let src = include_str!("svcbackup.rs");
+        let go = &src[src.find("OpEvent::Go =>").unwrap()..src.find("OpEvent::Close =>").unwrap()];
+        assert!(go.contains("run_ps_file") && !go.contains("ps_stream("), "the restore runs from a file");
     }
 
     #[test]
