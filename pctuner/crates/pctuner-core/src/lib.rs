@@ -11,6 +11,7 @@ pub mod perf;
 pub mod ramled;
 pub mod scheduler;
 pub mod services;
+pub mod startup;
 pub mod svcbackup;
 pub mod tweaks;
 
