@@ -128,7 +128,7 @@ function row(pol: Policy, index: number): PolicyRow {
     currentColor: pol.cur.kind === "not_configured" ? "" : "green",
     target: label(pol, tgt),
     note,
-    rec: pol.rec ? (same(pol.rec, tgt) ? { text: "recommended", color: "accent" } : { text: `recommended: ${label(pol, pol.rec)}`, color: "" }) : { text: "your choice", color: "" },
+    rec: pol.rec ? (same(pol.rec, tgt) ? { text: "recommended", color: "accent" } : { text: `recommended: ${label(pol, pol.rec)}`, color: "", can: true }) : { text: "your choice", color: "" },
     opts: tgt.kind === "enabled" ? pol.opts.map((o, k) => ({ label: o.label, value: vals[k], known: o.choices.some((c) => c[1] === vals[k]), choices: o.choices.map(([l, value]) => ({ label: l, value })) })) : [],  };
 }
 
@@ -174,6 +174,11 @@ export const gpolicy: MockTab<View, Action> = {
       case "set":
         setTarget(policies[a.index], a.state === "enabled" ? on() : a.state === "disabled" ? off : nc);
         break;
+      case "recommend": {
+        const pol = policies[a.index];
+        if (pol.rec) pol.want = same(pol.rec, pol.cur) ? null : pol.rec;
+        break;
+      }
       case "reset":
         policies[a.index].want = null;
         break;

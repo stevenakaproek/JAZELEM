@@ -22,6 +22,8 @@ enum Choice {
 enum Action {
     /// The row's own Not configured / Enabled / Disabled control (that policy only).
     Set { index: usize, state: Choice },
+    /// A click on the row's "recommended: ..." label: choose the recommended setting for that policy.
+    Recommend { index: usize },
     /// The row's own "Reset" button.
     Reset { index: usize },
     /// A drop-down of an enabled policy.
@@ -85,7 +87,7 @@ impl GpolicyTab {
         };
         let rec = match p.rec_state() {
             Some(r) if r == tgt => json!({ "text": "recommended", "color": "accent" }),
-            Some(r) => json!({ "text": format!("recommended: {}", p.label(&r)), "color": "" }),
+            Some(r) => json!({ "text": format!("recommended: {}", p.label(&r)), "color": "", "can": true }),
             None => json!({ "text": "your choice", "color": "" }),
         };
         json!({
@@ -184,6 +186,21 @@ impl Backend for GpolicyTab {
                         Choice::NotConfigured => St::NotConfigured,
                     };
                     self.g.set_target(index, s);
+                }
+            }
+            Action::Recommend { index } => {
+                if loaded && !busy && index < n {
+                    let p = &POLICIES[index];
+                    match p.rec_state() {
+                        // a recommendation with its own drop-down values is taken exactly
+                        Some(St::Enabled(v)) if !v.is_empty() && v.len() == p.opts.len() => {
+                            let s = St::Enabled(v);
+                            let cur = self.g.states.get(index).cloned().unwrap_or(St::NotConfigured);
+                            self.g.want[index] = if s == cur { None } else { Some(s) };
+                        }
+                        Some(s) => self.g.set_target(index, s),
+                        None => {}
+                    }
                 }
             }
             Action::Reset { index } => {

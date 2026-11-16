@@ -12,6 +12,8 @@ interface Chip {
   text: string;
   color: BadgeColor;
   tip?: string;
+  /** The recommended label can be clicked to choose that setting. */
+  can?: boolean;
 }
 
 export interface PolicyOpt {
@@ -63,7 +65,7 @@ export interface View {
 export type PolicyChoice = "enabled" | "disabled" | "not_configured";
 
 export type Action =
-  | { kind: "reset"; index: number }
+  | { kind: "reset" | "recommend"; index: number }
   | { kind: "set"; index: number; state: PolicyChoice }
   | { kind: "opt"; index: number; opt: number; value: number }
   | { kind: "search"; text: string }
@@ -80,6 +82,15 @@ const CHOICES: { value: PolicyChoice; label: string }[] = [
 
 /** One policy with its own Not configured / Enabled / Disabled control. Nothing is written until Apply. */
 function PolicyLine({ r, canEdit, act }: { r: PolicyRow; canEdit: boolean; act: Act }) {
+  // "recommended: Enabled" is a button: a click chooses that setting for this policy
+  const rec =
+    r.rec.can && canEdit ? (
+      <button type="button" className="badge gp-rec" title="Click to choose the recommended setting for this policy." onClick={() => void act({ kind: "recommend", index: r.index })}>
+        {r.rec.text}
+      </button>
+    ) : (
+      <Badge color={r.rec.color}>{r.rec.text}</Badge>
+    );
   return (
     <div className={cx("row", "gp-row", r.changed && "changed")}>
       <span className="row-main">
@@ -119,6 +130,7 @@ function PolicyLine({ r, canEdit, act }: { r: PolicyRow; canEdit: boolean; act: 
               <Button variant="plain" title="Keep it as it is now." onClick={() => void act({ kind: "reset", index: r.index })}>
                 Reset
               </Button>
+              {rec}
             </>
           ) : (
             <>
@@ -128,7 +140,7 @@ function PolicyLine({ r, canEdit, act }: { r: PolicyRow; canEdit: boolean; act: 
                 </Badge>
               )}
               {r.state === "other" && <Badge color={r.currentColor}>{r.current}</Badge>}
-              <Badge color={r.rec.color}>{r.rec.text}</Badge>
+              {rec}
             </>
           )}
         </span>
