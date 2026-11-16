@@ -54,6 +54,8 @@ namespace PCTunerFan
     public sealed class EneDevice
     {
         public const byte FirstAddr = 0x70, LastAddr = 0x77;
+        /// <summary>Where ASUS graphics cards keep their ENE LED controller, on the card's own I2C bus.</summary>
+        public const byte GpuAddr = 0x67;
         public const int ModeOff = 0, ModeStatic = 1, ModeRainbow = 5;
         const ushort RegName = 0x1000, RegMicron = 0x1030, RegConfig = 0x1C00;
         const ushort RegEffectV1 = 0x8010, RegEffectV2 = 0x8160;
@@ -65,9 +67,10 @@ namespace PCTunerFan
         readonly byte addr;
         ushort effectReg; // 0: unknown controller version, colours are left alone
 
-        EneDevice(IEneBus bus, byte addr)
+        EneDevice(IEneBus bus, byte addr, bool gpu)
         {
-            if (addr < FirstAddr || addr > LastAddr) throw new ArgumentException($"address 0x{addr:X2} is outside the LED controller range");
+            // RAM: only 0x70-0x77 (the same bus carries the SPD chips); a graphics card: only 0x67
+            if (gpu ? addr != GpuAddr : addr < FirstAddr || addr > LastAddr) throw new ArgumentException($"address 0x{addr:X2} is outside the LED controller range");
             this.bus = bus;
             this.addr = addr;
         }
@@ -122,10 +125,10 @@ namespace PCTunerFan
 
         /// <summary>Read-only until the address has answered with the ENE test pattern (only then is the
         /// register pointer set, which is the first thing written). Null: no supported controller here.</summary>
-        public static EneDevice Probe(IEneBus bus, byte addr, out EneStick stick)
+        public static EneDevice Probe(IEneBus bus, byte addr, out EneStick stick, bool gpu = false)
         {
             stick = null;
-            var d = new EneDevice(bus, addr);
+            var d = new EneDevice(bus, addr, gpu);
             for (int i = 0; i < 16; i++)
                 if (bus.ReadByteData(addr, (byte)(0xA0 + i)) != i) return null;
             string name = d.ReadString(RegName, 16);

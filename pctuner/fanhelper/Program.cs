@@ -441,6 +441,7 @@ namespace PCTunerFan
             {
                 if (args.Contains("--selftest")) return SelfTest();
                 if (args.Contains("--ramled")) return RamLed.Run(args); // RAM LED tab: one-shot, never touches the fans
+                if (args.Contains("--gpuled")) return GpuLed.Run(args); // RAM LED tab, graphics card section: one-shot
                 if (args.Contains("--dump"))
                 {
                     int i = Array.IndexOf(args, "--dump");
@@ -815,6 +816,7 @@ namespace PCTunerFan
             Check(Safety.Hysteresis(65, 62) == 62, "hysteresis follows a 3 C drop");
             ControllerTests(Check);
             RamLed.SelfTest(Check);
+            GpuLed.SelfTest(Check);
             Console.Out.WriteLine(fails == 0 ? "selftest passed" : $"selftest FAILED ({fails})");
             return fails == 0 ? 0 : 1;
         }

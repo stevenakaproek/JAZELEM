@@ -13,6 +13,30 @@ pub const SAVED: &str = "ramled.json";
 pub const MODE_OFF: u8 = 0;
 pub const MODE_STATIC: u8 = 1;
 pub const MODE_RAINBOW: u8 = 5;
+/// The graphics card controller cannot be read back: its state is unknown until PC Tuner sets it.
+pub const MODE_UNKNOWN: u8 = 255;
+
+/// Which LEDs: the memory sticks (`--ramled`) or the graphics card (`--gpuled`, fanhelperGpuLed.cs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Ram,
+    Gpu,
+}
+
+impl Target {
+    pub fn flag(self) -> &'static str {
+        match self {
+            Target::Ram => "--ramled",
+            Target::Gpu => "--gpuled",
+        }
+    }
+    pub fn saved_file(self) -> &'static str {
+        match self {
+            Target::Ram => SAVED,
+            Target::Gpu => "gpuled.json",
+        }
+    }
+}
 
 /// One stick's LED controller as the helper reports it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -78,6 +102,7 @@ pub fn describe(s: &Stick) -> String {
             None => "Static colour".into(),
         },
         MODE_RAINBOW => "Rainbow".into(),
+        MODE_UNKNOWN => "Not set by PC Tuner yet".into(),
         m => format!("Effect {m}"),
     }
 }
@@ -89,21 +114,21 @@ pub fn restore_arg(s: &Stick) -> String {
 
 /// The helper prints one JSON line; anything else on stdout is ignored.
 pub fn parse_reply(stdout: &str) -> Result<Vec<Stick>, String> {
-    let line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{')).ok_or("The RAM LED helper gave no answer.")?;
-    let r: Reply = serde_json::from_str(line.trim()).map_err(|e| format!("The RAM LED helper's answer could not be read: {e}"))?;
+    let line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{')).ok_or("The LED helper gave no answer.")?;
+    let r: Reply = serde_json::from_str(line.trim()).map_err(|e| format!("The LED helper's answer could not be read: {e}"))?;
     if r.ok {
         Ok(r.sticks)
     } else if r.error.is_empty() {
-        Err("The RAM LED helper failed.".into())
+        Err("The LED helper failed.".into())
     } else {
         Err(r.error)
     }
 }
 
-pub fn run_helper(args: Vec<String>) -> Result<Vec<Stick>, String> {
+pub fn run_helper(target: Target, args: Vec<String>) -> Result<Vec<Stick>, String> {
     let exe = crate::fan_files::extract_helper()?;
     let out = Command::new(&exe)
-        .arg("--ramled")
+        .arg(target.flag())
         .args(&args)
         .stdin(Stdio::null())
         .creation_flags(common::CREATE_NO_WINDOW)
@@ -114,6 +139,7 @@ pub fn run_helper(args: Vec<String>) -> Result<Vec<Stick>, String> {
 
 /// The RAM LED state: the sticks found, the running helper call, and what is remembered between runs.
 pub struct RamLed {
+    pub target: Target,
     pub sticks: Vec<Stick>,
     pub error: Option<String>,
     pub status: String,
@@ -132,9 +158,13 @@ impl Default for RamLed {
 
 impl RamLed {
     pub fn new() -> Self {
-        let saved: Saved = common::load_json(SAVED);
+        Self::for_target(Target::Ram)
+    }
+
+    pub fn for_target(target: Target) -> Self {
+        let saved: Saved = common::load_json(target.saved_file());
         let color = saved.color.unwrap_or([255, 255, 255]);
-        RamLed { sticks: vec![], error: None, status: String::new(), job: None, scanned: false, saved, color }
+        RamLed { target, sticks: vec![], error: None, status: String::new(), job: None, scanned: false, saved, color }
     }
 
     pub fn start(&mut self, mut args: Vec<String>, what: &str) {
@@ -143,7 +173,8 @@ impl RamLed {
             args.push("--save".into());
         }
         self.status = what.to_string();
-        self.job = Some((Job::spawn(move || run_helper(args)), change));
+        let target = self.target;
+        self.job = Some((Job::spawn(move || run_helper(target, args)), change));
     }
 
     pub fn finish(&mut self, result: Result<Vec<Stick>, String>, change: bool) {
@@ -155,11 +186,14 @@ impl RamLed {
                 } else if self.saved.no_save {
                     "Done. Not saved: the LEDs go back to their stored setting at the next power-on.".into()
                 } else {
-                    "Done, and saved in the RAM: it stays like this after a restart.".into()
+                    match self.target {
+                        Target::Ram => "Done, and saved in the RAM: it stays like this after a restart.".into(),
+                        Target::Gpu => "Done, and saved in the graphics card: it stays like this after a restart.".into(),
+                    }
                 };
                 // remember the last lit state of each stick for "Turn on"
                 let mut dirty = false;
-                for s in sticks.iter().filter(|s| is_lit(s)) {
+                for s in sticks.iter().filter(|s| is_lit(s) && s.mode != MODE_UNKNOWN) {
                     match self.saved.last_on.iter_mut().find(|o| o.id == s.id) {
                         Some(o) if o == s => {}
                         Some(o) => {
@@ -173,7 +207,7 @@ impl RamLed {
                     }
                 }
                 if dirty {
-                    common::save_json(SAVED, &self.saved);
+                    common::save_json(self.target.saved_file(), &self.saved);
                 }
                 self.sticks = sticks;
             }
@@ -213,7 +247,7 @@ impl RamLed {
 
     /// Store the colour picker's colour.
     pub fn save_settings(&self) {
-        common::save_json(SAVED, &self.saved);
+        common::save_json(self.target.saved_file(), &self.saved);
     }
 }
 
@@ -252,7 +286,7 @@ mod tests {
 
     #[test]
     fn ramled_turn_on_uses_last_lit_state() {
-        let mut t = RamLed { sticks: vec![], error: None, status: String::new(), job: None, scanned: true, saved: Saved::default(), color: [0; 3] };
+        let mut t = RamLed { target: Target::Ram, sticks: vec![], error: None, status: String::new(), job: None, scanned: true, saved: Saved::default(), color: [0; 3] };
         t.finish(Ok(vec![stick(MODE_OFF, "000000000000")]), false);
         assert_eq!(t.on_args(), vec!["rainbow".to_string()], "never seen lit: rainbow");
         t.saved.last_on = vec![stick(MODE_STATIC, "FF0000FF0000")];
@@ -265,7 +299,7 @@ mod tests {
     #[ignore]
     fn ramled_live_detect() {
         assert!(common::is_admin(), "run elevated");
-        let r = run_helper(vec!["detect".into()]);
+        let r = run_helper(Target::Ram, vec!["detect".into()]);
         if let Ok(p) = std::env::var("RAMLED_LIVE_LOG") {
             let _ = std::fs::write(p, format!("{r:#?}"));
         }
@@ -280,10 +314,10 @@ mod tests {
     #[ignore]
     fn ramled_live_toggle() {
         assert!(common::is_admin(), "run elevated");
-        let before = run_helper(vec!["detect".into()]).expect("detect");
-        let off = run_helper(vec!["off".into()]).expect("off");
+        let before = run_helper(Target::Ram, vec!["detect".into()]).expect("detect");
+        let off = run_helper(Target::Ram, vec!["off".into()]).expect("off");
         assert!(off.iter().all(|s| s.mode == MODE_OFF));
-        let back = run_helper(std::iter::once("restore".to_string()).chain(before.iter().map(restore_arg)).collect()).expect("restore");
+        let back = run_helper(Target::Ram, std::iter::once("restore".to_string()).chain(before.iter().map(restore_arg)).collect()).expect("restore");
         assert_eq!(back, before);
     }
 }

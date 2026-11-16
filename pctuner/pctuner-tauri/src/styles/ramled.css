@@ -21,6 +21,14 @@
 .ramled-color:disabled {
   opacity: 0.4;
 }
+.ramled-heading {
+  margin: var(--s4) 0 calc(-1 * var(--s1));
+  font-size: var(--text-lg);
+  font-weight: 600;
+}
+.ramled-heading:first-of-type {
+  margin-top: 0;
+}
 .ramled-divider {
   width: 1px;
   height: var(--control-h);
