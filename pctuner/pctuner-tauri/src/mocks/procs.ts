@@ -1,5 +1,5 @@
 import type { Action, Compare, ProcRow, Side, View } from "../tabs/Processes";
-import { mockAdmin } from "./env";
+import { mockAdmin, mockParams } from "./env";
 import type { MockTab } from "./types";
 
 type Item = [exe: string, title: string, kind: ProcRow["kind"], mb: number | null, what: string, loses: string];
@@ -31,7 +31,12 @@ const now = () => {
   return `2026-11-16 ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 };
 
+// "?state=again": Windows started the switched-off touch keyboard again after sign-in
+const again = mockParams.get("state") === "again";
+if (again) changed.set("TabTip", { what: "off", when: "2026-11-16 13:43:47" });
+
 function liveMb(exe: string, mb: number | null): number | null {
+  if (again && exe === "TabTip") return mb;
   return changed.get(exe)?.what === "off" ? null : mb;
 }
 
@@ -48,8 +53,8 @@ function row([exe, title, kind, mb, what, loses]: Item): ProcRow {
     kind,
     running: m === null ? 0 : 1,
     mb: m,
-    state: kind === "keep" ? "left alone" : c ? (c.what === "off" ? "switched off" : "lower priority") : "as Windows set it",
-    tone: kind === "keep" ? "Dim" : c ? "Ok" : "Text",
+    state: kind === "keep" ? "left alone" : c ? (c.what === "off" ? (m !== null ? "off, but running again (low priority)" : "switched off") : "lower priority") : "as Windows set it",
+    tone: kind === "keep" ? "Dim" : c ? (c.what === "off" && m !== null ? "Warn" : "Ok") : "Text",
     changed: !!c,
     when: c?.when ?? null,
     detail: c ? `HKLM\\...\\Image File Execution Options\\${exe}.exe\\PerfOptions  CpuPriorityClass = 5\nHKLM\\...\\Image File Execution Options\\${exe}.exe\\PerfOptions  IoPriority = 1` : null,
@@ -74,6 +79,8 @@ function compare(): Compare | null {
     })),
     savedMb: n >= 2 ? measures[n - 2].listedMb - measures[n - 1].listedMb : null,
     count: n,
+    // the stand-in pretends a game ran during the first measurement only
+    warnings: n >= 2 && n % 2 === 0 ? ["A game was running during the first measurement but not the second, so the whole-PC numbers mostly show the game closing."] : [],
   };
 }
 
@@ -109,6 +116,7 @@ export const procs: MockTab<View, Action> = {
       rows,
       hero: { running: changeable.length, runningMb: changeable.reduce((a, r) => a + (r.mb ?? 0), 0), changed: changed.size },
       canUndoAll: mockAdmin && changed.size > 0,
+      signIn: [...changed.values()].some((c) => c.what === "off") ? "Closed again 30 s and 2 min after every sign-in by the task \\PCTuner\\CloseSwitchedOff (Undo removes it)." : null,
       measuring: measuring === null ? null : { secs: Math.min(30, Math.floor(measuring)), of: 30 },
       compare: compare(),
     };

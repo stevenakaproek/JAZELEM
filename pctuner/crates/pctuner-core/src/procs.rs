@@ -329,6 +329,44 @@ pub fn apply(e: &Entry, what: What) -> Result<Change, String> {
     Ok(Change { exe: e.exe.into(), what, time: common::now(), writes, undone: false, notes })
 }
 
+/// Windows starts some switched-off processes at sign-in anyway (sihost starts Resume from phone, the
+/// text input service starts the touch keyboard). This task closes them shortly after every sign-in.
+pub const CLOSE_TASK_PATH: &str = r"\PCTuner\";
+pub const CLOSE_TASK_NAME: &str = "CloseSwitchedOff";
+
+/// The PowerShell that makes the sign-in task match `exes` (removed when the list is empty).
+pub fn close_task_script(exes: &[String]) -> String {
+    // only catalog names, so nothing from outside reaches the command line
+    let exes: Vec<&str> = exes.iter().filter_map(|x| entry(x)).filter(|e| e.kind == Kind::Off).map(|e| e.exe).collect();
+    let unregister = format!("Unregister-ScheduledTask -TaskName {} -TaskPath {} -Confirm:$false -ErrorAction SilentlyContinue", common::psq(CLOSE_TASK_NAME), common::psq(CLOSE_TASK_PATH));
+    if exes.is_empty() {
+        return unregister;
+    }
+    let ims: Vec<String> = exes.iter().map(|e| format!("/IM {e}.exe")).collect();
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $a = New-ScheduledTaskAction -Execute 'taskkill.exe' -Argument {}\n\
+         $t1 = New-ScheduledTaskTrigger -AtLogOn; $t1.Delay = 'PT30S'\n\
+         $t2 = New-ScheduledTaskTrigger -AtLogOn; $t2.Delay = 'PT2M'\n\
+         $p = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -RunLevel Highest\n\
+         $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 1)\n\
+         Register-ScheduledTask -TaskName {} -TaskPath {} -Description 'PC Tuner: closes the processes switched off on the Processes page, after sign-in. Undo on that page removes it.' -Action $a -Trigger $t1,$t2 -Principal $p -Settings $s -Force | Out-Null",
+        common::psq(&format!("/F {}", ims.join(" "))),
+        common::psq(CLOSE_TASK_NAME),
+        common::psq(CLOSE_TASK_PATH),
+    )
+}
+
+/// Make the sign-in task close exactly `exes`.
+pub fn sync_close_task(exes: &[String]) -> Result<(), String> {
+    common::ps(&close_task_script(exes)).map(|_| ()).map_err(|e| format!("the sign-in task could not be updated: {}", e.lines().next().unwrap_or("").trim()))
+}
+
+/// Is the sign-in task there?
+pub fn close_task_exists() -> bool {
+    common::run("schtasks.exe", &["/Query", "/TN", &format!("{CLOSE_TASK_PATH}{CLOSE_TASK_NAME}")]).map(|(c, _)| c == 0).unwrap_or(false)
+}
+
 pub fn undo(c: &Change) -> Result<(), String> {
     let mut errs = vec![];
     for w in c.writes.iter().rev() {
@@ -405,6 +443,37 @@ pub struct Measure {
     /// Changes in effect when it was taken: "TabTip off", "AppActions lowered"...
     #[serde(default)]
     pub setup: Vec<String>,
+    /// Minutes since Windows started.
+    #[serde(default)]
+    pub uptime_min: Option<u64>,
+}
+
+/// Processes that mean a game is running (the game itself, or an anti-cheat that only runs with one).
+pub const GAME_SIGNS: &[&str] = &["HaloInfinite", "EasyAntiCheat_EOS"];
+
+/// Why two measurements are not a fair before / after comparison (empty = they are).
+pub fn unlike(before: &Measure, after: &Measure) -> Vec<String> {
+    let mut v = vec![];
+    let game = |m: &Measure| GAME_SIGNS.iter().any(|g| m.procs.contains_key(*g));
+    match (game(before), game(after)) {
+        (true, false) => v.push("A game was running during the first measurement but not the second, so the whole-PC numbers mostly show the game closing.".to_string()),
+        (false, true) => v.push("A game was running during the second measurement but not the first, so the whole-PC numbers mostly show the game.".to_string()),
+        _ => {}
+    }
+    if let (Some(a), Some(b)) = (before.ram_used_mb, after.ram_used_mb) {
+        let d = a.abs_diff(b);
+        if d > 3000 && !v.iter().any(|s| s.contains("game")) {
+            v.push(format!("Memory in use differs by {:.1} GB, so the PC was doing different things in the two measurements.", d as f64 / 1024.0));
+        }
+    }
+    if after.uptime_min.is_some_and(|u| u < 5) {
+        v.push("The second measurement was taken within 5 minutes of starting Windows; some processes start later, so measure again after a few minutes.".to_string());
+    }
+    v
+}
+
+fn uptime_min() -> u64 {
+    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() / 60_000 }
 }
 
 impl Measure {
@@ -457,6 +526,7 @@ pub fn measure(secs: u64, setup: Vec<String>) -> Measure {
         pc_cpu: if cpu.is_empty() { None } else { Some(cpu.iter().sum::<f64>() / cpu.len() as f64) },
         ram_used_mb: sysinfo::memory().map(|(u, _)| u),
         setup,
+        uptime_min: Some(uptime_min()),
     }
 }
 
@@ -467,7 +537,10 @@ pub struct Procs {
     pub measures: Vec<Measure>,
     pub setups: Vec<Setup>,
     pub live: BTreeMap<String, ProcUse>,
-    pub scan: Option<Job<(Vec<Setup>, BTreeMap<String, ProcUse>)>>,
+    pub scan: Option<Job<(Vec<Setup>, BTreeMap<String, ProcUse>, bool)>>,
+    /// The sign-in task is there (read with every scan).
+    pub task: Option<bool>,
+    pub task_tried: bool,
     pub work: Option<(String, Job<Result<Option<Change>, String>>)>,
     pub measuring: Option<(Instant, Job<Measure>)>,
     pub note: Option<(bool, String)>,
@@ -487,6 +560,8 @@ impl Procs {
             setups: vec![],
             live: BTreeMap::new(),
             scan: None,
+            task: None,
+            task_tried: false,
             work: None,
             measuring: None,
             note: None,
@@ -499,16 +574,24 @@ impl Procs {
 
     pub fn rescan(&mut self) {
         if self.scan.is_none() {
-            self.scan = Some(Job::spawn(|| (CATALOG.iter().map(read_setup).collect(), snapshot())));
+            self.scan = Some(Job::spawn(|| (CATALOG.iter().map(read_setup).collect(), snapshot(), close_task_exists())));
         }
     }
 
     pub fn pump(&mut self) {
         if let Some(j) = &self.scan {
-            if let Some((s, l)) = j.poll() {
+            if let Some((s, l, t)) = j.poll() {
                 self.setups = s;
                 self.live = l;
+                self.task = Some(t);
                 self.scan = None;
+                // processes switched off before the sign-in task existed (or the task was deleted): add it
+                let offs = self.off_list();
+                if !t && !offs.is_empty() && common::is_admin() && self.work.is_none() && !self.task_tried {
+                    // once per run, so a failure does not retry on every scan
+                    self.task_tried = true;
+                    self.work = Some(("Sign-in task added".into(), Job::spawn(move || sync_close_task(&offs).map(|_| None))));
+                }
             }
         }
         if let Some((label, j)) = &self.work {
@@ -558,7 +641,28 @@ impl Procs {
             return;
         }
         let label = format!("{} {}", e.title, if what == What::Off { "switched off" } else { "lowered" });
-        self.work = Some((label, Job::spawn(move || apply(e, what).map(Some))));
+        let mut offs = self.off_list();
+        if what == What::Off {
+            offs.push(e.exe.to_string());
+        }
+        self.work = Some((
+            label,
+            Job::spawn(move || {
+                let mut c = apply(e, what)?;
+                if what == What::Off {
+                    match sync_close_task(&offs) {
+                        Ok(()) => c.notes.push("closed after every sign-in from now on".into()),
+                        Err(err) => c.notes.push(err),
+                    }
+                }
+                Ok(Some(c))
+            }),
+        ));
+    }
+
+    /// The processes switched off now (not undone).
+    pub fn off_list(&self) -> Vec<String> {
+        self.history.iter().filter(|c| !c.undone && c.what == What::Off).map(|c| c.exe.clone()).collect()
     }
 
     pub fn undo(&mut self, exe: &str) {
@@ -568,8 +672,18 @@ impl Procs {
         let Some(i) = self.active(exe) else { return };
         self.history[i].undone = true;
         let c = self.history[i].clone();
+        let offs = self.off_list();
         let title = entry(exe).map(|e| e.title).unwrap_or(exe);
-        self.work = Some((format!("{title} undone"), Job::spawn(move || undo(&c).map(|_| None))));
+        self.work = Some((
+            format!("{title} undone"),
+            Job::spawn(move || {
+                undo(&c)?;
+                if c.what == What::Off {
+                    sync_close_task(&offs)?;
+                }
+                Ok(None)
+            }),
+        ));
     }
 
     pub fn undo_all(&mut self) {
@@ -584,7 +698,10 @@ impl Procs {
             return;
         }
         self.work = Some(("Undo all".into(), Job::spawn(move || {
-            let errs: Vec<String> = list.iter().rev().filter_map(|c| undo(c).err()).collect();
+            let mut errs: Vec<String> = list.iter().rev().filter_map(|c| undo(c).err()).collect();
+            if let Err(e) = sync_close_task(&[]) {
+                errs.push(e);
+            }
             if errs.is_empty() { Ok(None) } else { Err(errs.join("; ")) }
         })));
     }
@@ -602,12 +719,14 @@ impl Procs {
     }
 }
 
-/// Text and colour of a row's state.
-pub fn state_text(e: &Entry, s: Option<&Setup>, active: Option<&Change>) -> (String, Tone) {
+/// Text and colour of a row's state. `running`: the process is running right now.
+pub fn state_text(e: &Entry, s: Option<&Setup>, active: Option<&Change>, running: bool) -> (String, Tone) {
     if e.kind == Kind::Keep {
         return ("left alone".into(), Tone::Dim);
     }
     match (active.map(|c| c.what), s) {
+        // Windows started it again (at sign-in, or when something asked for it): say so
+        (Some(What::Off), _) if running => ("off, but running again (low priority)".into(), Tone::Warn),
         (Some(What::Off), _) => ("switched off".into(), Tone::Ok),
         (Some(What::Lower), _) => ("lower priority".into(), Tone::Ok),
         (None, Some(s)) if s.off => ("off (set elsewhere)".into(), Tone::Dim),
@@ -685,6 +804,45 @@ mod tests {
         assert_eq!(read_dword(Hive::Hkcu, &base, "Kept"), Some(7));
         assert!(root.open_subkey(&base).is_ok(), "a key that was there stays");
         let _ = root.delete_subkey_all(&base);
+    }
+
+    #[test]
+    fn sign_in_task_closes_only_switched_off_catalog_processes() {
+        let s = close_task_script(&["TabTip".into(), "CrossDeviceResume".into(), "AppActions".into(), "calc & evil".into(), "HaloInfinite".into()]);
+        assert!(s.contains("'/F /IM TabTip.exe /IM CrossDeviceResume.exe'"), "{s}");
+        assert!(!s.contains("AppActions") && !s.contains("evil") && !s.contains("Halo"), "only Off entries from the catalog: {s}");
+        assert!(s.contains("Register-ScheduledTask") && s.contains("S-1-5-18") && s.contains("-AtLogOn"));
+        // nothing switched off: the task is removed
+        let none = close_task_script(&[]);
+        assert!(none.starts_with("Unregister-ScheduledTask") && !none.contains("Register-ScheduledTask -"), "{none}");
+        assert_eq!(close_task_script(&["AppActions".into()]), none, "a lowered process never gets the task");
+    }
+
+    #[test]
+    fn switched_off_but_running_again_is_not_called_off() {
+        let e = entry("TabTip").unwrap();
+        let c = Change { exe: "TabTip".into(), what: What::Off, time: String::new(), writes: vec![], undone: false, notes: vec![] };
+        assert_eq!(state_text(e, None, Some(&c), false).1, Tone::Ok);
+        let (t, tone) = state_text(e, None, Some(&c), true);
+        assert_eq!(tone, Tone::Warn);
+        assert!(t.contains("running again"));
+    }
+
+    #[test]
+    fn unlike_measurements_are_flagged() {
+        let with_game = |game: bool, ram: u64, up: u64| {
+            let mut procs = BTreeMap::new();
+            if game {
+                procs.insert("HaloInfinite".to_string(), ProcMeasure { count: 1, mb: 4800.0, cpu_pct: Some(3.8) });
+            }
+            Measure { procs, ram_used_mb: Some(ram), uptime_min: Some(up), ..Default::default() }
+        };
+        // the user's real case: Halo in the first, a fresh restart in the second
+        let w = unlike(&with_game(true, 17039, 300), &with_game(false, 5315, 1));
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("game") && w[1].contains("5 minutes"));
+        assert!(unlike(&with_game(false, 5000, 60), &with_game(false, 5200, 90)).is_empty());
+        assert!(unlike(&with_game(false, 5000, 60), &with_game(false, 9000, 90))[0].contains("GB"));
     }
 
     #[test]

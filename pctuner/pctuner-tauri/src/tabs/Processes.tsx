@@ -44,6 +44,8 @@ export interface Compare {
   rows: { title: string; file: string; before: Cell; after: Cell }[];
   savedMb: number | null;
   count: number;
+  /** why the two measurements are not a fair comparison */
+  warnings: string[];
 }
 
 export interface View {
@@ -56,6 +58,8 @@ export interface View {
   rows: ProcRow[];
   hero: { running: number; runningMb: number; changed: number };
   canUndoAll: boolean;
+  /** about the sign-in task that closes switched-off processes (null when nothing is switched off) */
+  signIn: string | null;
   measuring: { secs: number; of: number } | null;
   compare: Compare | null;
 }
@@ -142,6 +146,11 @@ function MeasureCard({ view, act }: { view: View; act: Act }) {
         {m && <Progress value={m.secs / m.of} />}
         {c && (
           <>
+            {c.warnings.length > 0 && (
+              <Banner kind="warn">
+                Not a fair comparison: {c.warnings.join(" ")}
+              </Banner>
+            )}
             {c.before && c.savedMb !== null && (
               <div className={cx("proc-saved", c.savedMb > 0 ? "tone-ok" : "secondary")}>
                 {c.savedMb > 0 ? `${c.savedMb} MB less memory used by these processes` : c.savedMb < 0 ? `${-c.savedMb} MB more memory than before` : "No memory difference"}
@@ -243,7 +252,15 @@ export function Processes() {
             </Banner>
           )}
           <MeasureCard view={view} act={act} />
-          <Group title="Can be switched off" footer="Switch off = the feature's own setting is turned off (as in the Settings app), the running copy is closed, and it is kept at low priority in case Windows starts it anyway.">
+          <Group
+            title="Can be switched off"
+            footer="Switch off = the feature's own setting is turned off (as in the Settings app), the running copy is closed, and a small task closes it again after every sign-in because Windows starts these two anyway. While it runs it is kept at low priority."
+          >
+            {view.signIn && (
+              <div className="row">
+                <span className="row-main secondary">{view.signIn}</span>
+              </div>
+            )}
             {view.rows.filter((r) => r.kind === "off").map((r) => (
               <RowView key={r.exe} r={r} view={view} act={act} onOff={setConfirm} />
             ))}

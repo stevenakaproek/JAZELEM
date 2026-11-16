@@ -38,7 +38,7 @@ impl ProcsTab {
         let p = &self.p;
         let live = p.live.get(e.exe);
         let active = p.active(e.exe).map(|i| &p.history[i]);
-        let (state, tone) = state_text(e, p.setups.get(i), active);
+        let (state, tone) = state_text(e, p.setups.get(i), active, live.is_some());
         let can = self.can() && active.is_none();
         json!({
             "exe": e.exe,
@@ -97,6 +97,7 @@ impl ProcsTab {
             "rows": rows,
             "savedMb": saved,
             "count": m.len(),
+            "warnings": prev.map(|p| unlike(p, last)).unwrap_or_default(),
         })
     }
 }
@@ -133,6 +134,12 @@ impl Backend for ProcsTab {
                 "changed": changed,
             },
             "canUndoAll": self.can() && changed > 0,
+            // the sign-in task that closes switched-off processes again
+            "signIn": if p.off_list().is_empty() { None } else { Some(match p.task {
+                Some(true) => format!("Closed again 30 s and 2 min after every sign-in by the task {CLOSE_TASK_PATH}{CLOSE_TASK_NAME} (Undo removes it)."),
+                Some(false) => "The sign-in task that closes switched-off processes is missing - it is added when PC Tuner runs as administrator.".to_string(),
+                None => String::new(),
+            }) },
             "measuring": p.measuring.as_ref().map(|(t, _)| json!({ "secs": t.elapsed().as_secs().min(MEASURE_SECS), "of": MEASURE_SECS })),
             "compare": self.compare(),
         })
