@@ -14,6 +14,7 @@ pub mod services;
 pub mod startup;
 pub mod svcbackup;
 pub mod tweaks;
+pub mod usb;
 
 /// The PowerShell scripts built into the app.
 pub mod scripts {
