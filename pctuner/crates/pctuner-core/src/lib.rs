@@ -10,6 +10,8 @@ pub mod opwin;
 pub mod perf;
 pub mod ramled;
 pub mod scheduler;
+pub mod services;
+pub mod svcbackup;
 pub mod tweaks;
 
 /// The PowerShell scripts built into the app.
