@@ -111,6 +111,7 @@ impl Tab for BloatTab {
         ui.add_space(2.0);
 
         // ---- targets, full width
+        let mut toggled = None;
         let pick = &mut self.b.pick;
         let installed = &self.b.installed;
         {
@@ -143,7 +144,9 @@ impl Tab for BloatTab {
                                     theme::chip(ui, "optional", theme::OPTIONAL);
                                 }
                                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                    ui.checkbox(&mut pick[i], "").on_hover_text("Ticked = removed by Remove selected");
+                                    if ui.checkbox(&mut pick[i], "").on_hover_text("Ticked = removed by Remove selected").changed() {
+                                        toggled = Some(i);
+                                    }
                                     let c = if !pick[i] || state == Some(false) { theme::DIM } else { theme::TEXT };
                                     let name = RichText::new(friendly(t.name)).color(c);
                                     ui.add(egui::Label::new(name).truncate()).on_hover_text(format!("{}\nYou lose: {}", t.name.trim_end_matches(['~', '.']), t.loses));
@@ -153,6 +156,9 @@ impl Tab for BloatTab {
                     }
                 });
             });
+        }
+        if let Some(i) = toggled {
+            self.b.sync_paired(i);
         }
 
         // button clicks are handled last, when nothing borrows the tab any more

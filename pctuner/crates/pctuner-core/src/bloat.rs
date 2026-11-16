@@ -36,7 +36,7 @@ pub const TARGETS: &[Target] = &[
     Target { name: "Microsoft.WindowsCamera", kind: Kind::App, optional: false, loses: "Camera app" },
     Target { name: "Microsoft.WindowsFeedbackHub", kind: Kind::App, optional: false, loses: "Feedback Hub" },
     Target { name: "Microsoft.StartExperiencesApp", kind: Kind::App, optional: false, loses: "MSN widgets" },
-    Target { name: "Microsoft.Ink.Handwriting.Main.en-US.1.0.1", kind: Kind::App, optional: false, loses: "pen handwriting" },
+    Target { name: "Microsoft.Ink.Handwriting.Main.en-US.1.0.1", kind: Kind::App, optional: false, loses: "pen handwriting (removed with its language data)" },
     Target { name: "App.StepsRecorder~", kind: Kind::Capability, optional: false, loses: "Steps Recorder" },
     Target { name: "Hello.Face.", kind: Kind::Capability, optional: false, loses: "Windows Hello face (PIN unaffected)" },
     Target { name: "Print.Management.Console~", kind: Kind::Capability, optional: false, loses: "Print Management console" },
@@ -63,6 +63,9 @@ pub const TARGETS: &[Target] = &[
     Target { name: "Language.Speech~", kind: Kind::Capability, optional: true, loses: "voice typing / speech" },
     Target { name: "Language.OCR~", kind: Kind::Capability, optional: true, loses: "copy text from images" },
 ];
+
+/// Rows that are ticked and unticked together.
+pub const PAIRED: &[&[&str]] = &[&["Microsoft.Ink.Handwriting.Main.en-US.1.0.1", "Language.Handwriting~"]];
 
 // ------------------------------------------------------------------ friendly result summary
 
@@ -283,6 +286,28 @@ impl Bloat {
                 .map(|v| v.into_iter().map(|n| n.name).collect())
                 .unwrap_or_default()
         }));
+    }
+
+    /// Tick or untick a row. Pen handwriting and its language data go together: Windows puts the app
+    /// back from the language data, so ticking either ticks both (and unticking either unticks both).
+    pub fn toggle(&mut self, index: usize) {
+        let Some(p) = self.pick.get_mut(index) else { return };
+        *p = !*p;
+        self.sync_paired(index);
+    }
+
+    /// Give the rows paired with `index` the same tick as it has.
+    pub fn sync_paired(&mut self, index: usize) {
+        let Some(&on) = self.pick.get(index) else { return };
+        for group in PAIRED {
+            if group.contains(&TARGETS[index].name) {
+                for (i, t) in TARGETS.iter().enumerate() {
+                    if group.contains(&t.name) {
+                        self.pick[i] = on;
+                    }
+                }
+            }
+        }
     }
 
     /// Targets a run would process: the ticked items.
@@ -567,6 +592,27 @@ mod tests {
         assert!(skip.contains(&"Microsoft.WindowsCamera"));
         assert!(!skip.contains(&"MSTeams"));
         assert_eq!(skip.len(), TARGETS.len() - p.iter().filter(|x| **x).count());
+    }
+
+    #[test]
+    fn pen_handwriting_and_its_language_data_tick_together() {
+        let mut b = Bloat::new();
+        let ink = TARGETS.iter().position(|t| t.name == "Microsoft.Ink.Handwriting.Main.en-US.1.0.1").unwrap();
+        let lang = TARGETS.iter().position(|t| t.name == "Language.Handwriting~").unwrap();
+        b.toggle(ink);
+        assert!(b.pick[ink] && b.pick[lang], "ticking pen handwriting ticks its language data");
+        let names: Vec<&str> = b.selected().iter().map(|t| t.name).collect();
+        assert_eq!(names, ["Microsoft.Ink.Handwriting.Main.en-US.1.0.1", "Language.Handwriting~"]);
+        let skip = pick_args(&b.pick).last().cloned().unwrap_or_default();
+        assert!(skip.split(',').all(|s| s != "Language.Handwriting~" && !s.starts_with("Microsoft.Ink")), "neither is skipped");
+        b.toggle(lang);
+        assert!(!b.pick[ink] && !b.pick[lang], "unticking either unticks both");
+        // every paired name is a real target
+        for g in PAIRED {
+            for n in *g {
+                assert!(TARGETS.iter().any(|t| t.name == *n), "{n} is not a target");
+            }
+        }
     }
 
     #[test]

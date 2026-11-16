@@ -84,9 +84,7 @@ impl Backend for BloatTab {
         let running = self.b.running();
         match parse::<Action>(action)? {
             Action::Toggle { index } => {
-                if let Some(p) = self.b.pick.get_mut(index) {
-                    *p = !*p;
-                }
+                self.b.toggle(index);
             }
             Action::Clear => {
                 if !running {
