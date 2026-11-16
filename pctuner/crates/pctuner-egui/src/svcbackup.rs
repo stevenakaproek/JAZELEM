@@ -6,7 +6,7 @@
 //! Restore only changes Start / DelayedAutostart of services that exist, never paths or accounts.
 
 use crate::common::{self, Job, Stream};
-use crate::opwin::{OpEvent, OpItem, OpWindow, Stage};
+use crate::opwin::{OpWindowUi as _, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 use serde::{Deserialize, Serialize};

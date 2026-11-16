@@ -4,7 +4,7 @@
 //! never removed. Needs administrator (Defender only shows and changes exclusions for admins).
 
 use crate::common::{self, Job, Stream};
-use crate::opwin::{OpEvent, OpItem, OpWindow, Stage};
+use crate::opwin::{OpWindowUi as _, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 use serde::{Deserialize, Serialize};

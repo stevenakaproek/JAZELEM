@@ -6,7 +6,7 @@
 //! off the way Task Manager / Autoruns do it, and every change goes into an undoable history.
 
 use crate::common::{self, Job, Tab};
-use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::opwin::{self, OpWindowUi as _, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -1527,7 +1527,7 @@ fn clean_items_op(mut junk: Vec<&Entry>, include_optional: bool) -> OpShow {
 
 /// Result-stage extras of a cleanup: what is left, what to do next.
 fn clean_done(win: &mut OpWindow, junk_left: usize, spotlight: bool) {
-    win.footer = Some((format!("Junk still switched on: {junk_left}"), if junk_left == 0 { theme::OK } else { theme::JUNK }));
+    win.footer = Some((format!("Junk still switched on: {junk_left}"), if junk_left == 0 { common::Tone::Ok } else { common::Tone::Junk }));
     if win.ok_count() > 0 {
         win.notes.push("Sign out or restart Windows to finish.".into());
         if spotlight {

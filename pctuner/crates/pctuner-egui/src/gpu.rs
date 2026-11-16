@@ -3,7 +3,7 @@
 //! applied right now (live: memory offset from nvidia-smi; saved: the [Startup] section Afterburner restores).
 
 use crate::common::{self, Job, Tab};
-use crate::opwin::{OpEvent, OpItem, OpWindow, Stage};
+use crate::opwin::{OpWindowUi as _, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 use serde::{Deserialize, Serialize};

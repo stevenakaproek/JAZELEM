@@ -2,6 +2,7 @@
 //! The egui app (pctuner-egui) and the Tauri app are thin layers on top of this crate.
 
 pub mod common;
+pub mod opwin;
 pub mod ramled;
 pub mod scheduler;
 

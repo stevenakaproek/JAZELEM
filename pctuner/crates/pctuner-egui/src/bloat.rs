@@ -3,7 +3,7 @@
 //! Revo-style leftover cleanup with quarantine, re-check task, full restore.
 
 use crate::common::{self, Stream, Tab};
-use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::opwin::{self, OpWindowUi as _, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 

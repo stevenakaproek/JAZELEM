@@ -1,7 +1,7 @@
 //! Post-install tweaks tab - runs PostInstall-Tweaks.ps1 (embedded) and shows Teredo / Widgets status.
 
 use crate::common::{self, Stream, Tab};
-use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::opwin::{self, OpWindowUi as _, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 

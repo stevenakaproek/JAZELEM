@@ -5,7 +5,7 @@
 //! Windows 10/11. The biggest real-world cause of lag spikes (bufferbloat) lives on the router.
 
 use crate::common::{self, Job, Stream, Tab};
-use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::opwin::{self, OpWindowUi as _, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 use serde::{Deserialize, Serialize};
@@ -379,10 +379,10 @@ fn show_restart(op: &mut OpWindow, adapter: &str, r: Option<&Result<String, Stri
         Some(Ok(note)) if note.starts_with("Not needed") => {}
         Some(Ok(_)) => op.notes.insert(0, format!("\"{adapter}\" was restarted and is back online.")),
         Some(Err(e)) => {
-            op.footer = Some((format!("Restarting \"{adapter}\" failed - restart it or reboot to finish. {e}").trim().to_string(), theme::LOCKED))
+            op.footer = Some((format!("Restarting \"{adapter}\" failed - restart it or reboot to finish. {e}").trim().to_string(), common::Tone::Error))
         }
         None => {
-            op.footer = Some((format!("\"{adapter}\" may not have been restarted - restart it or reboot to finish."), theme::LOCKED))
+            op.footer = Some((format!("\"{adapter}\" may not have been restarted - restart it or reboot to finish."), common::Tone::Error))
         }
     }
 }

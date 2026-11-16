@@ -6,7 +6,7 @@
 //! important settings (Game Mode, GPU scheduling, refresh rate) are where they should be.
 
 use crate::common::{self, Job, Stream, Tab};
-use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::opwin::{self, OpWindowUi as _, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui::{self, RichText};
 use serde::{Deserialize, Serialize};

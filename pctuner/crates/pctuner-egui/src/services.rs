@@ -4,7 +4,7 @@
 //! (imported once from the PowerShell tool's %LOCALAPPDATA%\ServiceManager\history.json).
 
 use crate::common::{self, Job, Tab};
-use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::opwin::{self, OpWindowUi as _, OpEvent, OpItem, OpWindow, Stage};
 use crate::theme;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};

@@ -744,6 +744,8 @@ pub enum Tone {
     Dim,
     Faint,
     Warn,
+    /// Something left over that is safe to clean up (orange).
+    Junk,
     Error,
 }
 

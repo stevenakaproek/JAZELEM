@@ -8,7 +8,7 @@
 //! Keys, value names and values are taken from Windows' own ADMX files (C:\Windows\PolicyDefinitions).
 
 use crate::common::{self, Job, Tab};
-use crate::opwin::{OpEvent, OpItem, OpWindow};
+use crate::opwin::{OpWindowUi as _, OpEvent, OpItem, OpWindow};
 use crate::theme;
 use eframe::egui::{self, RichText};
 use serde::{Deserialize, Serialize};
