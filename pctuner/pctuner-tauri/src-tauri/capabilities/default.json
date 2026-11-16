@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "The main window may use events and window controls",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-set-theme"]
 }

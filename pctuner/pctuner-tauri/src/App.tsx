@@ -1,7 +1,8 @@
-import { Power, RotateCcw, ShieldCheck, ShieldOff } from "lucide-react";
+import { Moon, Power, RotateCcw, ShieldCheck, ShieldOff, Sun } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { Badge, Button, Sheet, Spinner, cx } from "./components/ui";
+import { Badge, Button, Segmented, Sheet, Spinner, cx } from "./components/ui";
 import { shellAction } from "./lib/api";
+import { useTheme, type Theme } from "./lib/theme";
 import { runSelftest } from "./lib/selftest";
 import { ShellProvider, useShell } from "./lib/shell";
 import { TABS } from "./tabs";
@@ -18,6 +19,7 @@ function Frame() {
   const shell = useShell();
   const [active, setActive] = useState(initialTab);
   const [power, setPower] = useState(false);
+  const [theme, setTheme] = useTheme();
   const tab = TABS.find((t) => t.id === active) ?? TABS[0];
 
   // tell the app which views to build (the open tab, plus the Power sheet while it is open)
@@ -64,6 +66,16 @@ function Frame() {
           ))}
         </nav>
         <div className="sidebar-foot">
+          <div className="theme-toggle" title="Light or dark appearance">
+            <Segmented
+              value={theme}
+              onChange={setTheme}
+              options={[
+                { value: "light" as Theme, label: <><Sun size={13} /> Light</> },
+                { value: "dark" as Theme, label: <><Moon size={13} /> Dark</> },
+              ]}
+            />
+          </div>
           <Button block icon={<Power />} title="Restart into the BIOS, or shut down so the next start opens the BIOS." onClick={() => setPower(true)}>
             Power / BIOS
           </Button>

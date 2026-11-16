@@ -71,13 +71,13 @@ textarea {
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.16);
+  background: var(--scroll-thumb);
   border-radius: var(--r-pill);
   border: 3px solid transparent;
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.28);
+  background: var(--scroll-thumb-hover);
   background-clip: content-box;
   border: 3px solid transparent;
 }
@@ -194,6 +194,17 @@ html.tauri .sidebar {
   gap: var(--s2);
   padding-top: var(--s3);
   border-top: 1px solid var(--hairline);
+}
+/* the Light / Dark switch fills the sidebar's width */
+.theme-toggle .segmented {
+  display: grid;
+  width: 100%;
+}
+.theme-toggle .segmented button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
 }
 
 .content {
@@ -552,7 +563,7 @@ html.tauri .sidebar {
   bottom: 2px;
   left: 2px;
   border-radius: var(--r-sm);
-  background: var(--bg-elevated-3);
+  background: var(--thumb);
   box-shadow: var(--shadow-control), inset 0 0 0 0.5px var(--hairline-strong);
   transition: transform var(--t-base) var(--ease-spring), width var(--t-base) var(--ease-spring);
 }
@@ -1144,7 +1155,7 @@ html.tauri .sidebar {
   overflow-y: auto;
   padding: var(--s3) var(--s4);
   border-radius: var(--r-md);
-  background: rgba(0, 0, 0, 0.22);
+  background: var(--well);
   box-shadow: inset 0 0 0 0.5px var(--hairline);
 }
 .op-line {
@@ -1357,10 +1368,10 @@ html.tauri .sidebar {
   touch-action: none;
 }
 .graph-bg {
-  fill: rgba(255, 255, 255, 0.04);
+  fill: var(--graph-bg);
 }
 .graph-grid {
-  stroke: rgba(255, 255, 255, 0.07);
+  stroke: var(--graph-grid);
   stroke-width: 1;
 }
 .graph-floor {

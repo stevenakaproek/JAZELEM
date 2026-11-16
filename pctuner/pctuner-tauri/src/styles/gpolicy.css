@@ -5,7 +5,7 @@
   align-items: flex-start;
 }
 .gp-row.changed {
-  background: var(--accent-soft, rgba(10, 132, 255, 0.1));
+  background: var(--accent-soft);
 }
 .gp-side {
   display: flex;

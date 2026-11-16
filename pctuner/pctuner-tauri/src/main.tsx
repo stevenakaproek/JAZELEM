@@ -5,8 +5,10 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { inTauri } from "./lib/api";
+import { applyTheme, savedTheme } from "./lib/theme";
 
 if (inTauri) document.documentElement.classList.add("tauri");
+applyTheme(savedTheme());
 // the app is not a web page: no browser context menu on empty space
 window.addEventListener("contextmenu", (e) => e.preventDefault());
 
