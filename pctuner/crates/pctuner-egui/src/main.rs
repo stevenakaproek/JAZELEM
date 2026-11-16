@@ -415,14 +415,19 @@ fn main() -> eframe::Result<()> {
     if args.iter().any(|a| a == "--gpu-guard") {
         std::process::exit(gpu::guard_main(args.iter().any(|a| a == "--dry-run")));
     }
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("PC Tuner")
-            // PCTUNER_HEIGHT=<px>: taller window for self-test screenshots of long pages
-            .with_inner_size([1250.0, std::env::var("PCTUNER_HEIGHT").ok().and_then(|v| v.parse::<f32>().ok()).filter(|h| (520.0..=4000.0).contains(h)).unwrap_or(780.0)])
-            .with_min_inner_size([950.0, 520.0]),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("PC Tuner")
+        // PCTUNER_HEIGHT=<px>: taller window for self-test screenshots of long pages
+        .with_inner_size([1250.0, std::env::var("PCTUNER_HEIGHT").ok().and_then(|v| v.parse::<f32>().ok()).filter(|h| (520.0..=4000.0).contains(h)).unwrap_or(780.0)])
+        .with_min_inner_size([950.0, 520.0]);
+    // PCTUNER_SELFTEST_HIDDEN=1 (with PCTUNER_SELFTEST): the self-test window opens far off-screen,
+    // without taking the focus or a taskbar button, so it does not interrupt work on this PC.
+    // Windows draws it at the main monitor's scale, so compare its screenshots only with other hidden runs.
+    let hidden = std::env::var_os("PCTUNER_SELFTEST").is_some() && std::env::var_os("PCTUNER_SELFTEST_HIDDEN").is_some();
+    if hidden {
+        viewport = viewport.with_position([-30000.0, -30000.0]).with_active(false).with_taskbar(false);
+    }
+    let opts = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "PC Tuner",
         opts,
