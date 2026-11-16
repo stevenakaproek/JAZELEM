@@ -135,6 +135,33 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     card_frame().show(ui, add).inner
 }
 
+/// A row the user clicks to select or unselect (instead of a check box). Selected rows get an accent
+/// fill and border. Returns true when it was clicked while `enabled`.
+pub fn select_row(ui: &mut egui::Ui, id: impl std::hash::Hash, selected: bool, enabled: bool, add: impl FnOnce(&mut egui::Ui)) -> bool {
+    let (fill, stroke) = if selected { (tint(ACCENT, 22), tint(ACCENT, 170)) } else { (Color32::TRANSPARENT, tint(Color32::WHITE, 14)) };
+    let inner = egui::Frame::none().fill(fill).stroke(Stroke::new(1.0_f32, stroke)).rounding(R_WIDGET).inner_margin(egui::Margin::symmetric(10.0, 6.0)).show(ui, |ui| {
+        // labels must not swallow the click
+        ui.style_mut().interaction.selectable_labels = false;
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
+    let resp = ui.interact(inner.response.rect, ui.id().with(("select-row", id)), egui::Sense::click());
+    if enabled && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    enabled && resp.clicked()
+}
+
+/// Status badge for a setting: APPLIED (green) or NOT APPLIED (dim), fixed width so rows line up.
+pub fn applied_badge(ui: &mut egui::Ui, applied: bool) {
+    let (text, c) = if applied { ("APPLIED", OK) } else { ("NOT APPLIED", DIM) };
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(11.5), c);
+    let size = Vec2::new(96.0, galley.size().y + 8.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(rect, size.y / 2.0, tint(c, if applied { 40 } else { 22 }));
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, c);
+}
+
 /// A coloured banner (warnings, notices). `c` is the accent of the banner.
 pub fn banner(ui: &mut egui::Ui, c: Color32, text: &str) {
     egui::Frame::none().fill(tint(c, 26)).stroke(Stroke::new(1.0_f32,tint(c, 120))).rounding(R_WIDGET).inner_margin(10.0).show(ui, |ui| {

@@ -1,5 +1,5 @@
 //! Performance tab - Windows settings that make games and the desktop feel faster, chosen from
-//! researched evidence (see LEFT_ALONE for the popular tweaks that do nothing or cause harm).
+//! researched evidence.
 //!
 //! Honest scope: Halo Infinite on this PC is GPU-bound, so almost nothing in Windows changes its fps.
 //! What helps is lower latency in borderless DX10/11 games, a snappier desktop, and checks that the
@@ -97,25 +97,19 @@ const TWEAKS: &[Tweak] = &[
         why: "Stops Windows running its security layer in a hidden virtual machine. Memory Integrity is already off here, so the gain is small (0-5 % in some games). Costs security: Windows Hello enhanced sign-in, Credential Guard-style protection and Memory Integrity stop working. Restart needed. Hyper-V / WSL keep working." },
 ];
 
-/// Popular tweaks this tab does not offer, and why (from the research).
-const LEFT_ALONE: &[(&str, &str)] = &[
-    ("Ultimate / High performance power plan", "AMD recommends Balanced for X3D CPUs; the other plans add nothing measurable on a 9800X3D."),
-    ("Minimum processor state 100 %, core parking off", "Already fully unparked when plugged in; forcing it only raises idle power."),
-    ("HPET / useplatformclock / disabledynamictick", "Slower timing and possible stutter; modern Windows already uses the best timer."),
-    ("Timer resolution tools", "Games ask Windows for the timer resolution they need; global changes do nothing on Windows 11."),
-    ("Disabling MPO (multiplane overlays)", "Only a fix for specific flicker bugs; it can raise latency."),
-    ("Fullscreen optimizations off", "Needed for the flip model and VRR; no measured gain from turning it off."),
-    ("Game Mode off / GPU scheduling (HAGS) off", "Both are right as they are: Game Mode stops update interruptions, HAGS is needed for DLSS Frame Generation."),
-    ("TdrDelay / TdrLevel", "A GPU hang would freeze the whole PC instead of recovering."),
-    ("Spectre / Meltdown mitigations off", "A real security risk for a tiny gain at best."),
-    ("LargeSystemCache, DisablePagingExecutive, fixed page file", "Server-era settings; on a desktop they do nothing or make memory pressure worse."),
-    ("MMCSS 'Games' priorities, SystemResponsiveness", "Game render threads do not use them. SystemResponsiveness is already 10 here (the lowest that counts)."),
-    ("MSI-mode tools", "The RTX 5080 already uses MSI interrupts."),
-    ("Thumbnail cache off, ForegroundLockTimeout 0, AutoEndTasks", "Slower folders, focus stealing, or lost unsaved work."),
-];
-
 fn tweak(id: &str) -> Option<&'static Tweak> {
     TWEAKS.iter().find(|t| t.id == id)
+}
+
+/// Changes for the selected rows: each selected tweak that is available and not applied yet gets its
+/// value. Selected rows that are already applied need nothing.
+fn selected_changes(state: &State, selected: &[bool]) -> Vec<Change> {
+    TWEAKS
+        .iter()
+        .zip(selected)
+        .filter(|(t, sel)| **sel && state.applicable(t.kind) && !state.is_set(t))
+        .map(|(t, _)| Change { id: t.id.into(), prev: state.value(t.kind), new: Some(t.target.into()) })
+        .collect()
 }
 
 // ------------------------------------------------------------------ state
@@ -617,67 +611,6 @@ struct HistEntry {
     undone: bool,
 }
 
-// ------------------------------------------------------------------ checks (read only)
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Check {
-    Good,
-    Look,
-    Unknown,
-}
-
-struct CheckRow {
-    name: &'static str,
-    state: Check,
-    now: String,
-    note: String,
-}
-
-fn checks(s: &State) -> Vec<CheckRow> {
-    let mut v = vec![];
-    let on_off = |b: bool| if b { "On".to_string() } else { "Off".to_string() };
-    let gm = s.game_mode.unwrap_or(1) != 0;
-    v.push(CheckRow { name: "Game Mode", state: if gm { Check::Good } else { Check::Look }, now: on_off(gm),
-        note: if gm { "Keeps Windows Update and its pop-ups quiet during games.".into() } else { "Turn it on: Settings > Gaming > Game Mode.".into() } });
-    let hags_off = s.hags == Some(1);
-    v.push(CheckRow { name: "GPU scheduling (HAGS)", state: if hags_off { Check::Look } else { Check::Good },
-        now: match s.hags { Some(2) => "On".into(), Some(1) => "Off".into(), _ => "Windows default (on)".into() },
-        note: if hags_off { "Turn it on (Settings > Display > Graphics): DLSS Frame Generation needs it.".into() } else { "Needed for DLSS Frame Generation on the RTX 5080.".into() } });
-    let capture = s.app_capture.unwrap_or(0) != 0 || s.gamedvr.unwrap_or(0) != 0;
-    v.push(CheckRow { name: "Background game recording", state: if capture { Check::Look } else { Check::Good }, now: on_off(capture),
-        note: if capture { "Recording in the background costs a little GPU time; turn it off in Settings > Gaming > Captures if you do not use it.".into() } else { "Off - nothing records in the background.".into() } });
-    if let Some(hz) = s.hz_now {
-        let max = s.hz_max.unwrap_or(hz);
-        let asus540 = s.monitor.to_ascii_uppercase().contains("PG27AQWP") && max < 540;
-        let state = if hz < max || asus540 { Check::Look } else { Check::Good };
-        let mut note = if hz < max {
-            format!("Windows offers {max} Hz at this resolution - pick it in Settings > Display > Advanced display.")
-        } else {
-            "Running at the highest refresh rate Windows offers.".to_string()
-        };
-        if asus540 {
-            note.push_str(" This monitor can do 540 Hz, but only over DisplayPort 2.1 UHBR20: check the cable (DP80 / UHBR20 certified) and the monitor's DisplayPort setting.");
-        }
-        let mon = if s.monitor.is_empty() { String::new() } else { format!(" ({})", s.monitor) };
-        v.push(CheckRow { name: "Refresh rate", state, now: format!("{hz} Hz{mon}"), note });
-    }
-    let anim = s.client_anim.unwrap_or(true) || s.min_animate.as_deref() != Some("0");
-    v.push(CheckRow { name: "Window animations", state: Check::Good, now: if anim { "On".into() } else { "Off".into() },
-        note: if anim { "Turning them off (Settings > Accessibility > Visual effects) makes windows open instantly - a matter of taste.".into() } else { "Off - windows open and close instantly.".into() } });
-    let tr = s.transparency.unwrap_or(1) != 0;
-    v.push(CheckRow { name: "Transparency effects", state: Check::Good, now: on_off(tr),
-        note: if tr { "A matter of taste; costs almost nothing on an RTX 5080.".into() } else { "Off.".into() } });
-    v.push(CheckRow { name: "USB selective suspend", state: match s.usb_suspend { Some(0) => Check::Good, Some(_) => Check::Look, None => Check::Unknown },
-        now: match s.usb_suspend { Some(0) => "Off".into(), Some(_) => "On".into(), None => "-".into() },
-        note: "Off means USB devices (controller, headset) are never put to sleep while plugged in.".into() });
-    v.push(CheckRow { name: "PCI Express power saving", state: match s.pcie_aspm { Some(0) => Check::Good, Some(_) => Check::Look, None => Check::Unknown },
-        now: match s.pcie_aspm { Some(0) => "Off".into(), Some(1) => "Moderate".into(), Some(2) => "Maximum".into(), _ => "-".into() },
-        note: "Off means the graphics card's link never dozes while plugged in.".into() });
-    v.push(CheckRow { name: "Do not disturb while gaming", state: Check::Unknown, now: "Check".into(),
-        note: "Windows stores this where apps cannot read it safely. Open the setting and tick 'When playing a game'.".into() });
-    v
-}
-
 // ------------------------------------------------------------------ tab
 
 struct Run {
@@ -715,18 +648,13 @@ fn explorer_window() -> OpWindow {
     win
 }
 
-fn open_uri(uri: &'static str) {
-    std::thread::spawn(move || {
-        let _ = common::run("explorer.exe", &[uri]);
-    });
-}
-
 impl PerfTab {
     pub fn new() -> Self {
         let mut tab = PerfTab {
             state: None,
             loading: Some(Job::spawn(read_state)),
-            selected: TWEAKS.iter().map(|t| !t.optional).collect(),
+            // nothing is pre-selected: the user clicks the settings they want
+            selected: vec![false; TWEAKS.len()],
             history: common::load_json(HISTORY),
             op: None,
             pending: None,
@@ -805,24 +733,15 @@ impl PerfTab {
         w
     }
 
+    /// "Apply selected": the selected settings that are not applied yet get their value.
     fn open_apply(&mut self) {
         let Some(state) = self.state.as_ref().filter(|s| s.error.is_none()) else { return };
-        let changes: Vec<Change> = TWEAKS
-            .iter()
-            .zip(&self.selected)
-            .filter(|(t, sel)| **sel && state.applicable(t.kind) && !state.is_set(t))
-            .map(|(t, _)| Change { id: t.id.into(), prev: state.value(t.kind), new: Some(t.target.into()) })
-            .collect();
+        let changes = selected_changes(state, &self.selected);
         if changes.is_empty() {
-            let mut w = OpWindow::new("PERFORMANCE", "change", "changed", vec![]);
-            w.empty_title = "Already set".into();
-            w.empty_text = "Every ticked setting already has the value shown.".into();
-            self.op = Some(w);
-            self.pending = None;
-        } else {
-            self.op = Some(Self::op_window(&changes, false));
-            self.pending = Some((changes, None));
+            return;
         }
+        self.op = Some(Self::op_window(&changes, false));
+        self.pending = Some((changes, None));
     }
 
     fn undo_changes(&self) -> Option<(Vec<Change>, usize)> {
@@ -918,6 +837,7 @@ impl PerfTab {
             op.can_undo = can_undo;
             op.done();
         }
+        self.selected = vec![false; TWEAKS.len()];
         self.refresh();
     }
 
@@ -985,17 +905,12 @@ impl Tab for PerfTab {
         if self.loading.is_some() || self.run.is_some() || self.explorer.is_some() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                theme::page_header(ui, "Performance", "Settings with a real effect on games and on how fast Windows feels. Most 'gaming tweaks' online do nothing - those are listed at the bottom.")
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                if ui.add_enabled(self.loading.is_none(), egui::Button::new("Refresh")).clicked() {
-                    self.refresh();
-                }
-            });
+        // shown inside the Optimization tab, which draws the page header and admin banner
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            if ui.add_enabled(self.loading.is_none(), egui::Button::new("Refresh")).clicked() {
+                self.refresh();
+            }
         });
-        common::admin_banner(ui);
         egui::ScrollArea::vertical().id_salt("perf-page").auto_shrink([false, false]).show(ui, |ui| self.page(ui));
     }
 }
@@ -1017,77 +932,13 @@ impl PerfTab {
             ui.label(RichText::new("Nothing can be changed until the settings are read correctly. Press Refresh to try again.").color(theme::TEXT_DIM));
             return;
         }
-        let rows = checks(&state);
-
-        // ---- hero
-        theme::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let rec: Vec<&Tweak> = TWEAKS.iter().filter(|t| !t.optional && state.applicable(t.kind)).collect();
-            let set = rec.iter().filter(|t| state.is_set(t)).count();
-            let good = rows.iter().filter(|r| r.state == Check::Good).count();
-            let look = rows.iter().filter(|r| r.state == Check::Look).count();
-            let opt_on = TWEAKS.iter().filter(|t| t.optional && state.is_set(t)).count();
-            ui.horizontal(|ui| {
-                let v = theme::count_up(ui.ctx(), "perf-set", set as f32).round() as usize;
-                theme::hero(ui, &format!("{v} of {}", rec.len()), "recommended settings in place", "Optional ones are your choice - read each note.", if set == rec.len() { theme::ACCENT } else { theme::JUNK });
-                ui.add_space(28.0);
-                theme::stat(ui, &good.to_string(), "checks fine", theme::TEXT);
-                ui.add_space(22.0);
-                theme::stat(ui, &look.to_string(), "worth a look", if look > 0 { theme::GAMING } else { theme::TEXT });
-                ui.add_space(22.0);
-                theme::stat(ui, &opt_on.to_string(), "optional in place", theme::TEXT);
-            });
-        });
-        ui.add_space(6.0);
-
-        // ---- checks
-        theme::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                theme::section(ui, "Checks");
-                ui.label(RichText::new("read only - PC Tuner does not change these").size(12.0).color(theme::TEXT_FAINT));
-            });
-            ui.add_space(4.0);
-            for r in &rows {
-                ui.horizontal(|ui| {
-                    let (chip, c) = match r.state {
-                        Check::Good => ("fine", theme::OK),
-                        Check::Look => ("look", theme::GAMING),
-                        Check::Unknown => ("check", theme::DIM),
-                    };
-                    theme::chip(ui, chip, c);
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(r.name).strong());
-                            ui.label(RichText::new(&r.now).color(theme::TEXT_DIM));
-                        });
-                        ui.label(RichText::new(&r.note).size(12.5).color(theme::TEXT_DIM));
-                    });
-                });
-                ui.add_space(2.0);
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("Display settings").clicked() {
-                    open_uri("ms-settings:display-advanced");
-                }
-                if ui.button("Notification settings").clicked() {
-                    open_uri("ms-settings:notifications");
-                }
-                if ui.button("Graphics settings").clicked() {
-                    open_uri("ms-settings:display-advancedgraphics");
-                }
-                if ui.button("Gaming settings").clicked() {
-                    open_uri("ms-settings:gaming-gamemode");
-                }
-            });
-        });
-        ui.add_space(6.0);
-
         // ---- settings
         theme::card(ui, |ui| {
             ui.set_width(ui.available_width());
-            theme::section(ui, "Settings");
+            ui.horizontal(|ui| {
+                theme::section(ui, "Settings");
+                ui.label(RichText::new("click the ones you want, then Apply selected").size(12.0).color(theme::TEXT_FAINT));
+            });
             let mut group = "";
             for (i, t) in TWEAKS.iter().enumerate() {
                 if t.group != group {
@@ -1098,60 +949,67 @@ impl PerfTab {
                 }
                 let applicable = state.applicable(t.kind);
                 let set = state.is_set(t);
-                ui.horizontal(|ui| {
-                    ui.add_enabled(applicable && self.run.is_none(), egui::Checkbox::without_text(&mut self.selected[i]));
-                    ui.vertical(|ui| {
-                        ui.set_width((ui.available_width() - 330.0).max(260.0));
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(t.name).strong().color(if applicable { theme::TEXT } else { theme::TEXT_FAINT }));
-                            if t.optional {
-                                ui.label(RichText::new("optional").size(11.5).color(theme::OPTIONAL));
+                // an applied setting has nothing to apply, so it cannot be selected
+                let selectable = applicable && !set && self.run.is_none();
+                let sel = self.selected[i] && selectable;
+                let clicked = theme::select_row(ui, ("perf", i), sel, selectable, |ui| {
+                    ui.horizontal(|ui| {
+                        if applicable {
+                            theme::applied_badge(ui, set);
+                        } else {
+                            theme::chip_response(ui, "not available", theme::DIM).on_hover_text(state.blocked_reason(t.kind));
+                        }
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.set_width((ui.available_width() - 260.0).max(240.0));
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(t.name).strong().color(if applicable { theme::TEXT } else { theme::TEXT_FAINT }));
+                                if t.optional {
+                                    ui.label(RichText::new("optional").size(11.5).color(theme::OPTIONAL));
+                                }
+                            });
+                            ui.label(RichText::new(t.why).size(12.5).color(theme::TEXT_DIM));
+                            if t.kind == Kind::Hibernate {
+                                if let Some(gb) = state.hiberfil_gb {
+                                    ui.label(RichText::new(format!("hiberfil.sys is {gb:.1} GB now")).size(11.5).color(theme::TEXT_FAINT));
+                                }
                             }
                         });
-                        ui.label(RichText::new(t.why).size(12.5).color(theme::TEXT_DIM));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !applicable {
-                            theme::chip_response(ui, "not available", theme::DIM).on_hover_text(state.blocked_reason(t.kind));
-                        } else if set {
-                            theme::chip(ui, "set", theme::OK);
-                        } else if self.selected[i] {
-                            theme::chip(ui, "will change", theme::JUNK);
-                        } else {
-                            theme::chip(ui, "not set", theme::DIM);
-                        }
-                        if applicable {
-                            let now = fmt(t.kind, state.value(t.kind).as_deref());
-                            let text = if set { now } else { format!("{now} -> {}", fmt(t.kind, Some(t.target))) };
-                            ui.label(RichText::new(text).color(theme::TEXT_DIM));
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if applicable {
+                                let now = fmt(t.kind, state.value(t.kind).as_deref());
+                                let (text, c) = if set {
+                                    (now, theme::OK)
+                                } else {
+                                    (format!("{now} -> {}", fmt(t.kind, Some(t.target))), if sel { theme::ACCENT } else { theme::TEXT_DIM })
+                                };
+                                ui.label(RichText::new(text).color(c));
+                            }
+                        });
                     });
                 });
-                if t.kind == Kind::Hibernate {
-                    if let Some(gb) = state.hiberfil_gb {
-                        ui.label(RichText::new(format!("        hiberfil.sys is {gb:.1} GB now")).size(11.5).color(theme::TEXT_FAINT));
-                    }
+                if clicked {
+                    self.selected[i] = !self.selected[i];
                 }
-                ui.add_space(2.0);
+                ui.add_space(3.0);
             }
             ui.add_space(8.0);
-            let pending = TWEAKS.iter().zip(&self.selected).filter(|(t, s)| **s && state.applicable(t.kind) && !state.is_set(t)).count();
+            let pending = selected_changes(&state, &self.selected).len();
             ui.horizontal(|ui| {
                 let can = common::is_admin() && self.run.is_none() && self.loading.is_none();
-                let label = match pending {
-                    0 => "   Apply   ".to_string(),
-                    1 => "   Apply 1 change   ".to_string(),
-                    n => format!("   Apply {n} changes   "),
-                };
-                if ui.add_enabled(can, theme::primary_button(&label)).clicked() {
+                if ui
+                    .add_enabled(can && pending > 0, theme::primary_button(&format!("   Apply selected ({pending})   ")))
+                    .on_disabled_hover_text(if common::is_admin() { "Click the settings you want to apply." } else { "Run PC Tuner as administrator to change settings." })
+                    .clicked()
+                {
                     self.open_apply();
+                }
+                if pending > 0 && ui.button("Clear selection").clicked() {
+                    self.selected = vec![false; TWEAKS.len()];
                 }
                 let has_undo = self.history.iter().any(|h| !h.undone);
                 if ui.add_enabled(can && has_undo, egui::Button::new("Undo last change")).clicked() {
                     self.open_undo(false);
-                }
-                if ui.button("Tick recommended only").clicked() {
-                    self.selected = TWEAKS.iter().map(|t| !t.optional).collect();
                 }
                 let explorer_ok = self.explorer.is_none() && self.run.is_none() && self.op.is_none();
                 if ui.add_enabled(explorer_ok, egui::Button::new("Restart Explorer")).on_hover_text("Shows taskbar and right-click changes. Shows a preview first. Not during a game: the taskbar disappears for a moment.").clicked() {
@@ -1165,21 +1023,6 @@ impl PerfTab {
         ui.add_space(6.0);
 
         self.defender.card(ui);
-
-        // ---- left alone
-        theme::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::section(ui, "Left alone on purpose");
-            ui.label(RichText::new("Popular in 'gaming optimization' guides, but placebo or harmful on Windows 11 with this hardware.").size(12.5).color(theme::TEXT_DIM));
-            ui.add_space(4.0);
-            egui::Grid::new("perf-left-alone").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
-                for (what, why) in LEFT_ALONE {
-                    ui.label(RichText::new(*what).strong());
-                    ui.label(RichText::new(*why).color(theme::TEXT_DIM));
-                    ui.end_row();
-                }
-            });
-        });
     }
 }
 
@@ -1340,21 +1183,6 @@ mod tests {
         assert!(s.error.is_none(), "{:?}", s.error);
     }
 
-    #[test]
-    fn perf_checks() {
-        let s = State { game_mode: Some(1), hags: None, app_capture: Some(0), gamedvr: Some(0), hz_now: Some(500), hz_max: Some(500), monitor: "PG27AQWP-W".into(), usb_suspend: Some(0), pcie_aspm: Some(0), ..Default::default() };
-        let rows = checks(&s);
-        let rr = rows.iter().find(|r| r.name == "Refresh rate").unwrap();
-        assert_eq!(rr.state, Check::Look, "540 Hz monitor stuck at 500 Hz is flagged");
-        assert!(rr.note.contains("UHBR20"));
-        assert_eq!(rows.iter().find(|r| r.name == "Game Mode").unwrap().state, Check::Good);
-        assert_eq!(rows.iter().find(|r| r.name == "GPU scheduling (HAGS)").unwrap().state, Check::Good, "absent = on");
-        let other = State { hz_now: Some(144), hz_max: Some(165), monitor: "Other".into(), ..Default::default() };
-        let rr = checks(&other).into_iter().find(|r| r.name == "Refresh rate").unwrap();
-        assert_eq!(rr.state, Check::Look);
-        assert!(rr.note.contains("165 Hz"));
-    }
-
     fn two_monitors() -> Vec<Monitor> {
         vec![
             Monitor { instance: r"DISPLAY\SAM7350\5&148b3217&1&UID4352_0".into(), name: "S90H".into(), active: true },
@@ -1376,13 +1204,6 @@ mod tests {
         // UID4353 must not match UID43530
         let near = vec![Monitor { instance: r"DISPLAY\AUS274F\5&148b3217&1&UID43530_0".into(), name: "Other".into(), active: true }];
         assert_eq!(pick_monitor(asus, &near), "");
-
-        let mut s = State { hz_now: Some(500), hz_max: Some(500), display_id: asus.into(), monitors: mons, ..Default::default() };
-        s.monitor = pick_monitor(&s.display_id, &s.monitors);
-        let rr = checks(&s).into_iter().find(|r| r.name == "Refresh rate").unwrap();
-        assert_eq!(rr.state, Check::Look);
-        assert!(rr.now.contains("PG27AQWP-W"), "{}", rr.now);
-        assert!(rr.note.contains("UHBR20"));
     }
 
     #[test]

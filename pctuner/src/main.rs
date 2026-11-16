@@ -5,13 +5,16 @@
 mod bloat;
 mod common;
 mod fan;
+mod gpolicy;
 mod gpu;
 mod network;
 mod opwin;
+mod optimize;
 mod defender;
 mod perf;
 mod svcbackup;
 mod power;
+mod ramled;
 mod tray;
 mod scheduler;
 mod services;
@@ -29,12 +32,12 @@ fn tab_icon(title: &str) -> &'static str {
         "Services" => "⚙",
         "Startup Cleaner" => "🚀",
         "Remove Bloat" => "🗑",
-        "Post-install Tweaks" => "🔧",
-        "Network" => "🌐",
-        "Performance" => "⚡",
+        "Optimization" => "⚡",
+        "Group Policy" => "📜",
         "CPU Scheduler" => "⏱",
         "RTX 5080 Profiles" => "🎮",
         "Fan Tuner" => "🌀",
+        "RAM LED" => "💡",
         "USB Port Finder" => "🔌",
         _ => "•",
     }
@@ -71,12 +74,13 @@ impl App {
                 Box::new(services::ServicesTab::new()),
                 Box::new(startup::StartupTab::new()),
                 Box::new(bloat::BloatTab::new()),
-                Box::new(tweaks::TweaksTab::new()),
-                Box::new(network::NetworkTab::new()),
-                Box::new(perf::PerfTab::new()),
+                // Performance, Network and the post-install tweaks, as sub-tabs
+                Box::new(optimize::OptimizeTab::new()),
+                Box::new(gpolicy::GpolicyTab::new()),
                 Box::new(scheduler::SchedulerTab::new()),
                 Box::new(gpu::GpuTab::new()),
                 Box::new(fan::FanTab::new()),
+                Box::new(ramled::RamLedTab::new()),
                 Box::new(usb::UsbTab::new()),
             ],
             // PCTUNER_TAB=<index> opens on that tab (used with the self-test to screenshot one tab)

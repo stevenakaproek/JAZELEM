@@ -71,8 +71,10 @@ pub struct Status {
 
 // ------------------------------------------------------------------ what each fan should do
 
-pub const FAN_FLOOR: f32 = 20.0;
-pub const PUMP_FLOOR: f32 = 50.0;
+/// No speed floor of PC Tuner's own: fans and pumps go as low as the user sets them (the helper's 90 °C
+/// override still sends every controlled fan to 100 %). Only the controller's own minimum applies.
+pub const FAN_FLOOR: f32 = 0.0;
+pub const PUMP_FLOOR: f32 = 0.0;
 
 /// How one fan is driven. `Bios` = hands off (the BIOS / graphics driver decides).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -83,6 +85,45 @@ pub enum FanSetting {
     Manual { percent: f32 },
     /// `points` are [temperature °C, duty %], sorted by temperature.
     Curve { source: Source, points: Vec<[f32; 2]> },
+    /// Two steady speeds: `idle` % until the temperature reaches `load_temp`, then `load` % until it
+    /// falls back to `idle_temp` (the gap is the hysteresis). Made for gaming: no revving on short spikes.
+    Trigger { source: Source, idle_temp: f32, load_temp: f32, idle: f32, load: f32 },
+}
+
+/// Trigger values as the editor and the helper accept them: whole numbers, temperatures 20-100 °C with the
+/// load temperature at least 2 °C above the idle one, speeds between the fan's floor and 100 %.
+pub fn fix_trigger(idle_temp: f32, load_temp: f32, idle: f32, load: f32, floor: f32) -> (f32, f32, f32, f32) {
+    let num = |v: f32, fallback: f32| if v.is_finite() { v.round() } else { fallback };
+    let it = num(idle_temp, 55.0).clamp(GRAPH_T.0, GRAPH_T.1 - 2.0);
+    let lt = num(load_temp, 65.0).clamp(it + 2.0, GRAPH_T.1);
+    let f = floor.clamp(0.0, 100.0);
+    (it, lt, num(idle, 30.0).clamp(f, 100.0), num(load, 70.0).clamp(f, 100.0))
+}
+
+/// Starting trigger for a fan, picked for gaming on a Ryzen 7 9800X3D + RTX 5080:
+/// - CPU fan / pump (CPU): idle until 55 °C, gaming from 65 °C, 30 % -> 65 %
+/// - graphics card fans (GPU): 50 °C / 60 °C, 30 % -> 60 % (30 % is the RTX driver minimum)
+/// - case fans (hotter of the two; the GPU heats the case most when gaming): 55 °C / 65 °C, 30 % -> 70 %
+pub fn default_trigger(name: &str, gpu: bool, pump: bool, floor: f32) -> FanSetting {
+    let FanSetting::Curve { source, .. } = default_curve(name, gpu, pump, floor) else { unreachable!() };
+    let (it, lt, idle, load) = match source {
+        Source::Cpu => (55.0, 65.0, 30.0, 65.0),
+        Source::Gpu => (50.0, 60.0, 30.0, 60.0),
+        Source::Hottest => (55.0, 65.0, 30.0, 70.0),
+    };
+    let (idle_temp, load_temp, idle, load) = fix_trigger(it, lt, idle, load, floor);
+    FanSetting::Trigger { source, idle_temp, load_temp, idle, load }
+}
+
+/// Speed a trigger runs at: `loaded` is whether it was in its gaming state before this temperature.
+pub fn trigger_loaded(loaded: bool, temp: f32, idle_temp: f32, load_temp: f32) -> bool {
+    if temp >= load_temp {
+        true
+    } else if temp <= idle_temp {
+        false
+    } else {
+        loaded
+    }
 }
 
 /// Which temperature a curve follows.
@@ -152,7 +193,7 @@ pub fn default_curve(name: &str, gpu: bool, pump: bool, floor: f32) -> FanSettin
     FanSetting::Curve { source, points }
 }
 
-/// Lowest duty PC Tuner allows for a fan: 20 % (50 % for pumps), or the driver's own minimum if higher.
+/// Lowest duty PC Tuner allows for a fan: the driver's / controller's own minimum (0 % when it has none).
 pub fn floor_for(pump: bool, driver_min: Option<f32>) -> f32 {
     let safety = if pump { PUMP_FLOOR } else { FAN_FLOOR };
     safety.max(driver_min.unwrap_or(0.0)).min(100.0)
@@ -210,11 +251,66 @@ pub fn normalize_points(points: &[[f32; 2]]) -> Option<Vec<[f32; 2]>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// A curve keeps at least this many points...
+pub const MIN_POINTS: usize = 2;
+/// ...and at most this many (the helper refuses longer curves).
+pub const MAX_POINTS: usize = 16;
+
+/// The temperatures point `i` may take: inside the graph and 2 °C away from its neighbours.
+fn temp_range(points: &[[f32; 2]], i: usize) -> (f32, f32) {
+    let lo = if i > 0 { points[i - 1][0] + 2.0 } else { GRAPH_T.0 };
+    let hi = if i + 1 < points.len() { points[i + 1][0] - 2.0 } else { GRAPH_T.1 };
+    (lo, hi.max(lo))
+}
+
+/// Move point `i` (dragged or typed): whole numbers, temperature kept between its neighbours, speed
+/// between the fan's floor and 100 %. True when the point changed.
+pub fn set_point(points: &mut [[f32; 2]], i: usize, t: f32, d: f32, floor: f32) -> bool {
+    let Some(old) = points.get(i).copied() else { return false };
+    if !t.is_finite() || !d.is_finite() {
+        return false;
+    }
+    let (lo, hi) = temp_range(points, i);
+    let new = [t.round().clamp(lo, hi), d.round().clamp(floor.min(100.0), 100.0)];
+    points[i] = new;
+    new != old
+}
+
+/// Add a point (a click on the graph). Refused when the curve is full or another point is closer than
+/// 2 °C. Returns the new point's index.
+pub fn add_point(points: &mut Vec<[f32; 2]>, t: f32, d: f32, floor: f32) -> Option<usize> {
+    if points.len() >= MAX_POINTS || !t.is_finite() || !d.is_finite() {
+        return None;
+    }
+    let t = t.round().clamp(GRAPH_T.0, GRAPH_T.1);
+    if points.iter().any(|p| (p[0] - t).abs() < 2.0) {
+        return None;
+    }
+    let i = points.iter().position(|p| p[0] > t).unwrap_or(points.len());
+    points.insert(i, [t, d.round().clamp(floor.min(100.0), 100.0)]);
+    Some(i)
+}
+
+/// Remove point `i`. Refused when only the minimum is left.
+pub fn remove_point(points: &mut Vec<[f32; 2]>, i: usize) -> bool {
+    if points.len() <= MIN_POINTS || i >= points.len() {
+        return false;
+    }
+    points.remove(i);
+    true
+}
+
 /// A setting as loaded from fan-profiles.json, with its curve normalised (an unreadable curve becomes the
 /// Balanced curve; the helper still applies the fan's floor).
 fn normalize_setting(s: &mut FanSetting) {
-    if let FanSetting::Curve { points, .. } = s {
-        *points = normalize_points(points).unwrap_or_else(|| preset_points("Balanced").map(|p| p.to_vec()).unwrap_or_default());
+    match s {
+        FanSetting::Curve { points, .. } => {
+            *points = normalize_points(points).unwrap_or_else(|| preset_points("Balanced").map(|p| p.to_vec()).unwrap_or_default());
+        }
+        FanSetting::Trigger { idle_temp, load_temp, idle, load, .. } => {
+            (*idle_temp, *load_temp, *idle, *load) = fix_trigger(*idle_temp, *load_temp, *idle, *load, 0.0);
+        }
+        _ => {}
     }
 }
 
@@ -299,6 +395,7 @@ fn fan_chip(f: &FanInfo, setting: &FanSetting, can: bool, emergency: bool, blind
     if !can {
         // view-only: nothing is sent, so show what the helper reports, not the saved setting
         return match (f.mode == "software", f.curve) {
+            (true, true) if matches!(setting, FanSetting::Trigger { .. }) => ("Trigger", theme::ACCENT),
             (true, true) => ("Curve", theme::ACCENT),
             (true, false) => ("PC Tuner", theme::ACCENT),
             _ => ("BIOS", theme::DIM),
@@ -312,6 +409,8 @@ fn fan_chip(f: &FanInfo, setting: &FanSetting, can: bool, emergency: bool, blind
         ("100 % - hot", theme::LOCKED)
     } else if matches!(setting, FanSetting::Curve { .. }) {
         ("Curve", theme::ACCENT)
+    } else if matches!(setting, FanSetting::Trigger { .. }) {
+        ("Trigger", theme::ACCENT)
     } else if ours {
         ("PC Tuner", theme::ACCENT)
     } else {
@@ -327,6 +426,10 @@ pub fn command_for(id: &str, setting: &FanSetting) -> String {
         FanSetting::Curve { source, points } => {
             let pts: Vec<String> = points.iter().map(|p| format!("{:.0}:{:.0}", p[0], p[1].clamp(0.0, 100.0))).collect();
             format!("curve {id} {} {}", source.key(), pts.join(","))
+        }
+        FanSetting::Trigger { source, idle_temp, load_temp, idle, load } => {
+            let (it, lt, i, l) = fix_trigger(*idle_temp, *load_temp, *idle, *load, 0.0);
+            format!("trigger {id} {} {it:.0} {lt:.0} {i:.0} {l:.0}", source.key())
         }
     }
 }
@@ -483,7 +586,7 @@ impl Shared {
 }
 
 /// Unpack the embedded helper to %LOCALAPPDATA%\PCTuner\fan and return the exe path.
-fn extract_helper() -> Result<PathBuf, String> {
+pub(crate) fn extract_helper() -> Result<PathBuf, String> {
     if embedded::FILES.is_empty() {
         return Err("The fan helper was not built into this copy of PC Tuner (run fanhelper\\build.ps1, then rebuild).".into());
     }
@@ -792,6 +895,16 @@ fn demo_apply(s: &mut Status, settings: &HashMap<String, FanSetting>) {
             Some(FanSetting::Curve { source, points }) => {
                 if let Some(t) = source.read(cpu, gpu) {
                     let d = curve_duty(points, t.clamp(GRAPH_T.0, GRAPH_T.1)).max(floor);
+                    f.percent = Some(d);
+                    f.requested = Some(d);
+                }
+                f.curve = true;
+                f.mode = "software".into();
+            }
+            Some(FanSetting::Trigger { source, idle_temp, load_temp, idle, load }) => {
+                if let Some(t) = source.read(cpu, gpu) {
+                    // the demo has no history: halfway between the two temperatures counts as gaming
+                    let d = if trigger_loaded(t >= (idle_temp + load_temp) / 2.0, t, *idle_temp, *load_temp) { *load } else { *idle }.max(floor);
                     f.percent = Some(d);
                     f.requested = Some(d);
                 }
@@ -1496,6 +1609,10 @@ impl Tab for FanTab {
                     let s = match s {
                         FanSetting::Manual { percent } => FanSetting::Manual { percent: percent.max(floor) },
                         FanSetting::Curve { source, points } => FanSetting::Curve { source, points: points.into_iter().map(|p| [p[0], p[1].clamp(floor, 100.0)]).collect() },
+                        FanSetting::Trigger { source, idle_temp, load_temp, idle, load } => {
+                            let (idle_temp, load_temp, idle, load) = fix_trigger(idle_temp, load_temp, idle, load, floor);
+                            FanSetting::Trigger { source, idle_temp, load_temp, idle, load }
+                        }
                         other => other,
                     };
                     self.pin(&id, &s);
@@ -1507,6 +1624,10 @@ impl Tab for FanTab {
                         match self.settings.get_mut(&id) {
                             Some(FanSetting::Manual { percent }) => *percent = percent.max(PUMP_FLOOR),
                             Some(FanSetting::Curve { points, .. }) => points.iter_mut().for_each(|pt| pt[1] = pt[1].max(PUMP_FLOOR)),
+                            Some(FanSetting::Trigger { idle, load, .. }) => {
+                                *idle = idle.max(PUMP_FLOOR);
+                                *load = load.max(PUMP_FLOOR);
+                            }
                             _ => {}
                         }
                     }
@@ -1516,6 +1637,10 @@ impl Tab for FanTab {
                         }
                         if let (true, FanSetting::Curve { points, .. }) = (p, &mut *s) {
                             points.iter_mut().for_each(|pt| pt[1] = pt[1].max(PUMP_FLOOR));
+                        }
+                        if let (true, FanSetting::Trigger { idle, load, .. }) = (p, &mut *s) {
+                            *idle = idle.max(PUMP_FLOOR);
+                            *load = load.max(PUMP_FLOOR);
                         }
                     }
                     // a fact about the header, the same for every profile: saved with the store
@@ -1643,7 +1768,7 @@ fn fans_and_temps(ui: &mut egui::Ui, s: &Status, rpm_hist: &HashMap<String, VecD
     });
     ui.add_space(4.0);
     ui.label(
-        RichText::new("Sensors: LibreHardwareMonitor with the PawnIO driver, updated every second. Fans never go below 20 % (pumps 50 %); at 90 °C every controlled fan goes to 100 %.")
+        RichText::new("Sensors: LibreHardwareMonitor with the PawnIO driver, updated every second. Speeds go as low as you set them; at 90 °C every controlled fan goes to 100 %.")
             .size(12.0)
             .color(theme::TEXT_FAINT),
     );
@@ -1734,7 +1859,31 @@ fn fan_card(ui: &mut egui::Ui, f: &FanInfo, hist: Option<&VecDeque<f32>>, settin
                 if ui.selectable_label(curve, "  Curve  ").on_hover_text("Speed follows a temperature: drag the points on the graph.").clicked() && !curve {
                     action = Some(CardAction::Set(default_curve(&f.name, f.gpu, f.pump, floor)));
                 }
+                let trigger = matches!(setting, FanSetting::Trigger { .. });
+                if ui
+                    .selectable_label(trigger, "  Trigger  ")
+                    .on_hover_text("Two steady speeds for gaming: quiet until the temperature reaches the gaming point, then one fixed speed until it falls back to the idle point. No revving on short temperature spikes.")
+                    .clicked()
+                    && !trigger
+                {
+                    action = Some(CardAction::Set(default_trigger(&f.name, f.gpu, f.pump, floor)));
+                }
             });
+            if let FanSetting::Trigger { source, idle_temp, load_temp, idle, load } = setting {
+                let mut src = *source;
+                egui::ComboBox::from_id_salt(("fan-trg-src", &f.id)).selected_text(src.label()).width(ui.available_width() - 8.0).show_ui(ui, |ui| {
+                    for s in [Source::Cpu, Source::Gpu, Source::Hottest] {
+                        ui.selectable_value(&mut src, s, s.label());
+                    }
+                });
+                let mut v = (*idle_temp, *load_temp, *idle, *load);
+                let live = src.read(s.cpu, s.gpu);
+                let changed = trigger_editor(ui, &mut v, floor, live, f.percent);
+                if changed || src != *source {
+                    let (idle_temp, load_temp, idle, load) = v;
+                    action = Some(CardAction::Set(FanSetting::Trigger { source: src, idle_temp, load_temp, idle, load }));
+                }
+            }
             if let FanSetting::Curve { source, points } = setting {
                 let mut src = *source;
                 egui::ComboBox::from_id_salt(("fan-src", &f.id)).selected_text(src.label()).width(ui.available_width() - 8.0).show_ui(ui, |ui| {
@@ -1761,7 +1910,7 @@ fn fan_card(ui: &mut egui::Ui, f: &FanInfo, hist: Option<&VecDeque<f32>>, settin
             }
             if !f.gpu {
                 let mut pump = f.pump;
-                if ui.checkbox(&mut pump, "This is a pump (never below 50 %)").changed() {
+                if ui.checkbox(&mut pump, "This is a pump").on_hover_text("Its default curve follows the CPU temperature.").changed() {
                     action = Some(CardAction::Pump(pump));
                 }
             }
@@ -1782,11 +1931,86 @@ fn fan_card(ui: &mut egui::Ui, f: &FanInfo, hist: Option<&VecDeque<f32>>, settin
 
 const GRAPH_T: (f32, f32) = (20.0, 100.0);
 
-/// Draggable fan curve. Returns true when a point moved.
-/// x = temperature 20-100 °C, y = duty 0-100 %. The shaded band is below the fan's floor; the red line is the 90 °C override.
-fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut [[f32; 2]], floor: f32, live: Option<f32>) -> bool {
-    let size = egui::vec2(ui.available_width(), 150.0);
+/// Trigger editor: a picture of the two speeds and four typed values. `v` = (idle temp, gaming temp,
+/// idle %, gaming %). `now` is the speed the helper reports for this fan. Returns true when a value changed.
+fn trigger_editor(ui: &mut egui::Ui, v: &mut (f32, f32, f32, f32), floor: f32, live: Option<f32>, now: Option<f32>) -> bool {
+    let size = egui::vec2(ui.available_width(), 110.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let plot = rect.shrink2(egui::vec2(6.0, 8.0));
+    let x = |t: f32| plot.left() + plot.width() * (t.clamp(GRAPH_T.0, GRAPH_T.1) - GRAPH_T.0) / (GRAPH_T.1 - GRAPH_T.0);
+    let y = |d: f32| plot.bottom() - plot.height() * d.clamp(0.0, 100.0) / 100.0;
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 8.0, theme::tint(egui::Color32::WHITE, 6));
+    let (it, lt, idle, load) = *v;
+    // between the two temperatures the fan keeps whichever speed it had
+    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x(it), plot.top()), egui::pos2(x(lt), plot.bottom())), 0.0, theme::tint(theme::ACCENT, 14));
+    let faint = egui::Stroke::new(1.0_f32, theme::tint(egui::Color32::WHITE, 10));
+    for d in [25.0_f32, 50.0, 75.0] {
+        painter.line_segment([egui::pos2(plot.left(), y(d)), egui::pos2(plot.right(), y(d))], faint);
+    }
+    let x90 = x(90.0);
+    painter.line_segment([egui::pos2(x90, plot.top()), egui::pos2(x90, plot.bottom())], egui::Stroke::new(1.0_f32, theme::tint(theme::LOCKED, 160)));
+    // idle level up to the gaming point, the jump, gaming level down to the idle point (dashed: the way back)
+    let s = egui::Stroke::new(2.0_f32, theme::ACCENT);
+    painter.line_segment([egui::pos2(plot.left(), y(idle)), egui::pos2(x(lt), y(idle))], s);
+    painter.line_segment([egui::pos2(x(lt), y(idle)), egui::pos2(x(lt), y(load))], s);
+    painter.line_segment([egui::pos2(x(lt), y(load)), egui::pos2(plot.right(), y(load))], s);
+    painter.add(egui::Shape::dashed_line(&[egui::pos2(x(it), y(load)), egui::pos2(x(lt), y(load))], s, 4.0, 3.0));
+    painter.add(egui::Shape::dashed_line(&[egui::pos2(x(it), y(load)), egui::pos2(x(it), y(idle))], s, 4.0, 3.0));
+    let small = egui::FontId::proportional(10.5);
+    painter.text(egui::pos2(x(lt) + 4.0, y(load) - 2.0), egui::Align2::LEFT_BOTTOM, format!("gaming {load:.0} %"), small.clone(), theme::TEXT_DIM);
+    painter.text(egui::pos2(plot.left() + 2.0, y(idle) - 2.0), egui::Align2::LEFT_BOTTOM, format!("idle {idle:.0} %"), small.clone(), theme::TEXT_DIM);
+    painter.text(plot.left_bottom() + egui::vec2(2.0, -2.0), egui::Align2::LEFT_BOTTOM, "20 °C", small.clone(), theme::TEXT_FAINT);
+    painter.text(egui::pos2(x90 + 3.0, plot.top()), egui::Align2::LEFT_TOP, "90°", small, theme::tint(theme::LOCKED, 200));
+    if let Some(t) = live {
+        let d = now.unwrap_or(if t >= lt { load } else { idle });
+        painter.circle_filled(egui::pos2(x(t), y(d)), 5.0, theme::GAMING);
+        let label = format!("now {t:.0} °C → {d:.0} %");
+        let galley = painter.layout_no_wrap(label, egui::FontId::proportional(11.5), theme::GAMING);
+        let pos = plot.left_top() + egui::vec2(2.0, 2.0);
+        let bg = egui::Rect::from_min_size(pos, galley.size()).expand2(egui::vec2(3.0, 1.0));
+        painter.rect_filled(bg, 3.0, egui::Color32::from_rgba_unmultiplied(theme::BG.r(), theme::BG.g(), theme::BG.b(), 200));
+        painter.galley(pos, galley, theme::GAMING);
+    }
+
+    let mut n = *v;
+    let mut changed = false;
+    fn dv<'a>(val: &'a mut f32, lo: f32, hi: f32, suffix: &'static str) -> egui::DragValue<'a> {
+        egui::DragValue::new(val).range(lo..=hi).speed(0.25).fixed_decimals(0).suffix(suffix)
+    }
+    egui::Grid::new(ui.id().with("trigger-values")).num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
+        ui.label(RichText::new("Gaming from").size(12.0).color(theme::TEXT_DIM));
+        changed |= ui.add(dv(&mut n.1, GRAPH_T.0 + 2.0, GRAPH_T.1, " °C")).on_hover_text("At this temperature the fan steps up to the gaming speed.").changed();
+        ui.label(RichText::new("at").size(12.0).color(theme::TEXT_DIM));
+        changed |= ui.add(dv(&mut n.3, floor, 100.0, " %")).on_hover_text("Gaming speed.").changed();
+        ui.end_row();
+        ui.label(RichText::new("Idle below").size(12.0).color(theme::TEXT_DIM));
+        changed |= ui.add(dv(&mut n.0, GRAPH_T.0, GRAPH_T.1 - 2.0, " °C")).on_hover_text("The fan drops back to the idle speed only when the temperature falls to this point (at least 2 °C under the gaming point).").changed();
+        ui.label(RichText::new("at").size(12.0).color(theme::TEXT_DIM));
+        changed |= ui.add(dv(&mut n.2, floor, 100.0, " %")).on_hover_text("Idle speed.").changed();
+        ui.end_row();
+    });
+    if changed {
+        // keep the gaming point above the idle point, moving whichever one was not just edited
+        if n.1 != v.1 && n.1 < n.0 + 2.0 {
+            n.0 = n.1 - 2.0;
+        }
+        let fixed = fix_trigger(n.0, n.1, n.2, n.3, floor);
+        changed = fixed != *v;
+        *v = fixed;
+    }
+    ui.label(RichText::new("Steady speeds: short temperature spikes in games do not rev the fan up and down.").size(11.5).color(theme::TEXT_FAINT));
+    changed
+}
+
+/// Fan curve editor. Returns true when the curve changed.
+/// Drag a point to move it, click the graph to add one, right-click a point to remove it; the row under
+/// the graph takes typed values for the selected point.
+/// x = temperature 20-100 °C, y = duty 0-100 %. The shaded band is below the fan's floor; the red line is the 90 °C override.
+fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut Vec<[f32; 2]>, floor: f32, live: Option<f32>) -> bool {
+    let size = egui::vec2(ui.available_width(), 150.0);
+    // the graph itself takes clicks (add a point); the points are registered after it, so they win
+    let (rect, graph) = ui.allocate_exact_size(size, egui::Sense::click());
     let plot = rect.shrink2(egui::vec2(6.0, 8.0));
     let to_screen = |t: f32, d: f32| {
         egui::pos2(
@@ -1817,34 +2041,56 @@ fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut [[f32; 2]], floor: f32
     // 90 °C: every fan to 100 %
     let x90 = to_screen(90.0, 0.0).x;
     // under the floor line, ending left of the 90° line (the curve is always above the floor)
-    painter.text(egui::pos2(x90.min(plot.right()) - 4.0, fy + 2.0), egui::Align2::RIGHT_TOP, format!("min {floor:.0} %"), egui::FontId::proportional(10.5), theme::tint(theme::LOCKED, 200));
+    if floor > 0.0 {
+        painter.text(egui::pos2(x90.min(plot.right()) - 4.0, fy + 2.0), egui::Align2::RIGHT_TOP, format!("min {floor:.0} %"), egui::FontId::proportional(10.5), theme::tint(theme::LOCKED, 200));
+    }
     painter.line_segment([egui::pos2(x90, plot.top()), egui::pos2(x90, plot.bottom())], egui::Stroke::new(1.0_f32, theme::tint(theme::LOCKED, 160)));
     painter.text(egui::pos2(x90 + 3.0, plot.top()), egui::Align2::LEFT_TOP, "90°", egui::FontId::proportional(10.5), theme::tint(theme::LOCKED, 200));
     painter.text(plot.left_bottom() + egui::vec2(2.0, -2.0), egui::Align2::LEFT_BOTTOM, "20 °C", egui::FontId::proportional(10.5), theme::TEXT_FAINT);
     painter.text(plot.left_top() + egui::vec2(2.0, 0.0), egui::Align2::LEFT_TOP, "100 %", egui::FontId::proportional(10.5), theme::TEXT_FAINT);
 
-    // drag the points (temperatures stay in order, 2 °C apart)
+    // the selected point (the one the value boxes under the graph edit) is remembered per fan
+    let sel_id = ui.id().with(("fan-sel", id));
+    let mut sel: Option<usize> = ui.data(|d| d.get_temp::<usize>(sel_id)).filter(|i| *i < points.len());
+
+    // drag the points (temperatures stay in order, 2 °C apart); click selects, right-click removes
     let mut changed = false;
-    let n = points.len();
-    for i in 0..n {
+    let mut remove: Option<usize> = None;
+    let mut hovered: Option<usize> = None;
+    for i in 0..points.len() {
         let p = to_screen(points[i][0], points[i][1]);
         let hit = egui::Rect::from_center_size(p, egui::vec2(18.0, 18.0));
-        let resp = ui.interact(hit, ui.id().with(("fan-pt", id, i)), egui::Sense::drag());
-        if resp.dragged() {
+        let resp = ui.interact(hit, ui.id().with(("fan-pt", id, i)), egui::Sense::click_and_drag());
+        if resp.clicked() || resp.drag_started_by(egui::PointerButton::Primary) {
+            sel = Some(i);
+        }
+        if resp.secondary_clicked() {
+            remove = Some(i);
+        }
+        if resp.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let (t, d) = from_screen(pos);
-                let lo = if i > 0 { points[i - 1][0] + 2.0 } else { GRAPH_T.0 };
-                let hi = if i + 1 < n { points[i + 1][0] - 2.0 } else { GRAPH_T.1 };
-                let nt = t.round().clamp(lo, hi.max(lo));
-                let nd = d.round().clamp(floor, 100.0);
-                if nt != points[i][0] || nd != points[i][1] {
-                    points[i] = [nt, nd];
-                    changed = true;
-                }
+                changed |= set_point(points, i, t, d, floor);
             }
         }
         if resp.hovered() || resp.dragged() {
+            hovered = Some(i);
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+    }
+    if let Some(i) = remove {
+        if remove_point(points, i) {
+            changed = true;
+            sel = None;
+            hovered = None;
+        }
+    } else if graph.clicked() {
+        if let Some(pos) = graph.interact_pointer_pos() {
+            let (t, d) = from_screen(pos);
+            if let Some(i) = add_point(points, t, d, floor) {
+                changed = true;
+                sel = Some(i);
+            }
         }
     }
 
@@ -1856,8 +2102,9 @@ fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut [[f32; 2]], floor: f32
     for (i, p) in points.iter().enumerate() {
         let c = to_screen(p[0], p[1].max(floor));
         let hot = ui.ctx().is_being_dragged(ui.id().with(("fan-pt", id, i)));
-        painter.circle(c, if hot { 7.0 } else { 5.5 }, theme::BG, egui::Stroke::new(2.0_f32, theme::ACCENT));
-        if hot {
+        let fill = if sel == Some(i) { theme::ACCENT } else { theme::BG };
+        painter.circle(c, if hot { 7.0 } else { 5.5 }, fill, egui::Stroke::new(2.0_f32, theme::ACCENT));
+        if hot || hovered == Some(i) {
             painter.text(c + egui::vec2(0.0, -12.0), egui::Align2::CENTER_BOTTOM, format!("{:.0} °C → {:.0} %", p[0], p[1]), egui::FontId::proportional(11.5), theme::TEXT);
         }
     }
@@ -1876,6 +2123,42 @@ fn curve_editor(ui: &mut egui::Ui, id: &str, points: &mut [[f32; 2]], floor: f32
         painter.rect_filled(bg, 3.0, egui::Color32::from_rgba_unmultiplied(theme::BG.r(), theme::BG.g(), theme::BG.b(), 200));
         painter.galley(pos, galley, theme::GAMING);
     }
+
+    // exact values for the selected point
+    ui.horizontal(|ui| match sel {
+        Some(i) => {
+            ui.label(RichText::new(format!("Point {} of {}", i + 1, points.len())).size(12.0).color(theme::TEXT_DIM));
+            let (lo, hi) = temp_range(points, i);
+            let mut t = points[i][0];
+            let mut d = points[i][1].max(floor);
+            let rt = ui
+                .add(egui::DragValue::new(&mut t).range(lo..=hi).speed(0.25).fixed_decimals(0).suffix(" °C"))
+                .on_hover_text(format!("Temperature of this point: type a value ({lo:.0}-{hi:.0} °C, 2 °C away from its neighbours)."));
+            let rd = ui
+                .add(egui::DragValue::new(&mut d).range(floor..=100.0).speed(0.25).fixed_decimals(0).suffix(" %"))
+                .on_hover_text(format!("Fan speed at that temperature ({floor:.0}-100 %)."));
+            if (rt.changed() || rd.changed()) && set_point(points, i, t, d, floor) {
+                changed = true;
+            }
+            if ui.add_enabled(points.len() > MIN_POINTS, egui::Button::new("Remove point").small()).on_disabled_hover_text("A curve needs at least 2 points.").clicked() && remove_point(points, i) {
+                changed = true;
+                sel = None;
+            }
+        }
+        None => {
+            ui.label(RichText::new("Click a point to type its exact temperature and speed.").size(11.5).color(theme::TEXT_FAINT));
+        }
+    });
+    let full = points.len() >= MAX_POINTS;
+    ui.label(
+        RichText::new(if full { "Right-click a point to remove it (the curve has the most points it can hold)." } else { "Click the graph to add a point, right-click a point to remove it." })
+            .size(11.5)
+            .color(theme::TEXT_FAINT),
+    );
+    ui.data_mut(|d| match sel {
+        Some(i) => d.insert_temp(sel_id, i),
+        None => d.remove::<usize>(sel_id),
+    });
     changed
 }
 
@@ -1907,12 +2190,62 @@ mod tests {
         assert!(sh.rpm.values().all(|h| h.len() == HISTORY));
     }
 
+    /// Trigger: gaming defaults per fan kind, the helper command, value rules, and old profile files.
+    #[test]
+    fn fan_trigger() {
+        let t = |s: FanSetting| match s {
+            FanSetting::Trigger { source, idle_temp, load_temp, idle, load } => (source, idle_temp, load_temp, idle, load),
+            _ => panic!("not a trigger"),
+        };
+        assert_eq!(t(default_trigger("CPU Fan", false, false, 0.0)), (Source::Cpu, 55.0, 65.0, 30.0, 65.0));
+        assert_eq!(t(default_trigger("Pump Fan", false, true, 0.0)), (Source::Cpu, 55.0, 65.0, 30.0, 65.0));
+        assert_eq!(t(default_trigger("GPU Fan", true, false, 30.0)), (Source::Gpu, 50.0, 60.0, 30.0, 60.0));
+        assert_eq!(t(default_trigger("System Fan #1", false, false, 0.0)), (Source::Hottest, 55.0, 65.0, 30.0, 70.0));
+        assert_eq!(t(default_trigger("GPU Fan", true, false, 40.0)).3, 40.0, "never under the driver minimum");
+        // value rules
+        assert_eq!(fix_trigger(60.0, 55.0, 30.0, 70.0, 0.0), (60.0, 62.0, 30.0, 70.0), "gaming point kept 2 °C above idle");
+        assert_eq!(fix_trigger(5.0, 150.0, -5.0, 120.0, 20.0), (20.0, 100.0, 20.0, 100.0));
+        assert_eq!(fix_trigger(f32::NAN, 65.4, 30.0, 70.0, 0.0), (55.0, 65.0, 30.0, 70.0));
+        // latch
+        assert!(!trigger_loaded(false, 64.0, 55.0, 65.0));
+        assert!(trigger_loaded(false, 65.0, 55.0, 65.0));
+        assert!(trigger_loaded(true, 58.0, 55.0, 65.0));
+        assert!(!trigger_loaded(true, 55.0, 55.0, 65.0));
+        // helper command and file format
+        let s = FanSetting::Trigger { source: Source::Hottest, idle_temp: 55.0, load_temp: 65.0, idle: 30.0, load: 70.0 };
+        assert_eq!(command_for("/lpc/x/control/2", &s), "trigger /lpc/x/control/2 hottest 55 65 30 70");
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#"{"mode":"trigger","source":"hottest","idle_temp":55.0,"load_temp":65.0,"idle":30.0,"load":70.0}"#);
+        assert_eq!(serde_json::from_str::<FanSetting>(&json).unwrap(), s);
+        // a saved trigger with bad values is repaired on load; files without triggers load as before
+        let mut store: ProfileStore = serde_json::from_str(
+            r#"{"pinned":{"a":{"mode":"trigger","source":"cpu","idle_temp":70,"load_temp":60,"idle":30,"load":65},
+                "b":{"mode":"curve","source":"gpu","points":[[30,30],[80,100]]}}}"#,
+        )
+        .unwrap();
+        normalize_store(&mut store);
+        assert_eq!(store.pinned["a"], FanSetting::Trigger { source: Source::Cpu, idle_temp: 70.0, load_temp: 72.0, idle: 30.0, load: 65.0 });
+        assert!(matches!(store.pinned["b"], FanSetting::Curve { .. }));
+        // chip
+        let mut f = FanInfo { id: "a".into(), controllable: true, ..Default::default() };
+        assert_eq!(fan_chip(&f, &s, true, false, false, false).0, "Trigger");
+        f.mode = "software".into();
+        f.curve = true;
+        assert_eq!(fan_chip(&f, &s, false, false, false, false).0, "Trigger", "view-only shows the helper's trigger too");
+    }
+
     #[test]
     fn fan_floors_and_commands() {
-        assert_eq!(floor_for(false, None), 20.0);
-        assert_eq!(floor_for(true, None), 50.0);
-        assert_eq!(floor_for(false, Some(30.0)), 30.0, "driver minimum wins when higher");
-        assert_eq!(floor_for(true, Some(30.0)), 50.0);
+        // no floor of PC Tuner's own, fan or pump: only the driver's minimum applies
+        assert_eq!(floor_for(false, None), 0.0);
+        assert_eq!(floor_for(true, None), 0.0);
+        assert_eq!(floor_for(false, Some(30.0)), 30.0, "driver minimum still holds");
+        assert_eq!(floor_for(true, Some(30.0)), 30.0);
+        let mut pts = vec![[30.0, 50.0], [85.0, 100.0]];
+        assert!(set_point(&mut pts, 0, 30.0, 35.0, floor_for(true, None)), "a pump curve point can go to 35 %");
+        assert_eq!(pts[0], [30.0, 35.0]);
+        assert!(set_point(&mut pts, 0, 30.0, 0.0, floor_for(false, None)));
+        assert_eq!(pts[0], [30.0, 0.0], "down to 0 %");
         assert_eq!(command_for("/lpc/x/control/0", &FanSetting::Bios), "auto /lpc/x/control/0");
         assert_eq!(command_for("/gpu/0/control/1", &FanSetting::Manual { percent: 55.4 }), "set /gpu/0/control/1 55");
         assert_eq!(command_for("id", &FanSetting::Manual { percent: 140.0 }), "set id 100");
@@ -2055,6 +2388,47 @@ mod tests {
         assert!(!json.contains("pumps"), "saved profiles no longer carry pump choices: {json}");
         let back: ProfileStore = serde_json::from_str(&serde_json::to_string(&t.store).unwrap()).unwrap();
         assert_eq!(back.pumps, t.store.pumps);
+    }
+
+    /// Editing a curve: points are added in order, removed down to 2, and typed values stay inside the rules.
+    #[test]
+    fn fan_curve_point_editing() {
+        let mut pts = vec![[30.0, 25.0], [50.0, 40.0], [85.0, 100.0]];
+        // add: lands in temperature order, rounded, never under the floor
+        assert_eq!(add_point(&mut pts, 61.4, 10.2, 20.0), Some(2));
+        assert_eq!(pts[2], [61.0, 20.0]);
+        assert_eq!(add_point(&mut pts, 95.0, 150.0, 20.0), Some(4));
+        assert_eq!(pts[4], [95.0, 100.0]);
+        assert_eq!(add_point(&mut pts, 10.0, 30.0, 20.0), Some(0), "left of the graph: clamped to 20 °C");
+        assert_eq!(pts[0], [20.0, 30.0]);
+        // too close to another point, or not a number: nothing added
+        let before = pts.clone();
+        assert_eq!(add_point(&mut pts, 51.0, 50.0, 20.0), None);
+        assert_eq!(add_point(&mut pts, f32::NAN, 50.0, 20.0), None);
+        assert_eq!(pts, before);
+        // typed values: temperature stays 2 °C from the neighbours, speed between floor and 100
+        assert!(set_point(&mut pts, 2, 90.0, 5.0, 20.0));
+        assert_eq!(pts[2], [59.0, 20.0], "clamped under the next point (61 °C) and to the floor");
+        assert!(set_point(&mut pts, 2, 0.0, 55.4, 20.0));
+        assert_eq!(pts[2], [32.0, 55.0], "clamped above the previous point (30 °C)");
+        assert!(!set_point(&mut pts, 2, 32.0, 55.0, 20.0), "same value: no change");
+        assert!(!set_point(&mut pts, 99, 50.0, 50.0, 20.0));
+        assert!(set_point(&mut pts, 5, 200.0, 100.0, 20.0));
+        assert_eq!(pts[5][0], 100.0, "last point may go to the right edge");
+        // an edited curve is already in the form the loader and the helper expect
+        assert_eq!(normalize_points(&pts).unwrap(), pts);
+        assert_eq!(command_for("f", &FanSetting::Curve { source: Source::Cpu, points: pts.clone() }), "curve f cpu 20:30,30:25,32:55,61:20,85:100,100:100");
+        // remove: down to 2 points, no further
+        assert!(!remove_point(&mut pts, 6));
+        while pts.len() > MIN_POINTS {
+            assert!(remove_point(&mut pts, 0));
+        }
+        assert!(!remove_point(&mut pts, 0));
+        assert_eq!(pts.len(), 2);
+        // full curve: no more points
+        let mut full: Vec<[f32; 2]> = (0..MAX_POINTS).map(|i| [20.0 + 4.0 * i as f32, 50.0]).collect();
+        assert_eq!(add_point(&mut full, 99.0, 50.0, 20.0), None);
+        assert_eq!(full.len(), MAX_POINTS);
     }
 
     /// Curves from fan-profiles.json are normalised the same way the helper reads them.

@@ -190,7 +190,8 @@ struct Launch {
 }
 
 pub struct BloatTab {
-    skip: Vec<bool>,
+    /// Ticked by hand = removed by the next "Remove selected".
+    pick: Vec<bool>,
     installed: Option<Vec<String>>,
     scan: Option<common::Job<Vec<String>>>,
     stream: Option<Stream>,
@@ -198,11 +199,12 @@ pub struct BloatTab {
     targeted: usize,
     op: Option<OpWindow>,
     pending: Option<Launch>,
-    show_details: bool,
     /// A run has just ended: read the installed apps again (once).
     rescan_due: bool,
-    /// Screenshot demo: a canned log shown in the result card instead of a real run.
-    demo: Option<(Vec<String>, Option<i32>)>,
+    /// The full script log while its window is open ("Show technical details" in the pop-up).
+    log: Option<String>,
+    /// Screenshot demo: the pop-up shows a canned log, nothing runs.
+    demo: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -240,7 +242,7 @@ const DEMO_LOG: &[&str] = &[
 impl BloatTab {
     pub fn new() -> Self {
         let mut tab = BloatTab {
-            skip: vec![false; TARGETS.len()],
+            pick: vec![false; TARGETS.len()],
             installed: None,
             scan: None,
             stream: None,
@@ -248,23 +250,24 @@ impl BloatTab {
             targeted: 0,
             op: None,
             pending: None,
-            show_details: false,
             rescan_due: false,
-            demo: None,
+            log: None,
+            demo: false,
         };
         if let Some(stage) = opwin::demo_stage("bloat") {
             // samples for screenshots - the script is not started
-            match stage {
-                Stage::Preview => tab.op = Some(tab.remove_window(false).0),
-                Stage::Running | Stage::Done => {
-                    let done = stage == Stage::Done;
-                    let n = if done { DEMO_LOG.len() } else { DEMO_LOG.len() - 5 };
-                    tab.demo = Some((DEMO_LOG[..n].iter().map(|s| s.to_string()).collect(), if done { Some(0) } else { None }));
-                    tab.last_title = "Remove Safe".into();
-                    let all: Vec<String> = DEMO_LOG.iter().map(|s| s.to_string()).collect();
-                    tab.targeted = summarize(&all, false).0.len();
-                }
+            tab.pick = TARGETS.iter().map(|t| !t.optional).collect();
+            let mut w = tab.remove_window().0;
+            if stage != Stage::Preview {
+                let done = stage == Stage::Done;
+                let n = if done { DEMO_LOG.len() } else { DEMO_LOG.len() - 5 };
+                let lines: Vec<String> = DEMO_LOG[..n].iter().map(|s| s.to_string()).collect();
+                w.stage = Stage::Running;
+                w.show_steps = true;
+                fill_window(&mut w, &lines, if done { Some(0) } else { None });
             }
+            tab.op = Some(w);
+            tab.demo = true;
         }
         tab
     }
@@ -277,19 +280,9 @@ impl BloatTab {
         }));
     }
 
-    fn skip_arg(&self, optional: bool) -> Vec<String> {
-        let names: Vec<&str> = TARGETS
-            .iter()
-            .zip(&self.skip)
-            .filter(|(t, s)| **s && (optional || !t.optional))
-            .map(|(t, _)| t.name)
-            .collect();
-        if names.is_empty() { vec![] } else { vec!["-Skip".into(), names.join(",")] }
-    }
-
-    /// Targets a run would process: the chosen lists minus the ticked (skipped) items.
-    fn selected(&self, optional: bool) -> Vec<&'static Target> {
-        TARGETS.iter().zip(&self.skip).filter(|(t, s)| !**s && (optional || !t.optional)).map(|(t, _)| t).collect()
+    /// Targets a run would process: the ticked items.
+    fn selected(&self) -> Vec<&'static Target> {
+        TARGETS.iter().zip(&self.pick).filter(|(_, p)| **p).map(|(t, _)| t).collect()
     }
 
     /// Some(true) = installed, Some(false) = removed, None = not known (still scanning, or not a Store app).
@@ -307,9 +300,9 @@ impl BloatTab {
         self.stream = Some(Stream::run_ps_file(&path, &l.args));
     }
 
-    /// Preview window + launch data for "Remove Safe" / "Remove Safe + Optional".
-    fn remove_window(&self, optional: bool) -> (OpWindow, Launch) {
-        let sel = self.selected(optional);
+    /// Preview window + launch data for "Remove selected".
+    fn remove_window(&self) -> (OpWindow, Launch) {
+        let sel = self.selected();
         let items: Vec<OpItem> = sel
             .iter()
             .map(|t| {
@@ -326,35 +319,30 @@ impl BloatTab {
             let names: Vec<String> = sel.iter().map(|t| friendly(t.name)).collect();
             w.preview_text.push_str(&format!("\n\nRemoves: {}.", names.join(", ")));
         }
-        w.warning = Some("A restore point is created first. Everything can be undone with Restore.".into());
+        w.warning = Some("A Windows restore point is created first.".into());
         w.reassure = "Never touches Xbox, Game Pass, Store, Security, Edge/WebView2, Photos, Notepad or codecs.".into();
         w.go_label = "Remove".into();
-        w.empty_text = "Every item in this list is ticked to be skipped.".into();
-        let mut args = vec!["-Apply".to_string()];
-        if optional {
-            args.push("-Optional".into());
-        }
-        args.push("-Yes".into());
-        args.extend(self.skip_arg(optional));
-        (w, Launch { args, title: if optional { "Remove Safe + Optional" } else { "Remove Safe" }, targeted: sel.len() })
+        w.empty_text = "Nothing is ticked. Tick the apps to remove in the list.".into();
+        let mut args = vec!["-Apply".to_string(), "-Yes".to_string()];
+        args.extend(pick_args(&self.pick));
+        (w, Launch { args, title: "Remove selected", targeted: sel.len() })
     }
+}
 
-    fn restore_window() -> (OpWindow, Launch) {
-        let items = vec![
-            OpItem::new("apps", "Reinstall the removed apps that have a Store listing", "Restore").detail("from the Microsoft Store, for you"),
-            OpItem::new("unblock", "Unblock the apps without a Store listing", "Restore").detail("reinstall these by hand"),
-            OpItem::new("reg", "Undo its registry, policy, task and feature changes", "Restore"),
-            OpItem::new("task", "Remove the re-check task", "Restore"),
-        ];
-        let mut w = OpWindow::new("REMOVE BLOAT", "run", "done", items).noun("restore step", "restore steps");
-        w.preview_text = "Puts back what Remove Bloat changed on this PC. Apps with no Store listing (for example Bing Search, Dev Home, \
-                          MSN widgets, Cross Device, the Teams meeting add-in) are only unblocked: the result lists them as not reinstalled, \
-                          so you can get them back by hand. Store apps come back for your account; other user profiles get them from the Store."
-            .into();
-        w.reassure = "Needs internet: the apps are downloaded again from the Microsoft Store.".into();
-        w.go_label = "Restore".into();
-        (w, Launch { args: vec!["-Restore".into(), "-Yes".into()], title: "Restore", targeted: 0 })
+/// The script runs whole tiers minus -Skip: ask for the Optional tier only when an optional item is
+/// ticked, and skip every unticked item of the tiers that run.
+fn pick_args(pick: &[bool]) -> Vec<String> {
+    let optional = TARGETS.iter().zip(pick).any(|(t, p)| *p && t.optional);
+    let skip: Vec<&str> = TARGETS.iter().zip(pick).filter(|(t, p)| !**p && (optional || !t.optional)).map(|(t, _)| t.name).collect();
+    let mut args = vec![];
+    if optional {
+        args.push("-Optional".to_string());
     }
+    if !skip.is_empty() {
+        args.push("-Skip".into());
+        args.push(skip.join(","));
+    }
+    args
 }
 
 /// A hero-row stat that is left out when the window is too narrow for it (instead of wrapping letter by letter).
@@ -375,32 +363,9 @@ fn visible_checkboxes(ui: &mut egui::Ui) {
     }
 }
 
-/// One result row: icon, plain name, what happened.
-fn result_row(ui: &mut egui::Ui, i: &ResultItem, label: &str) {
-    let (icon, text, c) = match &i.res {
-        Res::Working => ("…", "working".to_string(), theme::OPTIONAL),
-        Res::Removed => ("✔", "removed".into(), theme::OK),
-        Res::Applied => ("✔", "done".into(), theme::OK),
-        Res::AlreadySet => ("—", "already set - nothing to change".into(), theme::DIM),
-        Res::Restored => ("✔", "restored".into(), theme::OK),
-        Res::WouldRemove => ("•", "would be removed".into(), theme::OPTIONAL),
-        Res::AlreadyGone => ("—", "already gone".into(), theme::DIM),
-        Res::Kept => ("•", "kept (protected)".into(), theme::GAMING),
-        Res::Failed(m) => ("✖", if m.is_empty() { "failed".into() } else { format!("failed: {m}") }, theme::LOCKED),
-    };
-    ui.horizontal(|ui| {
-        if i.res == Res::Working {
-            ui.add_sized([18.0, 18.0], egui::Spinner::new().size(13.0));
-        } else {
-            ui.add_sized([18.0, 18.0], egui::Label::new(RichText::new(icon).color(c).strong()));
-        }
-        ui.label(RichText::new(label).color(if matches!(i.res, Res::AlreadyGone | Res::AlreadySet) { theme::DIM } else { theme::TEXT }));
-        ui.label(RichText::new(text).color(c));
-    });
-}
-
 /// Short form of a capability's full name for telling apart rows of one target,
 /// e.g. "Language.Speech~~~en-US~0.0.1.0" -> "Language.Speech en-US".
+#[cfg(test)]
 fn part_name(name: &str) -> String {
     let mut parts: Vec<&str> = name.split('~').filter(|p| !p.is_empty()).collect();
     if parts.len() > 1 && parts.last().is_some_and(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.')) {
@@ -410,6 +375,7 @@ fn part_name(name: &str) -> String {
 }
 
 /// Labels for the result rows: the plain name, plus the part when one target produced several rows.
+#[cfg(test)]
 fn row_labels(items: &[ResultItem]) -> Vec<String> {
     items
         .iter()
@@ -422,6 +388,7 @@ fn row_labels(items: &[ResultItem]) -> Vec<String> {
 
 /// How many targets are finished: a target is finished when it has rows and none of them is still working.
 /// Rows that belong to no target (e.g. a protected app) count as one item each.
+#[cfg(test)]
 fn finished_targets(items: &[ResultItem]) -> usize {
     let mut done = 0;
     let mut seen: Vec<usize> = vec![];
@@ -441,105 +408,50 @@ fn finished_targets(items: &[ResultItem]) -> usize {
     done
 }
 
-/// The live result card: status line, progress (items finished / items targeted), rows as they arrive.
-/// Returns true when the "Undo" button of a finished Remove run was clicked.
-fn result_card(ui: &mut egui::Ui, title: &str, run: Option<(&[String], Option<i32>)>, targeted: usize, show_details: &mut bool) -> bool {
-    let mut undo = false;
-    ui.horizontal(|ui| {
-        theme::section(ui, &if title.is_empty() { "Result".to_string() } else { format!("Result - {title}") });
-        if run.is_some() {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                visible_checkboxes(ui);
-                ui.checkbox(show_details, "Show technical details");
-            });
-        }
-    });
-    let Some((lines, exit)) = run else {
-        ui.label(RichText::new("Run a preview first - it changes nothing.").color(theme::TEXT_DIM));
-        ui.allocate_space(ui.available_size());
-        return false;
-    };
-    let (mut items, notes) = summarize(lines, title.starts_with("Preview"));
-    let running = exit.is_none();
-    let count = |f: &dyn Fn(&Res) -> bool| items.iter().filter(|i| f(&i.res)).count();
-    let removed = count(&|r| matches!(r, Res::Removed | Res::Applied | Res::Restored));
-    let would = count(&|r| matches!(r, Res::WouldRemove));
-    let gone = count(&|r| matches!(r, Res::AlreadyGone | Res::AlreadySet));
-    let failed = count(&|r| matches!(r, Res::Failed(_)));
-    let finished = finished_targets(&items);
-
-    ui.horizontal(|ui| {
-        if running {
-            ui.spinner();
-            let cur = items.iter().rev().find(|i| i.res == Res::Working).map(|i| friendly(&i.name)).unwrap_or_else(|| "Starting...".into());
-            ui.label(RichText::new(format!("Working: {cur}")).size(16.0).strong());
-        } else if failed > 0 {
-            ui.label(RichText::new(format!("Finished with {failed} problem{}", if failed == 1 { "" } else { "s" })).size(16.0).strong().color(theme::LOCKED));
-        } else {
-            ui.label(RichText::new("✔  Finished").size(16.0).strong().color(theme::OK));
-        }
-        if targeted > 0 {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("{} / {targeted}", finished.min(targeted))).color(theme::TEXT_DIM));
-            });
-        }
-    });
-    let width = ui.available_width();
-    if !running {
-        theme::progress(ui, 1.0, width);
-    } else if targeted > 0 {
-        let frac = ui.ctx().animate_value_with_time(egui::Id::new("bloat-progress"), (finished as f32 / targeted as f32).clamp(0.0, 1.0), 0.3);
-        theme::progress(ui, frac, width);
+/// The outcome of one target in the script's log: None while it is still running or has no line yet.
+fn target_result(items: &[ResultItem], target: usize) -> Option<Result<String, String>> {
+    let rows: Vec<&ResultItem> = items.iter().filter(|i| target_of(&i.name) == Some(target)).collect();
+    if rows.is_empty() || rows.iter().any(|r| r.res == Res::Working) {
+        return None;
+    }
+    if let Some(Res::Failed(m)) = rows.iter().map(|r| &r.res).find(|r| matches!(r, Res::Failed(_))) {
+        return Some(Err(if m.is_empty() { "failed".into() } else { m.clone() }));
+    }
+    Some(Ok(if rows.iter().any(|r| matches!(r.res, Res::Removed | Res::Applied | Res::Restored)) {
+        "removed".into()
+    } else if rows.iter().any(|r| r.res == Res::Kept) {
+        "kept (protected)".into()
     } else {
-        theme::sweep(ui, width);
-    }
-    ui.horizontal_wrapped(|ui| {
-        if would > 0 {
-            theme::chip(ui, &format!("{would} would be removed"), theme::OPTIONAL);
-        }
-        if removed > 0 {
-            theme::chip(ui, &format!("{removed} done"), theme::OK);
-        }
-        theme::chip(ui, &format!("{gone} already gone"), theme::DIM);
-        if failed > 0 {
-            theme::chip(ui, &format!("{failed} failed"), theme::LOCKED);
-        }
-        // a finished Remove run gets its own Undo: the same Restore preview as "Restore everything"
-        if !running && title.starts_with("Remove") && removed > 0 {
-            ui.add_space(6.0);
-            if ui.button("Undo (Restore everything)").on_hover_text("Opens the Restore preview - nothing changes until you confirm.").clicked() {
-                undo = true;
-            }
-        }
-    });
-    ui.add_space(2.0);
-
-    if !running {
-        items.sort_by_key(|i| !matches!(i.res, Res::Failed(_))); // problems first
-    }
-    let labels = row_labels(&items);
-    egui::ScrollArea::vertical().id_salt(if running { "bloat-live" } else { "bloat-final" }).auto_shrink([false, false]).stick_to_bottom(running).show(ui, |ui| {
-        if *show_details {
-            for l in lines {
-                ui.label(RichText::new(l).monospace().small().color(theme::TEXT_DIM));
-            }
-            return;
-        }
-        for (i, label) in items.iter().zip(&labels) {
-            result_row(ui, i, label);
-        }
-        if !notes.is_empty() {
-            ui.add_space(6.0);
-            for n in &notes {
-                ui.label(RichText::new(n).size(12.5).color(theme::TEXT_DIM));
-            }
-        }
-        if !running && items.is_empty() && notes.is_empty() {
-            ui.label(RichText::new(format!("Finished (exit code {}). Tick \"Show technical details\" to see the full log.", exit.unwrap_or(-1))).color(theme::TEXT_DIM));
-        }
-    });
-    undo
+        "already gone".into()
+    }))
 }
+
+/// Put the script's progress into the remove pop-up: each app is ticked off as its result arrives;
+/// once the script has ended the window shows the results, the notes and a "technical details" button.
+fn fill_window(op: &mut OpWindow, lines: &[String], exit: Option<i32>) {
+    let (items, notes) = summarize(lines, false);
+    let result = |it: &OpItem| TARGETS.iter().position(|t| t.name == it.id).and_then(|i| target_result(&items, i));
+    match exit {
+        None => {
+            for it in op.items.iter_mut() {
+                if it.result.is_none() {
+                    it.result = result(it);
+                }
+            }
+        }
+        Some(code) => {
+            op.finish(|it| {
+                result(it).or_else(|| Some(if code == 0 { Ok("nothing to do".into()) } else { Err(format!("no result - the script stopped (exit code {code})")) }))
+            });
+            op.notes = notes.into_iter().filter(|n| !n.starts_with("Skipping") && !n.starts_with("Restart the PC")).collect();
+            if op.ok_count() > 0 {
+                op.notes.push("Restart the PC to finish.".into());
+            }
+            op.extras = vec!["Show technical details".into()];
+        }
+    }
+}
+
 
 impl Tab for BloatTab {
     fn title(&self) -> &'static str {
@@ -560,8 +472,14 @@ impl Tab for BloatTab {
             // only the frame on which the run ends asks for a refresh of the installed status
             let was_running = s.exit.is_none();
             s.pump();
-            if was_running && s.exit.is_some() {
-                self.rescan_due = true;
+            if was_running {
+                // the pop-up shows the progress and, at the end, the results
+                if let Some(op) = &mut self.op {
+                    fill_window(op, &s.lines, s.exit);
+                }
+                if s.exit.is_some() {
+                    self.rescan_due = true;
+                }
             }
         }
         if self.rescan_due && self.scan.is_none() {
@@ -572,15 +490,21 @@ impl Tab for BloatTab {
         let running = self.stream.as_ref().map(|s| s.exit.is_none()).unwrap_or(false);
         let can = common::is_admin() && !running;
 
-        // Confirmation: the preview stage of the operation window. On Go the script starts and the window
-        // closes, so the live result card underneath shows every item as it happens.
+        // The remove pop-up: confirm, then it stays open, ticks off each app as it goes and shows the
+        // results (with the full log behind "Show technical details").
         if let Some(op) = &mut self.op {
-            match op.show(ui.ctx(), can && self.pending.is_some()) {
+            match op.show(ui.ctx(), can && !self.demo) {
                 Some(OpEvent::Go) => {
-                    self.op = None;
                     if let Some(l) = self.pending.take() {
+                        op.stage = Stage::Running;
+                        op.show_steps = true;
+                        op.running_text = "Removing...".into();
                         self.launch(l);
                     }
+                }
+                Some(OpEvent::Extra(0)) => {
+                    let lines = self.stream.as_ref().map(|s| s.lines.clone()).unwrap_or_else(|| DEMO_LOG.iter().map(|s| s.to_string()).collect());
+                    self.log = Some(lines.join("\n"));
                 }
                 Some(OpEvent::Close) => {
                     self.op = None;
@@ -589,16 +513,13 @@ impl Tab for BloatTab {
                 _ => {}
             }
         }
+        common::message_ui(ui.ctx(), "Technical details", &mut self.log);
 
         theme::page_header(ui, "Remove Bloat", "Removes apps in depth (all users, leftovers, reinstall blocks). Never touches Xbox, Game Pass, Store, Security or Edge.");
         common::admin_banner(ui);
 
         // ---- hero: how much of the list is gone
-        let run: Option<(&[String], Option<i32>)> = match (&self.stream, &self.demo) {
-            (Some(s), _) => Some((&s.lines[..], s.exit)),
-            (None, Some((lines, exit))) => Some((&lines[..], *exit)),
-            _ => None,
-        };
+        let run: Option<(&[String], Option<i32>)> = self.stream.as_ref().map(|s| (&s.lines[..], s.exit));
         let apps: Vec<&Target> = TARGETS.iter().filter(|t| is_app(t)).collect();
         let last = run.map(|(lines, _)| summarize(lines, self.last_title.starts_with("Preview")).0);
         theme::card(ui, |ui| {
@@ -621,53 +542,44 @@ impl Tab for BloatTab {
                 let show = |v: Option<usize>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
                 let failed = n(&|r| matches!(r, Res::Failed(_)));
                 let dim = |on: bool, c: egui::Color32| if on { c } else { theme::TEXT_FAINT };
-                stat_fit(ui, 30.0, &show(n(&|r| matches!(r, Res::WouldRemove))), "would remove (after a preview)", dim(last.is_some(), theme::OPTIONAL));
+                stat_fit(ui, 30.0, &show(n(&|r| matches!(r, Res::Removed | Res::Applied))), "removed (last run)", dim(last.is_some(), theme::OK));
                 stat_fit(ui, 22.0, &show(n(&|r| matches!(r, Res::AlreadyGone | Res::AlreadySet))), "already gone", dim(last.is_some(), theme::TEXT));
                 stat_fit(ui, 22.0, &show(failed), "failed", dim(last.is_some(), if failed.unwrap_or(0) > 0 { theme::LOCKED } else { theme::TEXT }));
             });
         });
         ui.add_space(2.0);
 
-        // ---- actions
-        let mut preview: Option<bool> = None;
-        let mut remove: Option<bool> = None;
-        let mut restore = false;
-        let mut undo = false;
+        // ---- actions: tick apps in the list by hand, then one button removes them
+        let mut remove = false;
+        let mut clear = false;
+        let n_sel = self.selected().len();
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(can, theme::primary_button("  Preview Safe  ")).on_hover_text("Shows what would be removed. Changes nothing.").clicked() {
-                preview = Some(false);
+            if ui
+                .add_enabled(can && n_sel > 0, theme::primary_button(&format!("  Remove selected ({n_sel})  ")))
+                .on_hover_text("Removes the ticked apps. Shows the list to confirm first.")
+                .on_disabled_hover_text(if common::is_admin() { "Tick the apps to remove in the list below." } else { "Run PC Tuner as administrator to remove apps." })
+                .clicked()
+            {
+                remove = true;
             }
-            if ui.add_enabled(can, egui::Button::new("Preview Safe + Optional")).on_hover_text("Shows what would be removed. Changes nothing.").clicked() {
-                preview = Some(true);
+            if ui.add_enabled(!running && n_sel > 0, egui::Button::new("Clear selection")).on_hover_text("Untick everything.").clicked() {
+                clear = true;
             }
-            ui.separator();
-            if ui.add_enabled(can, theme::danger_button("Remove Safe")).clicked() {
-                remove = Some(false);
-            }
-            if ui.add_enabled(can, theme::danger_button("Remove Safe + Optional")).clicked() {
-                remove = Some(true);
-            }
-            ui.separator();
-            if ui.add_enabled(can, egui::Button::new("Restore everything")).clicked() {
-                restore = true;
-            }
-            if ui.add_enabled(!running, egui::Button::new("Rescan")).clicked() {
+            if ui.add_enabled(!running, egui::Button::new("Rescan")).on_hover_text("Read the installed apps again.").clicked() {
                 self.installed = None;
             }
         });
         ui.add_space(2.0);
 
-        // ---- targets (left) and the live result (right)
-        let skip = &mut self.skip;
+        // ---- targets, full width
+        let pick = &mut self.pick;
         let installed = &self.installed;
-        let show_details = &mut self.show_details;
-        let (title, targeted) = (&self.last_title, self.targeted);
-        ui.columns(2, |cols| {
-            theme::card(&mut cols[0], |ui| {
+        {
+            theme::card(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     theme::section(ui, "Targets");
-                    ui.label(RichText::new("tick an item to skip it").size(12.0).color(theme::TEXT_DIM));
+                    ui.label(RichText::new("tick the apps you want removed").size(12.0).color(theme::TEXT_DIM));
                 });
                 egui::ScrollArea::vertical().id_salt("bloat-list").auto_shrink([false, false]).show(ui, |ui| {
                     visible_checkboxes(ui);
@@ -692,12 +604,9 @@ impl Tab for BloatTab {
                                     theme::chip(ui, "optional", theme::OPTIONAL);
                                 }
                                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                    ui.checkbox(&mut skip[i], "").on_hover_text("Tick to skip this item");
-                                    let c = if skip[i] || state == Some(false) { theme::DIM } else { theme::TEXT };
-                                    let mut name = RichText::new(friendly(t.name)).color(c);
-                                    if skip[i] {
-                                        name = name.strikethrough();
-                                    }
+                                    ui.checkbox(&mut pick[i], "").on_hover_text("Ticked = removed by Remove selected");
+                                    let c = if !pick[i] || state == Some(false) { theme::DIM } else { theme::TEXT };
+                                    let name = RichText::new(friendly(t.name)).color(c);
                                     ui.add(egui::Label::new(name).truncate()).on_hover_text(format!("{}\nYou lose: {}", t.name.trim_end_matches(['~', '.']), t.loses));
                                 });
                             });
@@ -705,31 +614,17 @@ impl Tab for BloatTab {
                     }
                 });
             });
-            theme::card(&mut cols[1], |ui| {
-                ui.set_width(ui.available_width());
-                undo = result_card(ui, title, run, targeted, show_details);
-            });
-        });
+        }
 
         // button clicks are handled last, when nothing borrows the tab any more
-        if let Some(optional) = preview {
-            let mut args = vec!["-WhatIf".to_string()];
-            if optional {
-                args.push("-Optional".into());
-            }
-            args.extend(self.skip_arg(optional));
-            let targeted = self.selected(optional).len();
-            self.launch(Launch { args, title: if optional { "Preview Safe + Optional" } else { "Preview Safe" }, targeted });
+        if clear {
+            self.pick = vec![false; TARGETS.len()];
+            ui.ctx().request_repaint();
         }
-        if let Some(optional) = remove {
-            let (w, l) = self.remove_window(optional);
+        if remove {
+            let (w, l) = self.remove_window();
             self.pending = if w.items.is_empty() { None } else { Some(l) };
             self.op = Some(w);
-        }
-        if restore || undo {
-            let (w, l) = Self::restore_window();
-            self.op = Some(w);
-            self.pending = Some(l);
         }
     }
 }
@@ -737,6 +632,53 @@ impl Tab for BloatTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The remove pop-up ticks apps off as the log arrives, then shows the results.
+    #[test]
+    fn bloat_results_in_the_popup() {
+        let mut tab = BloatTab::new();
+        tab.pick = TARGETS.iter().map(|t| !t.optional).collect();
+        let mut w = tab.remove_window().0;
+        let n = w.items.len();
+        let log: Vec<String> = DEMO_LOG.iter().map(|s| s.to_string()).collect();
+        // while running: finished apps have results, the one in progress does not
+        w.stage = Stage::Running;
+        fill_window(&mut w, &log[..13], None);
+        let id = |t: &str| w.items.iter().find(|i| i.id == t).map(|i| i.result.clone()).unwrap();
+        assert_eq!(id("Microsoft.BingNews"), Some(Ok("removed".into())));
+        assert_eq!(id("Clipchamp.Clipchamp"), Some(Ok("already gone".into())));
+        assert_eq!(id("Microsoft.WindowsCamera"), None, "still being removed");
+        assert_eq!(w.stage, Stage::Running);
+        // finished: every item has a result, the failure keeps its reason, the log button is offered
+        fill_window(&mut w, &log, Some(0));
+        assert_eq!(w.stage, Stage::Done);
+        assert_eq!(w.items.len(), n);
+        assert!(w.items.iter().all(|i| i.result.is_some()));
+        let cam = w.items.iter().find(|i| i.id == "Microsoft.WindowsCamera").unwrap();
+        assert_eq!(cam.result, Some(Err("Access is denied.".into())));
+        assert_eq!(w.extras, vec!["Show technical details".to_string()]);
+        assert!(w.notes.iter().all(|n| !n.starts_with("Skipping")));
+        assert!(w.notes.contains(&"Restart the PC to finish.".to_string()));
+    }
+
+    #[test]
+    fn bloat_pick_args() {
+        let safe: Vec<bool> = TARGETS.iter().map(|t| !t.optional).collect();
+        assert!(pick_args(&safe).is_empty(), "the Safe preset as picked runs the Safe tier with nothing skipped");
+        // Safe, minus Camera, plus Teams: both tiers run, every other unticked item is skipped
+        let mut p = safe.clone();
+        let cam = TARGETS.iter().position(|t| t.name == "Microsoft.WindowsCamera").unwrap();
+        let teams = TARGETS.iter().position(|t| t.name == "MSTeams").unwrap();
+        p[cam] = false;
+        p[teams] = true;
+        let a = pick_args(&p);
+        assert_eq!(a[0], "-Optional");
+        assert_eq!(a[1], "-Skip");
+        let skip: Vec<&str> = a[2].split(',').collect();
+        assert!(skip.contains(&"Microsoft.WindowsCamera"));
+        assert!(!skip.contains(&"MSTeams"));
+        assert_eq!(skip.len(), TARGETS.len() - p.iter().filter(|x| **x).count());
+    }
 
     #[test]
     fn bloat_summary_from_log() {

@@ -17,8 +17,6 @@ const HISTORY: &str = "network-history.json";
 const QOS_NAME: &str = "PCTuner Halo Infinite";
 const THROTTLE_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile";
 const IF_KEY: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
-const PINGS: usize = 20;
-const BUFFERBLOAT_URL: &str = "https://www.waveform.com/tools/bufferbloat";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
@@ -84,15 +82,6 @@ const TWEAKS: &[Tweak] = &[
         why: "Stops ordinary network traffic waking the PC from sleep." },
     Tweak { id: "s5wol", name: "Shutdown Wake-on-LAN", group: G_OPT, kind: Kind::Adv("S5WakeOnLan"), target: "0", optional: true,
         why: "Keeps the network port powered while the PC is off. Off saves standby power." },
-];
-
-/// Tweaks people often recommend that this tab leaves alone, with the reason.
-const LEFT_ALONE: &[(&str, &str)] = &[
-    ("IPv6 stays on", "Xbox party chat and Teredo need it - turning it off breaks online play."),
-    ("TCP auto-tuning stays Normal", "Turning it off slows downloads and does nothing for ping."),
-    ("Offloads stay on (checksum, LSO, RSS)", "Turning them off moves work to the CPU with no measured gain for games."),
-    ("DNS is not changed", "DNS only speeds up looking up names, not the ping inside a match."),
-    ("Old registry tweaks", "TcpWindowSize, DefaultTTL, MaxUserPort and similar are ignored by Windows 10 and 11."),
 ];
 
 fn tweak(id: &str) -> Option<&'static Tweak> {
@@ -222,6 +211,7 @@ fn fmt(kind: Kind, v: Option<&str>) -> String {
         (Kind::Uro, Some("enabled")) => "On".into(),
         (Kind::Adv(_), Some("0")) => "Off".into(),
         (Kind::Adv(_), Some("1")) => "On".into(),
+        (Kind::Adv(_), None) => "Driver default".into(),
         (_, Some(x)) => format!("On ({x})"),
         (_, None) => "-".into(),
     }
@@ -256,10 +246,14 @@ fn set_stmt(kind: Kind, value: Option<&str>, adapter: &str, guid: &str) -> Strin
         }
     };
     match kind {
-        Kind::Adv(kw) => format!(
-            "Set-NetAdapterAdvancedProperty -Name {} -RegistryKeyword {} -RegistryValue {} -NoRestart -ErrorAction Stop",
-            q(adapter), q(kw), q(value.unwrap_or("0"))
-        ),
+        Kind::Adv(kw) => match value {
+            Some(v) => format!(
+                "Set-NetAdapterAdvancedProperty -Name {} -RegistryKeyword {} -RegistryValue {} -NoRestart -ErrorAction Stop",
+                q(adapter), q(kw), q(v)
+            ),
+            // "Remove": back to the network driver's own default
+            None => format!("Reset-NetAdapterAdvancedProperty -Name {} -RegistryKeyword {} -NoRestart -ErrorAction Stop", q(adapter), q(kw)),
+        },
         Kind::Throttle => dword(q(&format!(r"HKLM:\{THROTTLE_KEY}")), "NetworkThrottlingIndex"),
         Kind::Ack => iface_dword("TcpAckFrequency"),
         Kind::NoDelay => iface_dword("TCPNoDelay"),
@@ -296,6 +290,17 @@ struct HistEntry {
     guid: String,
     changes: Vec<Change>,
     undone: bool,
+}
+
+/// Changes for the selected rows: each selected tweak that exists on this adapter and is not applied
+/// yet gets its value. Selected rows that are already applied need nothing.
+fn selected_changes(state: &State, selected: &[bool]) -> Vec<Change> {
+    TWEAKS
+        .iter()
+        .zip(selected)
+        .filter(|(t, sel)| **sel && state.applicable(t.kind) && !state.is_set(t))
+        .map(|(t, _)| Change { id: t.id.into(), prev: state.value(t.kind), new: Some(t.target.into()) })
+        .collect()
 }
 
 /// One script for a batch of changes: one RESULT line per change, then one adapter restart if any
@@ -336,121 +341,6 @@ fn parse_result(line: &str) -> Option<(String, Result<String, String>)> {
     let status = p.next()?;
     let msg = p.next().unwrap_or("").trim().to_string();
     Some((id, if status == "ok" { Ok(msg) } else { Err(if msg.is_empty() { "Failed.".into() } else { msg }) }))
-}
-
-// ------------------------------------------------------------------ latency test
-
-/// Latency test script: echoes through System.Net.NetworkInformation.Ping, one per second, and prints
-/// language-neutral lines ("PING|ok|<ms>", "PING|lost|<IPStatus>", "PING|nohost|") instead of the
-/// localized text of ping.exe (works the same on any Windows language, for IPv4 and IPv6).
-fn ping_script(target: &str) -> String {
-    format!(
-        r#"$t = {t}
-$addr = $null
-try {{ $addr = @([System.Net.Dns]::GetHostAddresses($t))[0] }} catch {{ }}
-if (-not $addr) {{ Write-Output 'PING|nohost|'; exit }}
-$p = New-Object System.Net.NetworkInformation.Ping
-for ($i = 0; $i -lt {n}; $i++) {{
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  try {{
-    $r = $p.Send($addr, 1000)
-    if ($r.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {{ Write-Output ('PING|ok|' + $r.RoundtripTime) }}
-    else {{ Write-Output ('PING|lost|' + $r.Status) }}
-  }} catch {{ Write-Output ('PING|lost|' + ($_.Exception.Message -replace '\s+', ' ')) }}
-  if ($i -lt {n} - 1) {{ $left = 1000 - $sw.ElapsedMilliseconds; if ($left -gt 0) {{ Start-Sleep -Milliseconds $left }} }}
-}}
-"#,
-        t = common::psq(target),
-        n = PINGS
-    )
-}
-
-#[derive(Debug, PartialEq)]
-enum PingLine {
-    /// Round trip in ms (a sub-millisecond reply, reported as 0, counts as 0.5 like ping.exe's "<1ms").
-    Reply(f32),
-    Lost,
-    NoHost,
-}
-
-/// One line of `ping_script` output; None for anything else (stderr noise, blank lines).
-fn parse_ping_line(line: &str) -> Option<PingLine> {
-    let rest = line.trim().strip_prefix("PING|")?;
-    let mut p = rest.splitn(2, '|');
-    match p.next()? {
-        "ok" => {
-            let v: f32 = p.next()?.trim().parse().ok()?;
-            Some(PingLine::Reply(if v <= 0.0 { 0.5 } else { v }))
-        }
-        "lost" => Some(PingLine::Lost),
-        "nohost" => Some(PingLine::NoHost),
-        _ => None,
-    }
-}
-
-/// (average ms, jitter ms = mean change between consecutive replies, loss %).
-fn ping_stats(samples: &[f32], lost: usize) -> (f32, f32, f32) {
-    let n = samples.len();
-    let avg = if n == 0 { 0.0 } else { samples.iter().sum::<f32>() / n as f32 };
-    let jitter = if n < 2 { 0.0 } else { samples.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / (n - 1) as f32 };
-    let total = n + lost;
-    let loss = if total == 0 { 0.0 } else { lost as f32 * 100.0 / total as f32 };
-    (avg, jitter, loss)
-}
-
-/// Plain-language verdict for an internet latency result.
-fn grade(jitter: f32, loss: f32) -> (&'static str, egui::Color32) {
-    if loss >= 2.0 || jitter >= 15.0 {
-        ("Unstable - expect rubber-banding. Check the cable, the router, and others' downloads.", theme::LOCKED)
-    } else if loss > 0.0 || jitter >= 5.0 {
-        ("Good - small wobbles. Fine for online play.", theme::GAMING)
-    } else {
-        ("Excellent - steady connection, no packet loss.", theme::OK)
-    }
-}
-
-#[derive(Default)]
-struct Ping {
-    target: String,
-    stream: Option<Stream>,
-    seen: usize,
-    samples: Vec<f32>,
-    lost: usize,
-    error: Option<String>,
-}
-
-impl Ping {
-    fn start(&mut self, target: &str) {
-        *self = Ping { target: target.to_string(), ..Default::default() };
-        // Read-only measurement: it must not count as a running change, so closing PC Tuner
-        // during a latency test does not wait for it.
-        self.stream = Some(common::ps_stream_readonly(&ping_script(target)));
-    }
-
-    fn running(&self) -> bool {
-        self.stream.is_some()
-    }
-
-    fn pump(&mut self) {
-        let Some(s) = &mut self.stream else { return };
-        let running = s.pump();
-        let new: Vec<String> = s.lines[self.seen..].to_vec();
-        self.seen = s.lines.len();
-        for l in &new {
-            match parse_ping_line(l) {
-                Some(PingLine::Reply(ms)) => self.samples.push(ms),
-                Some(PingLine::Lost) => self.lost += 1,
-                Some(PingLine::NoHost) => self.error = Some(format!("{} could not be found.", self.target)),
-                None => {}
-            }
-        }
-        if !running {
-            self.stream = None;
-            if self.samples.is_empty() && self.lost == 0 && self.error.is_none() {
-                self.error = Some("The latency test did not return any results.".into());
-            }
-        }
-    }
 }
 
 // ------------------------------------------------------------------ tab
@@ -507,9 +397,6 @@ pub struct NetworkTab {
     pending: Option<(Vec<Change>, Option<usize>)>,
     run: Option<Run>,
     demo: bool,
-    net_target: String,
-    ping_net: Ping,
-    ping_gw: Ping,
 }
 
 impl NetworkTab {
@@ -517,21 +404,15 @@ impl NetworkTab {
         let mut tab = NetworkTab {
             state: None,
             loading: Some(Job::spawn(read_state)),
-            selected: TWEAKS.iter().map(|t| !t.optional).collect(),
+            // nothing is pre-selected: the user clicks the settings they want
+            selected: vec![false; TWEAKS.len()],
             history: common::load_json(HISTORY),
             op: None,
             pending: None,
             run: None,
             demo: false,
-            net_target: "1.1.1.1".into(),
-            ping_net: Ping::default(),
-            ping_gw: Ping::default(),
         };
-        let demo_env = std::env::var("PCTUNER_DEMO").unwrap_or_default();
-        if demo_env.eq_ignore_ascii_case("network:ping") {
-            // screenshot of the latency test: a real (harmless) ping run
-            tab.ping_net.start("1.1.1.1");
-        } else if let Some(stage) = opwin::demo_stage("network") {
+        if let Some(stage) = opwin::demo_stage("network") {
             // sample window for screenshots - nothing is changed
             let ids = ["eee", "im", "throttle", "dscp"];
             let prev = |id: &str| match id {
@@ -590,9 +471,6 @@ impl NetworkTab {
         if adapter_change {
             w.warning = Some(format!("\"{adapter}\" restarts at the end: your connection drops for about 5 seconds. Don't do this during a match."));
         }
-        if !undo {
-            w.notes.push("Run the latency test again to compare.".into());
-        }
         w
     }
 
@@ -608,24 +486,16 @@ impl NetworkTab {
         }
     }
 
+    /// "Apply selected": the selected settings that are not applied yet get their tweak value.
+    /// Recorded, so "Undo last change" reverts them.
     fn open_apply(&mut self) {
         let Some(state) = &self.state else { return };
-        let changes: Vec<Change> = TWEAKS
-            .iter()
-            .zip(&self.selected)
-            .filter(|(t, sel)| **sel && state.applicable(t.kind) && !state.is_set(t))
-            .map(|(t, _)| Change { id: t.id.into(), prev: state.value(t.kind), new: Some(t.target.into()) })
-            .collect();
+        let changes = selected_changes(state, &self.selected);
         if changes.is_empty() {
-            let mut w = OpWindow::new("NETWORK", "change", "changed", vec![]);
-            w.empty_title = "Already set".into();
-            w.empty_text = "Every ticked setting already has the recommended value.".into();
-            self.op = Some(w);
-            self.pending = None;
-        } else {
-            self.op = Some(Self::op_window(&changes, false, state.adapter()));
-            self.pending = Some((changes, None));
+            return;
         }
+        self.op = Some(Self::op_window(&changes, false, state.adapter()));
+        self.pending = Some((changes, None));
     }
 
     /// Changes that put back the last change that has not been undone.
@@ -664,8 +534,6 @@ impl NetworkTab {
                 self.loading = None;
             }
         }
-        self.ping_net.pump();
-        self.ping_gw.pump();
 
         let Some(run) = &mut self.run else { return };
         let running = run.stream.pump();
@@ -728,6 +596,7 @@ impl NetworkTab {
             op.can_undo = can_undo;
             op.done();
         }
+        self.selected = vec![false; TWEAKS.len()];
         self.refresh();
     }
 
@@ -748,60 +617,6 @@ impl NetworkTab {
             _ => {}
         }
     }
-
-    fn start_pings(&mut self) {
-        let t = self.net_target.trim().to_string();
-        let valid = !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || ".-:".contains(c));
-        if valid {
-            self.ping_net.start(&t);
-        } else {
-            self.ping_net = Ping { target: t, error: Some("Enter an IP address or host name.".into()), ..Default::default() };
-        }
-        let gw = self.state.as_ref().and_then(|s| s.info.as_ref()).map(|i| i.gateway.clone()).unwrap_or_default();
-        if !gw.is_empty() {
-            self.ping_gw.start(&gw);
-        }
-    }
-}
-
-/// One column of the latency card.
-fn ping_column(ui: &mut egui::Ui, title: &str, p: &Ping, id: &str, width: f32) {
-    ui.vertical(|ui| {
-        ui.set_width(width);
-        theme::section(ui, title);
-        if let Some(e) = &p.error {
-            ui.colored_label(theme::LOCKED, e);
-            return;
-        }
-        let (avg, jitter, loss) = ping_stats(&p.samples, p.lost);
-        let n = p.samples.len() + p.lost;
-        ui.horizontal(|ui| {
-            if p.samples.is_empty() && !p.running() && p.lost > 0 {
-                ui.label(RichText::new("No replies").size(24.0).strong().color(theme::LOCKED));
-            } else if p.samples.is_empty() {
-                ui.label(RichText::new(if p.running() { "..." } else { "-" }).size(34.0).strong().color(theme::TEXT_FAINT));
-            } else {
-                let v = theme::count_up(ui.ctx(), ("ping", id), avg);
-                let text = if avg < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") };
-                ui.label(RichText::new(text).size(34.0).strong().color(theme::ACCENT));
-                ui.vertical(|ui| {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("ms").size(16.0).strong());
-                });
-            }
-            ui.add_space(14.0);
-            if p.samples.len() >= 2 {
-                theme::stat(ui, &format!("{jitter:.1} ms"), "jitter", theme::TEXT);
-                ui.add_space(10.0);
-            }
-            if n > 0 {
-                theme::stat(ui, &format!("{loss:.0} %"), "packet loss", if loss > 0.0 { theme::LOCKED } else { theme::TEXT });
-            }
-        });
-        theme::sparkline(ui, &p.samples, egui::vec2(width - 10.0, 34.0), theme::ACCENT);
-        let status = if p.running() { format!("{n} of {PINGS} pings to {}", p.target) } else if n > 0 { format!("{n} pings to {}", p.target) } else { p.target.clone() };
-        ui.label(RichText::new(status).size(12.0).color(theme::TEXT_FAINT));
-    });
 }
 
 impl Tab for NetworkTab {
@@ -812,135 +627,35 @@ impl Tab for NetworkTab {
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.pump();
         self.window(ui.ctx());
-        if self.ping_net.running() || self.ping_gw.running() || self.loading.is_some() || self.run.is_some() {
+        if self.loading.is_some() || self.run.is_some() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| theme::page_header(ui, "Network", "Adapter and Windows settings that matter for online play, and a live latency test. Every change can be undone."));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                if ui.add_enabled(self.loading.is_none(), egui::Button::new("Refresh")).clicked() {
-                    self.refresh();
-                }
-            });
+        // shown inside the Optimization tab, which draws the page header and admin banner
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            if ui.add_enabled(self.loading.is_none(), egui::Button::new("Refresh")).clicked() {
+                self.refresh();
+            }
         });
-        common::admin_banner(ui);
         egui::ScrollArea::vertical().id_salt("network-page").auto_shrink([false, false]).show(ui, |ui| self.page(ui));
     }
 }
 
 impl NetworkTab {
     fn page(&mut self, ui: &mut egui::Ui) {
-        // ---- hero: how many recommended settings are in place
-        theme::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            match &self.state {
-                None => {
-                    ui.label(RichText::new("Reading your network adapter...").size(18.0).strong());
-                    ui.add_space(6.0);
-                    theme::sweep(ui, ui.available_width());
-                }
-                Some(s) if s.info.is_none() => {
-                    ui.colored_label(theme::LOCKED, s.error.clone().unwrap_or_default());
-                }
-                Some(s) => {
-                    let rec: Vec<&Tweak> = TWEAKS.iter().filter(|t| !t.optional && s.applicable(t.kind)).collect();
-                    let set = rec.iter().filter(|t| s.is_set(t)).count();
-                    let info = s.info.as_ref().unwrap();
-                    ui.horizontal(|ui| {
-                        let v = theme::count_up(ui.ctx(), "net-set", set as f32).round() as usize;
-                        theme::hero(
-                            ui,
-                            &format!("{v} of {}", rec.len()),
-                            "recommended settings in place",
-                            &info.desc,
-                            if set == rec.len() { theme::ACCENT } else { theme::JUNK },
-                        );
-                        ui.add_space(28.0);
-                        let wired = info.media.contains("802.3");
-                        theme::stat(ui, if wired { "Wired" } else { "Wi-Fi" }, "connection", if wired { theme::TEXT } else { theme::GAMING });
-                        ui.add_space(22.0);
-                        theme::stat(ui, &info.speed, "link speed", theme::TEXT);
-                        ui.add_space(22.0);
-                        let opt_on = TWEAKS.iter().filter(|t| t.optional && s.applicable(t.kind) && s.is_set(t)).count();
-                        theme::stat(ui, &opt_on.to_string(), "optional in place", theme::TEXT);
-                    });
-                    if !info.media.contains("802.3") {
-                        ui.add_space(4.0);
-                        theme::banner(ui, theme::GAMING, "You are on Wi-Fi. A cable beats every setting on this page for steady ping.");
-                    }
-                }
-            }
-        });
-        ui.add_space(6.0);
-
-        // ---- latency test
-        theme::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                theme::section(ui, "Latency test");
-                ui.label(RichText::new("20 pings, one per second - changes nothing").size(12.0).color(theme::TEXT_FAINT));
-            });
-            ui.add_space(4.0);
-            let busy = self.ping_net.running() || self.ping_gw.running();
-            ui.horizontal(|ui| {
-                ui.label("Internet target");
-                ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.net_target).desired_width(150.0));
-                if ui.add_enabled(!busy && self.state.is_some(), theme::primary_button(if busy { "   Testing...   " } else { "   Run latency test   " })).clicked() {
-                    self.start_pings();
-                }
-                if busy {
-                    let done = (self.ping_net.samples.len() + self.ping_net.lost) as f32 / PINGS as f32;
-                    theme::progress(ui, done, 200.0);
-                }
-            });
-            ui.add_space(8.0);
-            let w = ((ui.available_width() - 30.0) / 2.0).max(200.0);
-            ui.horizontal(|ui| {
-                ping_column(ui, "Internet", &self.ping_net, "net", w);
-                ui.add_space(20.0);
-                ping_column(ui, "Your router (local link)", &self.ping_gw, "gw", w);
-            });
-            // heavy or total loss still gets a verdict (grade() says "Unstable" from 2 % loss)
-            let n = self.ping_net.samples.len() + self.ping_net.lost;
-            if !self.ping_net.running() && self.ping_net.error.is_none() && n >= 5 {
-                let (_, jitter, loss) = ping_stats(&self.ping_net.samples, self.ping_net.lost);
-                let (text, c) = grade(jitter, loss);
-                ui.add_space(6.0);
-                ui.colored_label(c, RichText::new(text).strong());
-            }
-            let gw_n = self.ping_gw.samples.len() + self.ping_gw.lost;
-            if !self.ping_gw.running() && self.ping_gw.error.is_none() && gw_n > 0 {
-                let (avg, _, loss) = ping_stats(&self.ping_gw.samples, self.ping_gw.lost);
-                if (!self.ping_gw.samples.is_empty() && avg > 2.0) || loss > 0.0 {
-                    ui.colored_label(theme::GAMING, "The link to your router should be under 1 ms with no loss - check the cable and the router port.");
-                }
-            }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Halo's match servers do not answer ping, so this measures your connection, not a specific server. Halo shows server ping in the match lobby.")
-                    .size(12.0)
-                    .color(theme::TEXT_FAINT),
-            );
-        });
-        ui.add_space(6.0);
-
-        // ---- bufferbloat
-        theme::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::section(ui, "Biggest real-world fix: bufferbloat");
-            ui.label(
-                "If your ping jumps when someone else in the house streams, uploads or downloads, the router's queue is the cause. \
-                 Turn on SQM / Smart Queue / adaptive QoS on the router. No Windows setting can fix this.",
-            );
-            ui.add_space(4.0);
-            if ui.button("Open the bufferbloat test (waveform.com)").clicked() {
-                std::thread::spawn(|| {
-                    let _ = common::run("explorer.exe", &[BUFFERBLOAT_URL]);
+        // only while reading, or when no adapter could be read
+        match &self.state {
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Reading your network adapter...").color(theme::TEXT_DIM));
                 });
             }
-        });
-        ui.add_space(6.0);
+            Some(s) if s.info.is_none() => {
+                ui.colored_label(theme::LOCKED, s.error.clone().unwrap_or_default());
+            }
+            Some(_) => {}
+        }
 
         // ---- settings
         let Some(state) = self.state.clone() else { return };
@@ -949,7 +664,10 @@ impl NetworkTab {
         }
         theme::card(ui, |ui| {
             ui.set_width(ui.available_width());
-            theme::section(ui, "Settings");
+            ui.horizontal(|ui| {
+                theme::section(ui, "Settings");
+                ui.label(RichText::new("click the ones you want, then Apply selected").size(12.0).color(theme::TEXT_FAINT));
+            });
             let mut group = "";
             for (i, t) in TWEAKS.iter().enumerate() {
                 if t.group != group {
@@ -960,64 +678,57 @@ impl NetworkTab {
                 }
                 let applicable = state.applicable(t.kind);
                 let set = state.is_set(t);
-                ui.horizontal(|ui| {
-                    ui.add_enabled(applicable && self.run.is_none(), egui::Checkbox::without_text(&mut self.selected[i]));
-                    ui.vertical(|ui| {
-                        ui.set_width((ui.available_width() - 330.0).max(260.0));
-                        ui.label(RichText::new(t.name).strong().color(if applicable { theme::TEXT } else { theme::TEXT_FAINT }));
-                        ui.label(RichText::new(t.why).size(12.5).color(theme::TEXT_DIM));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !applicable {
-                            theme::chip(ui, "not on this adapter", theme::DIM);
-                        } else if set {
-                            theme::chip(ui, "set", theme::OK);
-                        } else if self.selected[i] {
-                            theme::chip(ui, "will change", theme::JUNK);
-                        } else {
-                            theme::chip(ui, "not set", theme::DIM);
-                        }
+                // an applied setting has nothing to apply, so it cannot be selected
+                let selectable = applicable && !set && self.run.is_none();
+                let sel = self.selected[i] && selectable;
+                let clicked = theme::select_row(ui, ("net", i), sel, selectable, |ui| {
+                    ui.horizontal(|ui| {
                         if applicable {
-                            let now = fmt(t.kind, state.value(t.kind).as_deref());
-                            let text = if set { now } else { format!("{now} -> {}", fmt(t.kind, Some(t.target))) };
-                            ui.label(RichText::new(text).color(theme::TEXT_DIM));
+                            theme::applied_badge(ui, set);
+                        } else {
+                            theme::chip(ui, "not on this adapter", theme::DIM);
                         }
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.set_width((ui.available_width() - 260.0).max(240.0));
+                            ui.label(RichText::new(t.name).strong().color(if applicable { theme::TEXT } else { theme::TEXT_FAINT }));
+                            ui.label(RichText::new(t.why).size(12.5).color(theme::TEXT_DIM));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if applicable {
+                                let now = fmt(t.kind, state.value(t.kind).as_deref());
+                                let (text, c) = if set {
+                                    (now, theme::OK)
+                                } else {
+                                    (format!("{now} -> {}", fmt(t.kind, Some(t.target))), if sel { theme::ACCENT } else { theme::TEXT_DIM })
+                                };
+                                ui.label(RichText::new(text).color(c));
+                            }
+                        });
                     });
                 });
-                ui.add_space(2.0);
+                if clicked {
+                    self.selected[i] = !self.selected[i];
+                }
+                ui.add_space(3.0);
             }
             ui.add_space(8.0);
-            let pending = TWEAKS.iter().zip(&self.selected).filter(|(t, s)| **s && state.applicable(t.kind) && !state.is_set(t)).count();
+            let pending = selected_changes(&state, &self.selected).len();
             ui.horizontal(|ui| {
                 let can = common::is_admin() && self.run.is_none() && self.loading.is_none();
-                let label = match pending {
-                    0 => "   Apply   ".to_string(),
-                    1 => "   Apply 1 change   ".to_string(),
-                    n => format!("   Apply {n} changes   "),
-                };
-                if ui.add_enabled(can, theme::primary_button(&label)).clicked() {
+                if ui
+                    .add_enabled(can && pending > 0, theme::primary_button(&format!("   Apply selected ({pending})   ")))
+                    .on_disabled_hover_text(if common::is_admin() { "Click the settings you want to apply." } else { "Run PC Tuner as administrator to change settings." })
+                    .clicked()
+                {
                     self.open_apply();
+                }
+                if pending > 0 && ui.button("Clear selection").clicked() {
+                    self.selected = vec![false; TWEAKS.len()];
                 }
                 let has_undo = self.history.iter().any(|h| !h.undone);
                 if ui.add_enabled(can && has_undo, egui::Button::new("Undo last change")).clicked() {
                     self.open_undo(false);
-                }
-                if ui.button("Tick recommended only").clicked() {
-                    self.selected = TWEAKS.iter().map(|t| !t.optional).collect();
-                }
-            });
-        });
-        ui.add_space(6.0);
-
-        // ---- left alone on purpose
-        theme::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::section(ui, "Left alone on purpose");
-            egui::Grid::new("net-left-alone").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
-                for (what, why) in LEFT_ALONE {
-                    ui.label(RichText::new(*what).strong());
-                    ui.label(RichText::new(*why).color(theme::TEXT_DIM));
-                    ui.end_row();
                 }
             });
         });
@@ -1028,31 +739,12 @@ impl NetworkTab {
 mod tests {
     use super::*;
 
-    #[test]
-    fn net_parse_ping_lines() {
-        assert_eq!(parse_ping_line("PING|ok|12"), Some(PingLine::Reply(12.0)));
-        assert_eq!(parse_ping_line("PING|ok|0"), Some(PingLine::Reply(0.5)));
-        assert_eq!(parse_ping_line("PING|lost|TimedOut"), Some(PingLine::Lost));
-        assert_eq!(parse_ping_line("PING|lost|DestinationHostUnreachable"), Some(PingLine::Lost));
-        assert_eq!(parse_ping_line("PING|lost|Eine Ausnahme ist aufgetreten."), Some(PingLine::Lost));
-        assert_eq!(parse_ping_line("PING|nohost|"), Some(PingLine::NoHost));
-        assert_eq!(parse_ping_line("PING|ok|"), None);
-        // the localized ping.exe text is no longer read at all
-        assert_eq!(parse_ping_line("Reply from ::1: time<1ms "), None);
-        assert_eq!(parse_ping_line("Réponse de 8.8.8.8 : octets=32 temps=13 ms TTL=117"), None);
-        assert_eq!(parse_ping_line("    Minimum = 0ms, Maximum = 0ms, Average = 0ms"), None);
-        // the target is quoted, IPv6 is allowed, and every echo has a 1 s timeout
-        let s = ping_script("2606:4700:4700::1111");
-        assert!(s.contains("$t = '2606:4700:4700::1111'") && s.contains("Send($addr, 1000)") && s.contains(&format!("-lt {PINGS}")));
-        assert!(ping_script("a'b").contains("'a''b'"));
-    }
-
     /// Parses (does not run) the generated scripts with the PowerShell parser.
     #[test]
     #[ignore]
     fn net_scripts_parse() {
         let all = [(String::from("eee"), Kind::Adv("*EEE"), Some("0".to_string())), ("ack".into(), Kind::Ack, None), ("nodelay".into(), Kind::NoDelay, Some("1".into())), ("throttle".into(), Kind::Throttle, None), ("dscp".into(), Kind::Qos, None), ("dscp".into(), Kind::Qos, Some("on".into())), ("uro".into(), Kind::Uro, Some("enabled".into()))];
-        for script in [ping_script("1.1.1.1"), build_script(&all, "Ethernet", "{G}"), build_script(&all, "Ethernet", ""), READ_SCRIPT.to_string()] {
+        for script in [build_script(&all, "Ethernet", "{G}"), build_script(&all, "Ethernet", ""), READ_SCRIPT.to_string()] {
             let check = format!(
                 "$e = $null; $null = [System.Management.Automation.Language.Parser]::ParseInput({}, [ref]$null, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}",
                 common::psq(&script)
@@ -1078,6 +770,23 @@ mod tests {
         assert!(w.footer.is_none() && !w.notes.iter().any(|n| n.contains("restarted")));
     }
 
+    /// "Apply selected" only touches selected settings that exist on the adapter and are not applied yet.
+    #[test]
+    fn net_apply_selected_only() {
+        let adv: HashMap<String, String> = [("*EEE".to_string(), "1".to_string())].into_iter().collect();
+        let state = State {
+            info: Some(AdapterInfo { name: "Ethernet".into(), guid: "{G}".into(), adv, ..Default::default() }),
+            throttle: Some(4294967295),
+            ..Default::default()
+        };
+        let all = vec![true; TWEAKS.len()];
+        let ids: Vec<String> = selected_changes(&state, &all).into_iter().map(|c| c.id).collect();
+        assert!(ids.contains(&"eee".to_string()), "selected and not applied");
+        assert!(!ids.contains(&"throttle".to_string()), "already applied: nothing to do");
+        assert!(!ids.contains(&"adveee".to_string()), "not on this adapter");
+        assert!(selected_changes(&state, &vec![false; TWEAKS.len()]).is_empty(), "nothing selected, nothing changes");
+    }
+
     #[test]
     fn net_history_without_guid_loads() {
         let h: Vec<HistEntry> = serde_json::from_str(r#"[{"time":"t","adapter":"Ethernet","changes":[],"undone":false}]"#).unwrap();
@@ -1095,17 +804,6 @@ mod tests {
         assert_eq!(run_target(&state, &history, Some(0)), ("Ethernet".into(), "{ETH}".into()));
         // old entry without a GUID: resolved from "Ethernet" in the script, not the Wi-Fi GUID
         assert_eq!(run_target(&state, &history, Some(1)), ("Ethernet".into(), String::new()));
-    }
-
-    #[test]
-    fn net_ping_stats() {
-        let (avg, jitter, loss) = ping_stats(&[10.0, 12.0, 10.0], 0);
-        assert!((avg - 10.6667).abs() < 0.01);
-        assert!((jitter - 2.0).abs() < 0.001);
-        assert_eq!(loss, 0.0);
-        let (_, _, loss) = ping_stats(&[10.0; 19], 1);
-        assert!((loss - 5.0).abs() < 0.001);
-        assert_eq!(ping_stats(&[], 0), (0.0, 0.0, 0.0));
     }
 
     #[test]

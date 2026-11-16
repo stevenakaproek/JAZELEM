@@ -30,10 +30,16 @@
 param(
     [switch]$RemoveOneDrive,
     [switch]$Undo,
-    [ValidateSet('Tasks', 'Edge', 'Teredo', 'OneDrive')]
+    # one or more of Tasks, Edge, Teredo, OneDrive; "Tasks,Edge" also works (PC Tuner passes it that way,
+    # since powershell -File cannot pass an array)
     [string[]]$Only,
     [string]$StatePath = (Join-Path $env:LOCALAPPDATA 'PCTuner\tweaks-state.json')
 )
+
+$Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+foreach ($o in $Only) {
+    if ($o -notin 'Tasks', 'Edge', 'Teredo', 'OneDrive') { throw "Unknown -Only value '$o' (use Tasks, Edge, Teredo or OneDrive)." }
+}
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators')) {
     throw 'Run this script from an elevated (Administrator) PowerShell.'

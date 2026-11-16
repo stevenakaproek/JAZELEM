@@ -1483,7 +1483,34 @@ fn entry_item(e: &Entry) -> OpItem {
 
 /// Invoke-CleanJunk: everything marked junk (and optional, when asked) that is still switched on.
 fn clean_op(entries: &[Entry], include_optional: bool) -> OpShow {
-    let mut junk: Vec<&Entry> = entries.iter().filter(|e| e.enabled && (e.category == "Junk" || (include_optional && e.category == "Optional"))).collect();
+    let junk: Vec<&Entry> = entries.iter().filter(|e| in_preset(e, include_optional)).collect();
+    clean_items_op(junk, include_optional)
+}
+
+/// Is this item part of the "Clean junk" (+ optional) preset: switched on and marked junk / optional.
+fn in_preset(e: &Entry, include_optional: bool) -> bool {
+    e.enabled && (e.category == "Junk" || (include_optional && e.category == "Optional"))
+}
+
+/// Cleanup of the items the user picked by hand. Items marked KEEP / Windows get a warning first.
+fn clean_sel_op(sel: &[Entry]) -> OpShow {
+    let items: Vec<&Entry> = sel.iter().filter(|e| e.enabled).collect();
+    let keep: Vec<&str> = items.iter().filter(|e| e.category == "Keep" || e.category == "Windows").map(|e| e.name.as_str()).collect();
+    let mut op = clean_items_op(items, false);
+    op.win.kicker = "Clean selected".into();
+    op.win.reassure = "One click undoes the whole cleanup.".into();
+    if !keep.is_empty() {
+        const MAX: usize = 10;
+        let mut names = keep.iter().take(MAX).copied().collect::<Vec<_>>().join("\n");
+        if keep.len() > MAX {
+            names.push_str(&format!("\n... and {} more", keep.len() - MAX));
+        }
+        op.win.warning = Some(format!("These are marked KEEP (gaming / hardware / security / Windows):\n\n{names}\n\nSwitch them off anyway?"));
+    }
+    op
+}
+
+fn clean_items_op(mut junk: Vec<&Entry>, include_optional: bool) -> OpShow {
     junk.sort_by_cached_key(|e| (group_rank(e.kind), e.category, e.name.to_lowercase()));
     let spotlight = junk.iter().any(|e| e.name.starts_with("Windows Spotlight"));
     let title = if include_optional { "Clean junk + optional" } else { "Clean junk" };
@@ -1494,7 +1521,7 @@ fn clean_op(entries: &[Entry], include_optional: bool) -> OpShow {
     win.running_text = "Cleaning...".into();
     win.undo_label = "Undo this cleanup".into();
     win.empty_title = "Already clean".into();
-    win.empty_text = "Everything on this list is already switched off.".into();
+    win.empty_text = "Everything selected is already switched off.".into();
     OpShow { win, what: What::Clean { spotlight }, batch: None }
 }
 
@@ -1849,6 +1876,10 @@ impl StartupTab {
             }
             if let What::Clean { spotlight } = op.what {
                 clean_done(&mut op.win, junk_left, spotlight);
+                if new_batch.is_some() {
+                    // the selection has been cleaned
+                    self.selected.clear();
+                }
             }
         }
     }
@@ -2214,27 +2245,8 @@ impl Tab for StartupTab {
         let junk = self.entries.iter().filter(|e| e.enabled && e.category == "Junk").count();
         let optional = self.entries.iter().filter(|e| e.enabled && e.category == "Optional").count();
         let pending = self.history.iter().filter(|h| !h.undone).count();
-        let mut clean: Option<bool> = None;
         theme::card(ui, |ui| {
             ui.set_width(ui.available_width());
-            let wide = ui.available_width() >= 900.0;
-            let mut buttons = |ui: &mut egui::Ui, rtl: bool| {
-                let enabled = ready && !busy;
-                // right-to-left layouts place the first widget rightmost: keep the primary button on the left
-                for include_optional in if rtl { [true, false] } else { [false, true] } {
-                    let (b, tip) = if include_optional {
-                        (
-                            egui::Button::new("Clean junk + optional").min_size(egui::vec2(0.0, 32.0)),
-                            "Junk plus optional items - each optional one costs a small convenience; see the Advice column.",
-                        )
-                    } else {
-                        (theme::primary_button("   Clean junk   "), "Switches off everything marked junk. Shows a preview first. Never touches gaming items.")
-                    };
-                    if ui.add_enabled(enabled, b).on_hover_text(tip).clicked() {
-                        clean = Some(include_optional);
-                    }
-                }
-            };
             ui.horizontal(|ui| {
                 if ready {
                     let n = theme::count_up(&ctx, "startup-junk", junk as f32).round() as usize;
@@ -2251,17 +2263,8 @@ impl Tab for StartupTab {
                 theme::stat(ui, &val(optional), "optional still on", if optional == 0 || !ready { theme::TEXT } else { theme::OPTIONAL });
                 ui.add_space(16.0);
                 theme::stat(ui, &pending.to_string(), "changes can be undone", theme::TEXT);
-                if wide {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| buttons(ui, true));
-                }
             });
-            if !wide {
-                ui.horizontal(|ui| buttons(ui, false));
-            }
         });
-        if let Some(include_optional) = clean {
-            self.op = Some(clean_op(&self.entries, include_optional));
-        }
         for w in self.history_warning.iter().chain(&self.warnings) {
             theme::banner(ui, theme::LOCKED, w);
         }
@@ -2294,9 +2297,15 @@ impl Tab for StartupTab {
             });
             ui.horizontal_wrapped(|ui| {
                 let has_sel = !sel.is_empty() && !busy;
-                if ui.add_enabled(has_sel, egui::Button::new("Switch off")).on_hover_text("Switch off the selected items (nothing is deleted). Shows a preview first.").clicked() {
-                    self.switch(sel.clone(), false);
+                let n = sel.iter().filter(|e| e.enabled).count();
+                if ui
+                    .add_enabled(has_sel && n > 0, theme::primary_button(&format!("Clean selected ({n})")))
+                    .on_hover_text("Click rows in the list to select them, then switch them off here (nothing is deleted). Shows a preview first; one click undoes it.")
+                    .clicked()
+                {
+                    self.op = Some(clean_sel_op(&sel));
                 }
+                ui.separator();
                 if ui.add_enabled(has_sel, egui::Button::new("Switch on")).on_hover_text("Switch the selected items back on. Shows a preview first.").clicked() {
                     self.switch(sel.clone(), true);
                 }
@@ -2384,6 +2393,27 @@ impl Tab for StartupTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_clean_selection() {
+        let mut junk = new_entry(Kind::Run, "Junky", r"HKCU\Run", "junk.exe", true, Loc::default(), "");
+        junk.category = "Junk";
+        junk.id = "a".into();
+        let mut keep = new_entry(Kind::Run, "GPU tool", r"HKCU\Run", "gpu.exe", true, Loc::default(), "");
+        keep.category = "Keep";
+        keep.id = "b".into();
+        let mut off = junk.clone();
+        off.enabled = false;
+        off.id = "c".into();
+        assert!(in_preset(&junk, false) && !in_preset(&keep, true) && !in_preset(&off, false));
+        // junk only: no warning; a KEEP item warns; switched-off items are left out
+        let op = clean_sel_op(&[junk.clone(), off.clone()]);
+        assert_eq!(op.win.items.len(), 1);
+        assert!(op.win.warning.is_none());
+        let op = clean_sel_op(&[junk, keep]);
+        assert_eq!(op.win.items.len(), 2);
+        assert!(op.win.warning.as_deref().unwrap_or("").contains("GPU tool"));
+    }
 
     #[test]
     fn startup_cleanup_reveal_and_groups() {

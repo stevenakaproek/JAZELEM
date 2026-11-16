@@ -1,328 +1,537 @@
-//! CPU Scheduler tab - Win32PrioritySeparation presets (port of TweakScheduler.ps1).
+//! CPU Scheduler tab - the Multimedia Class Scheduler (MMCSS) settings, edited directly:
+//! HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile and its Tasks.
+//! Shows what is set now, what differs from the Windows default, and what each save changed.
 
-use crate::common::{self, Job, Tab};
-use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::common::{self, Tab};
 use crate::theme;
 use eframe::egui::{self, RichText};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use winreg::enums::*;
 use winreg::RegKey;
 
-const KEY: &str = r"SYSTEM\CurrentControlSet\Control\PriorityControl";
-const VALUE: &str = "Win32PrioritySeparation";
-const HISTORY: &str = "scheduler-history.json";
-const RESTART_NOTE: &str = "Restart the PC to be certain it is in effect.";
+const SYS: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile";
+const SYS_REG: &str = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile";
+const HISTORY: &str = "mmcss-history.json";
+const DISABLED: u32 = 0xFFFF_FFFF;
 
-struct Preset {
-    name: &'static str,
-    tag: &'static str,
-    value: u32,
-    text: &'static str,
+/// Pseudo task names for the two settings outside the multimedia profile.
+const PRIO: &str = "#prio"; // HKLM ...\PriorityControl  Win32PrioritySeparation
+const FG: &str = "#fg"; // HKCU Control Panel\Desktop  ForegroundLockTimeout
+const PRIO_KEY: &str = r"SYSTEM\CurrentControlSet\Control\PriorityControl";
+const FG_KEY: &str = r"Control Panel\Desktop";
+const PRIO_NAME: &str = "Win32PrioritySeparation";
+const FG_NAME: &str = "ForegroundLockTimeout";
+
+/// The Windows tasks, in the order Windows lists them.
+const TASKS: &[&str] = &["Audio", "Capture", "DisplayPostProcessing", "Distribution", "Games", "Playback", "Pro Audio", "Window Manager"];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegVal {
+    D(u32),
+    S(String),
 }
 
-const PRESETS: &[Preset] = &[
-    Preset { name: "Windows default", tag: "recommended for Halo Infinite", value: 0x02,
-        text: "What Windows ships with: the game in focus already gets turns 3x longer than background apps plus the maximum wake-up boost. No controlled benchmark shows any other value beating it." },
-    Preset { name: "Game", tag: "community favourite", value: 0x2A,
-        text: "The value most gaming guides call the \"game\" setting. The game gets exactly what the default gives it; background apps get equally long turns. No measured benefit - an A/B test only." },
-    Preset { name: "Long turns", tag: "alternate to test", value: 0x16,
-        text: "Keeps the 3:1 advantage and the wake-up boost but doubles every turn. Sound in theory, unmeasured in practice." },
+#[derive(Clone, Copy, PartialEq)]
+enum Ty {
+    Dword,
+    Text,
+}
+
+/// (registry value name, label, type)
+const SYS_FIELDS: &[(&str, &str, Ty)] = &[("NetworkThrottlingIndex", "Network throttling index", Ty::Dword), ("SystemResponsiveness", "System responsiveness reserved CPU", Ty::Dword)];
+const TASK_FIELDS: &[(&str, &str, Ty)] = &[
+    ("Affinity", "Affinity", Ty::Dword),
+    ("Clock Rate", "Clock rate", Ty::Dword),
+    ("GPU Priority", "GPU priority", Ty::Dword),
+    ("Priority", "Priority", Ty::Dword),
+    ("Scheduling Category", "Scheduling category", Ty::Text),
+    ("SFIO Priority", "I/O priority", Ty::Text),
+    ("Background Only", "Background only", Ty::Text),
+    ("BackgroundPriority", "Background priority", Ty::Dword),
 ];
 
-#[derive(Serialize, Deserialize, Clone)]
-struct HistEntry {
-    time: String,
-    from: u32,
-    to: u32,
-    undone: bool,
-}
+/// A setting: "" = SystemProfile itself, otherwise the task name; then the value name.
+type Key = (String, &'static str);
 
-pub struct Decoded {
-    pub interval: &'static str,
-    pub kind: &'static str,
-    pub boost: u32,
-    pub ratio: String,
-    pub fg_ms: f64,
-    pub bg_ms: f64,
-    pub signature: (bool, bool, u32),
-}
-
-/// Bits 5-4 interval (1 long, 2 short, 0/3 default=short), bits 3-2 type (1 variable, 2 fixed, 0/3 default=variable),
-/// bits 1-0 foreground boost (3 = 2). Quantum units: 3 units = one 15.625 ms tick.
-pub fn decode(value: u32) -> Decoded {
-    let v = value & 0x3F;
-    let i = (v >> 4) & 3;
-    let t = (v >> 2) & 3;
-    let mut b = v & 3;
-    if b == 3 {
-        b = 2;
+/// Windows defaults (Windows 10 / 11).
+fn default_of(task: &str, name: &str) -> Option<RegVal> {
+    let d = |v: u32| Some(RegVal::D(v));
+    let s = |v: &str| Some(RegVal::S(v.to_string()));
+    match task {
+        PRIO => return d(2),
+        FG => return d(200000),
+        _ => {}
     }
-    let long = i == 1;
-    let fixed = t == 2;
-    let table: [f64; 3] = match (fixed, long) {
-        (true, true) => [36.0, 36.0, 36.0],
-        (true, false) => [18.0, 18.0, 18.0],
-        (false, true) => [12.0, 24.0, 36.0],
-        (false, false) => [6.0, 12.0, 18.0],
+    if task.is_empty() {
+        return match name {
+            "NetworkThrottlingIndex" => d(10),
+            "SystemResponsiveness" => d(20),
+            _ => None,
+        };
+    }
+    let (prio, cat, bg_only, bg_prio) = match task {
+        "Audio" => (6, "Medium", "True", None),
+        "Capture" => (5, "Medium", "True", None),
+        "DisplayPostProcessing" => (8, "High", "True", Some(8)),
+        "Distribution" => (4, "Medium", "True", None),
+        "Games" => (2, "Medium", "False", None),
+        "Playback" => (3, "Medium", "False", Some(4)),
+        "Pro Audio" => (1, "High", "False", None),
+        "Window Manager" => (5, "Medium", "True", None),
+        _ => return None,
     };
-    let ms = |u: f64| (u / 3.0 * 15.625 * 10.0).round() / 10.0;
-    Decoded {
-        interval: match i { 1 => "Long", 2 => "Short", _ => "Short (Windows default)" },
-        kind: match t { 2 => "Fixed", 1 => "Variable", _ => "Variable (Windows default)" },
-        boost: b,
-        ratio: if fixed { "1:1 (equal turns)".into() } else { format!("{}:1", b + 1) },
-        fg_ms: ms(table[b as usize]),
-        bg_ms: ms(table[0]),
-        signature: (long, fixed, b),
+    match name {
+        "Affinity" => d(0),
+        "Clock Rate" => d(10000),
+        "GPU Priority" => d(8),
+        "Priority" => d(prio),
+        "Scheduling Category" => s(cat),
+        "SFIO Priority" => s("Normal"),
+        "Background Only" => s(bg_only),
+        "BackgroundPriority" => bg_prio.map(RegVal::D),
+        _ => None,
     }
 }
 
-fn read_value() -> u32 {
-    RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey(KEY)
-        .and_then(|k| k.get_value::<u32, _>(VALUE))
-        .unwrap_or(2)
-}
-
-fn write_value(v: u32) -> Result<(), String> {
-    let k = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(KEY, KEY_SET_VALUE)
-        .map_err(|e| format!("cannot open the registry key (run as administrator): {e}"))?;
-    k.set_value(VALUE, &v).map_err(|e| e.to_string())
-}
-
-/// Preset whose schedule matches `value` (same interval, type and boost).
-fn preset_of(value: u32) -> Option<&'static Preset> {
-    let sig = decode(value).signature;
-    PRESETS.iter().find(|p| decode(p.value).signature == sig)
-}
-
-/// Index of the preset whose schedule matches `value` (0x26 selects the same card as 0x02).
-fn preset_index(value: u32) -> Option<usize> {
-    let sig = decode(value).signature;
-    PRESETS.iter().position(|p| decode(p.value).signature == sig)
-}
-
-/// History bookkeeping once a write is back: a successful change adds an entry, a successful
-/// undo marks its entry undone, and a failed write leaves the history as it was (so a failed
-/// undo can be retried). Returns true when the history changed and must be saved.
-fn apply_result(history: &mut Vec<HistEntry>, from: u32, to: u32, undo_of: Option<usize>, ok: bool, time: String) -> bool {
-    if !ok {
-        return false;
+/// How a value is shown.
+fn show(name: &str, v: &Option<RegVal>) -> String {
+    match (name, v) {
+        (_, None) => "(not set)".into(),
+        ("NetworkThrottlingIndex", Some(RegVal::D(DISABLED))) => "Disabled".into(),
+        ("SystemResponsiveness", Some(RegVal::D(n))) => format!("{n}%"),
+        ("Affinity", Some(RegVal::D(0))) => "all".into(),
+        ("Affinity", Some(RegVal::D(m))) => format!("0x{m:X}"),
+        (PRIO_NAME, Some(RegVal::D(m))) => format!("0x{m:X}"),
+        (FG_NAME, Some(RegVal::D(n))) => format!("{n} ms"),
+        (_, Some(RegVal::D(n))) => n.to_string(),
+        (_, Some(RegVal::S(s))) => s.clone(),
     }
-    match undo_of {
-        None => {
-            history.push(HistEntry { time, from, to, undone: false });
-            true
+}
+
+/// The values a drop-down offers (the current value is always added when it is not in the list).
+fn choices(name: &str) -> Vec<Option<RegVal>> {
+    let d = |r: std::ops::RangeInclusive<u32>| r.map(|n| Some(RegVal::D(n))).collect::<Vec<_>>();
+    let s = |l: &[&str]| l.iter().map(|x| Some(RegVal::S(x.to_string()))).collect::<Vec<_>>();
+    match name {
+        "NetworkThrottlingIndex" => std::iter::once(Some(RegVal::D(DISABLED))).chain([1, 5, 10, 20, 30, 40, 50, 60, 70].into_iter().map(|n| Some(RegVal::D(n)))).collect(),
+        "SystemResponsiveness" => (0..=10).map(|n| Some(RegVal::D(n * 10))).collect(),
+        "GPU Priority" => d(0..=31),
+        "Priority" => d(1..=8),
+        "Scheduling Category" => s(&["High", "Medium", "Low"]),
+        "SFIO Priority" => s(&["High", "Normal", "Low", "Idle"]),
+        "Background Only" => s(&["True", "False"]),
+        "BackgroundPriority" => std::iter::once(None).chain(d(1..=8)).collect(),
+        _ => vec![],
+    }
+}
+
+fn path_of(task: &str) -> String {
+    match task {
+        "" => SYS.to_string(),
+        PRIO => PRIO_KEY.to_string(),
+        FG => FG_KEY.to_string(),
+        t => format!(r"{SYS}\Tasks\{t}"),
+    }
+}
+
+/// ForegroundLockTimeout is per user (HKCU); everything else is machine-wide.
+fn hive_of(task: &str) -> RegKey {
+    RegKey::predef(if task == FG { HKEY_CURRENT_USER } else { HKEY_LOCAL_MACHINE })
+}
+
+/// How a setting is named in lists ("Games › Priority", or just the value name).
+fn place(task: &str, name: &str) -> String {
+    if task.is_empty() || task.starts_with('#') { name.to_string() } else { format!("{task} › {name}") }
+}
+
+/// Win32PrioritySeparation parts: (interval 0 auto / 1 long / 2 short, length 0 auto / 1 variable / 2 fixed,
+/// foreground boost 0 = 1:1, 1 = 2:1, 2 = 3:1).
+fn prio_parts(v: u32) -> (u32, u32, u32) {
+    let fix = |x: u32| if x == 3 { 0 } else { x };
+    (fix((v >> 4) & 3), fix((v >> 2) & 3), ((v & 3).min(2)))
+}
+
+fn prio_value(interval: u32, length: u32, boost: u32) -> u32 {
+    (interval << 4) | (length << 2) | boost
+}
+
+fn read_one(k: &RegKey, name: &str, ty: Ty) -> Option<RegVal> {
+    match ty {
+        Ty::Dword => k.get_value::<u32, _>(name).ok().map(RegVal::D),
+        Ty::Text => k.get_value::<String, _>(name).ok().map(RegVal::S),
+    }
+}
+
+/// Every setting as it is in the registry now, plus the task names found.
+fn read_all() -> (BTreeMap<Key, Option<RegVal>>, Vec<String>) {
+    let hk = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let mut m = BTreeMap::new();
+    for (task, name) in [(PRIO, PRIO_NAME), (FG, FG_NAME)] {
+        let v = hive_of(task).open_subkey(path_of(task)).ok().and_then(|k| read_one(&k, name, Ty::Dword));
+        m.insert((task.to_string(), name), v);
+    }
+    if let Ok(k) = hk.open_subkey(SYS) {
+        for (n, _, ty) in SYS_FIELDS {
+            m.insert((String::new(), *n), read_one(&k, n, *ty));
         }
-        Some(i) => match history.get_mut(i) {
-            Some(h) => {
-                h.undone = true;
-                true
+    }
+    // the known tasks first, in order, then any others this PC has
+    let mut tasks: Vec<String> = TASKS.iter().map(|s| s.to_string()).collect();
+    if let Ok(t) = hk.open_subkey(format!(r"{SYS}\Tasks")) {
+        for name in t.enum_keys().flatten() {
+            if !tasks.iter().any(|x| x.eq_ignore_ascii_case(&name)) {
+                tasks.push(name);
             }
-            None => false,
+        }
+    }
+    tasks.retain(|t| hk.open_subkey(path_of(t)).is_ok());
+    for t in &tasks {
+        if let Ok(k) = hk.open_subkey(path_of(t)) {
+            for (n, _, ty) in TASK_FIELDS {
+                m.insert((t.clone(), *n), read_one(&k, n, *ty));
+            }
+        }
+    }
+    (m, tasks)
+}
+
+fn write_one(task: &str, name: &str, v: &Option<RegVal>) -> Result<(), String> {
+    let k = hive_of(task).open_subkey_with_flags(path_of(task), KEY_READ | KEY_SET_VALUE).map_err(|e| e.to_string())?;
+    match v {
+        Some(RegVal::D(n)) => k.set_value(name, n).map_err(|e| e.to_string()),
+        Some(RegVal::S(s)) => k.set_value(name, s).map_err(|e| e.to_string()),
+        None => match k.delete_value(name) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
         },
     }
 }
 
-fn label_of(value: u32) -> String {
-    preset_of(value).map(|p| p.name.to_string()).unwrap_or_else(|| format!("Custom value 0x{value:02X}"))
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Change {
+    task: String,
+    name: String,
+    old: Option<RegVal>,
+    new: Option<RegVal>,
 }
 
-/// The one-row operation window for a change `from` -> `to`.
-fn op_window(from: u32, to: u32, undo: bool) -> OpWindow {
-    let item = OpItem::new("sep", label_of(to), "Registry").detail(format!("0x{from:02X} -> 0x{to:02X}"));
-    let (verb, done_word) = if undo { ("undo", "undone") } else { ("change", "changed") };
-    let mut w = OpWindow::new("CPU SCHEDULER", verb, done_word, vec![item]).noun("scheduler setting", "scheduler settings");
-    w.preview_text = "Win32PrioritySeparation: how Windows shares CPU time between the game and background apps.".into();
-    w.running_text = "Writing the registry value...".into();
-    w.go_label = if undo { "Undo".into() } else { "Apply".into() };
-    if undo {
-        w.reassure = "Puts back the value that was set before your last change.".into();
+impl Change {
+    fn line(&self) -> String {
+        format!("{}: {} → {}", place(&self.task, &self.name), show(&self.name, &self.old), show(&self.name, &self.new))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Save {
+    time: String,
+    changes: Vec<Change>,
+    undone: bool,
+}
+
+/// Status next to a value: pending change, changed from the Windows default, or default.
+fn status(name: &str, cur: &Option<RegVal>, v: &Option<RegVal>, def: &Option<RegVal>) -> (String, egui::Color32) {
+    if v != cur {
+        (format!("will change (now {})", show(name, cur)), theme::ACCENT)
+    } else if def.is_some() && cur != def {
+        (format!("changed - default {}", show(name, def)), theme::OK)
+    } else if def.is_some() {
+        ("default".to_string(), theme::TEXT_FAINT)
     } else {
-        w.reassure = "\"Undo last change\" puts the previous value back.".into();
-        if preset_of(to).map(|p| p.value != PRESETS[0].value).unwrap_or(true) {
-            w.warning = Some("No controlled benchmark shows this beating the Windows default. Treat it as an A/B test.".into());
+        (String::new(), theme::TEXT_FAINT)
+    }
+}
+
+/// Edits that differ from what is in the registry now.
+fn diff(cur: &BTreeMap<Key, Option<RegVal>>, edit: &BTreeMap<Key, Option<RegVal>>) -> Vec<Change> {
+    edit.iter()
+        .filter(|(k, v)| cur.get(*k) != Some(*v))
+        .map(|((t, n), v)| Change { task: t.clone(), name: n.to_string(), old: cur.get(&(t.clone(), *n)).cloned().flatten(), new: v.clone() })
+        .collect()
+}
+
+/// Write a batch; returns the changes that worked and the error lines of those that did not.
+fn write_all(changes: &[Change]) -> (Vec<Change>, Vec<String>) {
+    let mut ok = vec![];
+    let mut bad = vec![];
+    for c in changes {
+        match write_one(&c.task, &c.name, &c.new) {
+            Ok(()) => ok.push(c.clone()),
+            Err(e) => bad.push(format!("{} - {e}", c.line())),
         }
     }
-    w
+    (ok, bad)
 }
 
-/// A registry write in progress (shown as the Running stage).
-struct Run {
-    job: Job<Result<(), String>>,
-    result: Option<Result<(), String>>,
-    from: u32,
-    to: u32,
-    /// Some(index into history) when this run undoes that entry.
-    undo_of: Option<usize>,
-    t0: f64,
+/// The two parts of the page, each edited and saved on its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Section {
+    /// Win32PrioritySeparation + ForegroundLockTimeout
+    Processor,
+    /// The multimedia scheduler (MMCSS) profile and its tasks
+    Multimedia,
+}
+
+fn section_of(task: &str) -> Section {
+    if task == PRIO || task == FG { Section::Processor } else { Section::Multimedia }
 }
 
 pub struct SchedulerTab {
-    current: u32,
-    selected: Option<usize>,
-    history: Vec<HistEntry>,
-    op: Option<OpWindow>,
-    /// (from, to, history index when it is an undo) of the window that is open in the preview stage.
-    pending: Option<(u32, u32, Option<usize>)>,
-    run: Option<Run>,
-    demo: bool,
+    cur: BTreeMap<Key, Option<RegVal>>,
+    edit: BTreeMap<Key, Option<RegVal>>,
+    tasks: Vec<String>,
+    task: usize,
+    history: Vec<Save>,
+    /// The part of the page shown.
+    section: Section,
+    /// What the last action did (saved changes, undo, backup) and in which section, shown under the buttons.
+    report: Vec<(String, egui::Color32)>,
+    report_for: Section,
 }
 
 impl SchedulerTab {
     pub fn new() -> Self {
-        let current = read_value();
-        let selected = preset_index(current);
-        let mut tab = SchedulerTab { current, selected, history: common::load_json(HISTORY), op: None, pending: None, run: None, demo: false };
-        if let Some(stage) = opwin::demo_stage("scheduler") {
-            // sample window for screenshots - nothing is written
-            let mut w = op_window(0x02, 0x2A, false);
-            match stage {
-                Stage::Preview => {}
-                Stage::Running => w.stage = Stage::Running,
-                Stage::Done => {
-                    w.can_undo = true;
-                    w.undo_label = "Undo".into();
-                    w.finish(|_| Some(Ok(RESTART_NOTE.to_string())));
-                }
+        let (cur, tasks) = read_all();
+        let task = tasks.iter().position(|t| t == "Games").unwrap_or(0);
+        SchedulerTab { edit: cur.clone(), cur, tasks, task, history: common::load_json(HISTORY), section: Section::Processor, report: vec![], report_for: Section::Processor }
+    }
+
+    /// Read the registry again. Unsaved edits in the other section are kept.
+    fn reload(&mut self, section: Section) {
+        let (cur, tasks) = read_all();
+        let mut edit = cur.clone();
+        for (k, v) in &self.edit {
+            if section_of(&k.0) != section && edit.contains_key(k) {
+                edit.insert(k.clone(), v.clone());
             }
-            tab.op = Some(w);
-            tab.demo = true;
         }
-        tab
+        self.cur = cur;
+        self.edit = edit;
+        self.tasks = tasks;
+        self.task = self.task.min(self.tasks.len().saturating_sub(1));
     }
 
-    fn start(&mut self, from: u32, to: u32, undo_of: Option<usize>, now: f64) {
-        self.run = Some(Run { job: Job::spawn(move || write_value(to)), result: None, from, to, undo_of, t0: now });
+    /// Edits in one section that differ from the registry.
+    fn pending(&self, section: Section) -> Vec<Change> {
+        diff(&self.cur, &self.edit).into_iter().filter(|c| section_of(&c.task) == section).collect()
     }
 
-    /// Open the undo window for the last change that has not been undone.
-    fn undo_window(&mut self) -> bool {
-        let Some(i) = self.history.iter().rposition(|h| !h.undone) else { return false };
-        let to = self.history[i].from;
-        self.pending = Some((self.current, to, Some(i)));
-        self.op = Some(op_window(self.current, to, true));
-        true
-    }
-
-    /// Poll the registry write; when it is back (and the window had a moment to show it) fill in the result.
-    fn pump(&mut self, now: f64) {
-        let Some(run) = &mut self.run else { return };
-        if run.result.is_none() {
-            run.result = run.job.poll();
+    fn backup(&self, section: Section) -> Result<String, String> {
+        let stamp = common::now().replace([':', ' '], "-");
+        let (key, file) = match section {
+            Section::Processor => (format!(r"HKLM\{PRIO_KEY}"), format!("priority-backup-{stamp}.reg")),
+            Section::Multimedia => (SYS_REG.to_string(), format!("mmcss-backup-{stamp}.reg")),
+        };
+        let p = common::data_dir().join(file).to_string_lossy().to_string();
+        match common::run("reg.exe", &["export", &key, &p, "/y"]) {
+            Ok((0, _)) => Ok(p),
+            Ok((code, out)) => Err(format!("reg export failed ({code}): {}", out.trim())),
+            Err(e) => Err(e),
         }
-        if run.result.is_none() || now - run.t0 < 0.6 {
+    }
+
+    fn save(&mut self, section: Section) {
+        let changes = self.pending(section);
+        if changes.is_empty() {
             return;
         }
-        let run = self.run.take().unwrap();
-        let result = run.result.unwrap();
-        if apply_result(&mut self.history, run.from, run.to, run.undo_of, result.is_ok(), common::now()) {
+        self.report.clear();
+        self.report_for = section;
+        // first save in this section: keep a backup of the original values
+        if !self.history.iter().any(|s| s.changes.iter().any(|c| section_of(&c.task) == section)) {
+            match self.backup(section) {
+                Ok(p) => self.report.push((format!("Backup of the original values: {p}"), theme::TEXT_DIM)),
+                Err(e) => self.report.push((format!("No backup made: {e}"), theme::GAMING)),
+            }
+        }
+        let (ok, bad) = write_all(&changes);
+        if !ok.is_empty() {
+            self.report.insert(0, (format!("Applied {} change(s):", ok.len()), theme::OK));
+            for c in &ok {
+                self.report.push((format!("  {}", c.line()), theme::TEXT));
+            }
+            self.history.push(Save { time: common::now(), changes: ok, undone: false });
             common::save_json(HISTORY, &self.history);
         }
-        // re-read after a failure too, so `current` and the next window's "from" match the registry
-        self.current = read_value();
-        self.selected = preset_index(self.current);
-        if let Some(op) = &mut self.op {
-            let failed_undo = result.is_err() && run.undo_of.is_some();
-            op.can_undo = (result.is_ok() && run.undo_of.is_none()) || failed_undo;
-            if failed_undo {
-                // the entry is still not undone, so the Undo event picks the same one again
-                op.undo_label = "Retry undo".into();
-            }
-            op.finish(|_| Some(match &result {
-                Ok(()) => Ok(RESTART_NOTE.to_string()),
-                Err(e) => Err(format!("Could not change it: {e}")),
-            }));
+        for b in bad {
+            self.report.push((format!("Not changed: {b}"), theme::LOCKED));
         }
+        self.reload(section);
     }
 
-    fn window(&mut self, ctx: &egui::Context, now: f64) {
-        let Some(op) = &mut self.op else { return };
-        let can = common::is_admin() && self.run.is_none() && !self.demo;
-        match op.show(ctx, can) {
-            Some(OpEvent::Go) => {
-                if let Some((from, to, undo_of)) = self.pending.take() {
-                    self.start(from, to, undo_of, now);
+    /// The newest save in a section that is not undone yet.
+    fn last_save(&self, section: Section) -> Option<usize> {
+        self.history.iter().rposition(|s| !s.undone && s.changes.iter().any(|c| section_of(&c.task) == section))
+    }
+
+    fn undo_last(&mut self, section: Section) {
+        let Some(i) = self.last_save(section) else { return };
+        self.report_for = section;
+        let back: Vec<Change> = self.history[i].changes.iter().rev().map(|c| Change { task: c.task.clone(), name: c.name.clone(), old: c.new.clone(), new: c.old.clone() }).collect();
+        let (ok, bad) = write_all(&back);
+        self.report.clear();
+        self.report.push((format!("Undid {} change(s) from {}:", ok.len(), self.history[i].time), theme::OK));
+        for c in &ok {
+            self.report.push((format!("  {}", c.line()), theme::TEXT));
+        }
+        for b in &bad {
+            self.report.push((format!("Not changed: {b}"), theme::LOCKED));
+        }
+        if bad.is_empty() {
+            self.history[i].undone = true;
+        }
+        common::save_json(HISTORY, &self.history);
+        self.reload(section);
+    }
+
+    /// One setting row: label | control | status.
+    fn row(&mut self, ui: &mut egui::Ui, task: &str, name: &'static str, label: &str, can: bool) {
+        let key: Key = (task.to_string(), name);
+        let cur = self.cur.get(&key).cloned().flatten();
+        let mut v = self.edit.get(&key).cloned().flatten();
+        let def = default_of(task, name);
+        ui.label(label);
+        ui.add_enabled_ui(can, |ui| match name {
+            "Clock Rate" => {
+                let mut n = match &v {
+                    Some(RegVal::D(n)) => *n,
+                    _ => 10000,
+                };
+                if ui.add(egui::DragValue::new(&mut n).range(0..=1_000_000).speed(100.0)).changed() {
+                    v = Some(RegVal::D(n));
                 }
             }
-            Some(OpEvent::Undo) => {
-                if self.undo_window() {
-                    if let (Some(op), Some((from, to, undo_of))) = (&mut self.op, self.pending.take()) {
-                        op.stage = Stage::Running;
-                        self.start(from, to, undo_of, now);
+            "Affinity" => {
+                let mask = match &v {
+                    Some(RegVal::D(m)) => *m,
+                    _ => 0,
+                };
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new(RichText::new(show(name, &v)).monospace()));
+                    ui.menu_button("select ...", |ui| {
+                        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(32);
+                        let full = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+                        let mut all = mask == 0;
+                        if ui.checkbox(&mut all, "All CPUs").changed() {
+                            v = Some(RegVal::D(if all { 0 } else { 1 }));
+                        }
+                        ui.separator();
+                        egui::Grid::new(("aff", task)).num_columns(4).show(ui, |ui| {
+                            for c in 0..n {
+                                let mut on = mask == 0 || mask & (1 << c) != 0;
+                                if ui.checkbox(&mut on, format!("CPU {c}")).changed() {
+                                    let base = if mask == 0 { full } else { mask };
+                                    let m = if on { base | (1 << c) } else { base & !(1 << c) };
+                                    // all CPUs = 0; never an empty mask
+                                    if m != 0 {
+                                        v = Some(RegVal::D(if m & full == full { 0 } else { m }));
+                                    }
+                                }
+                                if c % 4 == 3 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                    });
+                });
+            }
+            _ => {
+                let mut opts = choices(name);
+                if !opts.contains(&v) {
+                    opts.push(v.clone());
+                }
+                egui::ComboBox::from_id_salt(("mmcss", task, name)).width(130.0).selected_text(show(name, &v)).show_ui(ui, |ui| {
+                    for o in opts {
+                        let text = show(name, &o);
+                        ui.selectable_value(&mut v, o, text);
                     }
-                }
+                });
             }
-            Some(OpEvent::Close) => {
-                self.op = None;
-                self.pending = None;
+        });
+        let (text, c) = status(name, &cur, &v, &def);
+        ui.label(RichText::new(text).size(12.0).color(c));
+        ui.end_row();
+        self.edit.insert(key, v);
+    }
+
+    /// Processor scheduling (Win32PrioritySeparation) and Foreground Lock Timeout.
+    fn prio_card(&mut self, ui: &mut egui::Ui, can: bool) {
+        let pk: Key = (PRIO.to_string(), PRIO_NAME);
+        let fk: Key = (FG.to_string(), FG_NAME);
+        let cur_p = self.cur.get(&pk).cloned().flatten();
+        let mut p = match self.edit.get(&pk).cloned().flatten() {
+            Some(RegVal::D(v)) => v,
+            _ => 2,
+        };
+        let before = prio_parts(p);
+        let (mut interval, mut length, mut boost) = before;
+        theme::card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add_enabled_ui(can, |ui| {
+                theme::section(ui, "Interval length");
+                ui.radio_value(&mut interval, 0, "Let Windows choose (short on this PC)");
+                ui.radio_value(&mut interval, 2, "Short");
+                ui.radio_value(&mut interval, 1, "Long");
+                ui.add_space(6.0);
+                theme::section(ui, "Fixed / variable intervals");
+                ui.radio_value(&mut length, 0, "Let Windows choose (variable on this PC)");
+                ui.radio_value(&mut length, 2, "Fixed length");
+                ui.radio_value(&mut length, 1, "Variable length");
+                ui.indent("boost", |ui| {
+                    ui.add_enabled_ui(length != 2, |ui| {
+                        ui.radio_value(&mut boost, 0, "No foreground boost (1:1)");
+                        ui.radio_value(&mut boost, 1, "Foreground double length intervals (2:1)");
+                        ui.radio_value(&mut boost, 2, "Foreground triple length intervals (3:1)");
+                    });
+                });
+                ui.add_space(6.0);
+                theme::section(ui, "Foreground lock timeout");
+                let cur_f = self.cur.get(&fk).cloned().flatten();
+                let mut f = self.edit.get(&fk).cloned().flatten();
+                ui.horizontal(|ui| {
+                    let mut n = match &f {
+                        Some(RegVal::D(n)) => *n,
+                        _ => 200000,
+                    };
+                    if ui.add(egui::DragValue::new(&mut n).range(0..=2_000_000).speed(1000.0).suffix(" ms")).changed() {
+                        f = Some(RegVal::D(n));
+                    }
+                    let (text, c) = status(FG_NAME, &cur_f, &f, &default_of(FG, FG_NAME));
+                    ui.label(RichText::new(text).size(12.0).color(c));
+                });
+                self.edit.insert(fk.clone(), f);
+            });
+            // only a changed choice rewrites the value (an odd stored value such as 0x3F is kept as is)
+            if (interval, length, boost) != before {
+                p = prio_value(interval, length, boost);
             }
-            _ => {}
-        }
-    }
-}
-
-/// A hero-row stat that is left out when the window is too narrow for it (instead of wrapping letter by letter).
-fn stat_fit(ui: &mut egui::Ui, gap: f32, value: &str, label: &str, c: egui::Color32) {
-    if ui.available_width() < gap + 7.0 * label.chars().count().max(value.chars().count() * 2) as f32 {
-        return;
-    }
-    ui.add_space(gap);
-    theme::stat(ui, value, label, c);
-}
-
-/// Small number + label pair used inside the preset cards.
-fn mini(ui: &mut egui::Ui, value: &str, label: &str) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.label(RichText::new(value).size(16.0).strong().color(theme::TEXT));
-        ui.label(RichText::new(label).size(11.5).color(theme::TEXT_FAINT));
-    });
-}
-
-/// One selectable preset card. Returns true when it was clicked.
-fn preset_card(ui: &mut egui::Ui, index: usize, p: &Preset, selected: bool, is_current: bool) -> bool {
-    let id = ui.id().with(("preset", index));
-    let hovered = ui.ctx().read_response(id).map(|r| r.hovered()).unwrap_or(false);
-    let hover = ui.ctx().animate_bool_with_time(id.with("hover"), hovered, 0.12);
-    let sel = ui.ctx().animate_bool_with_time(id.with("sel"), selected, 0.14);
-    let border = theme::BORDER.lerp_to_gamma(theme::TEXT_FAINT, hover).lerp_to_gamma(theme::ACCENT, sel);
-    let fill = theme::SURFACE.lerp_to_gamma(theme::SURFACE2, 0.5 * hover).lerp_to_gamma(theme::ACCENT, 0.07 * sel);
-    let d = decode(p.value);
-    let inner = theme::card_frame().fill(fill).stroke(egui::Stroke::new(1.0 + 0.5 * sel, border)).show(ui, |ui| {
-        ui.style_mut().interaction.selectable_labels = false;
-        ui.set_width(ui.available_width());
-        ui.set_min_height(250.0);
-        // the columns are justified layouts, which would stretch the words of wrapped text
-        ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            theme::section(ui, &format!("Preset {}", index + 1));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if is_current {
-                    theme::chip(ui, "current", theme::ACCENT);
-                }
-                if index == 0 {
-                    theme::chip(ui, "recommended", theme::ACCENT);
+            let v = Some(RegVal::D(p));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Bitmask (hex):");
+                ui.label(RichText::new(format!("{p:X}")).monospace().strong());
+                let (text, c) = status(PRIO_NAME, &cur_p, &v, &default_of(PRIO, PRIO_NAME));
+                ui.label(RichText::new(text).size(12.0).color(c));
+                if ui.add_enabled(can, egui::Button::new("Restore defaults")).on_hover_text("Bitmask 2 and 200000 ms. Click Apply to apply.").clicked() {
+                    p = 2;
+                    self.edit.insert(fk.clone(), default_of(FG, FG_NAME));
                 }
             });
         });
-        ui.label(RichText::new(p.name).size(20.0).strong().color(if selected { theme::ACCENT } else { theme::TEXT }));
-        ui.label(RichText::new(p.tag).color(theme::TEXT_DIM));
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 18.0;
-            mini(ui, &format!("{} ms", d.fg_ms), "game turn");
-            mini(ui, &format!("{} ms", d.bg_ms), "background turn");
-            mini(ui, &format!("+{}", d.boost), "boost");
-        });
-        ui.add_space(6.0);
-        ui.label(RichText::new(p.text).size(13.0).color(theme::TEXT_DIM));
-        ui.add_space(2.0);
-        ui.label(RichText::new(format!("0x{:02X}  ·  {}, {}", p.value, d.interval.split(" (").next().unwrap_or(d.interval), d.kind.split(" (").next().unwrap_or(d.kind))).size(12.0).color(theme::TEXT_FAINT));
-        });
-    });
-    ui.interact(inner.response.rect, id, egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+        self.edit.insert(pk, Some(RegVal::D(p)));
+    }
+
+    /// Settings in a section that differ from the Windows default (what is applied now).
+    fn applied(&self, section: Section) -> Vec<String> {
+        self.cur
+            .iter()
+            .filter(|((t, _), _)| section_of(t) == section)
+            .filter_map(|((t, n), v)| {
+                let def = default_of(t, n);
+                (def.is_some() && *v != def).then(|| format!("{}: {} (default {})", place(t, n), show(n, v), show(n, &def)))
+            })
+            .collect()
+    }
 }
 
 impl Tab for SchedulerTab {
@@ -331,84 +540,119 @@ impl Tab for SchedulerTab {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
-        let now = ui.input(|i| i.time);
-        self.pump(now);
-        self.window(ui.ctx(), now);
-
-        theme::page_header(ui, "CPU Scheduler", "How long a thread may run before Windows lets another in, and how much the game in focus is favoured.");
+        theme::page_header(ui, "CPU Scheduler", "");
         common::admin_banner(ui);
-        egui::ScrollArea::vertical().id_salt("scheduler-page").auto_shrink([false, false]).show(ui, |ui| self.page(ui));
-    }
-}
+        let can = common::is_admin();
 
-impl SchedulerTab {
-    fn page(&mut self, ui: &mut egui::Ui) {
-
-        // ---- hero: the schedule that is active now
-        let d = decode(self.current);
-        let matched = preset_of(self.current);
-        theme::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                theme::hero(
-                    ui,
-                    matched.map(|p| p.name).unwrap_or("Custom"),
-                    "current schedule",
-                    &format!("value 0x{:02X}  ·  game : background = {}", self.current, d.ratio),
-                    if matched.is_some() { theme::ACCENT } else { theme::JUNK },
-                );
-                stat_fit(ui, 30.0, &format!("{} ms", d.fg_ms), "game turn", theme::TEXT);
-                stat_fit(ui, 22.0, &format!("{} ms", d.bg_ms), "background turn", theme::TEXT);
-                stat_fit(ui, 22.0, &if d.boost == 0 { "none".to_string() } else { format!("+{}", d.boost) }, "foreground boost", theme::TEXT);
-            });
-        });
-        ui.add_space(6.0);
-
-        // ---- presets
-        theme::section(ui, "Presets");
-        let current_sig = d.signature;
-        ui.columns(PRESETS.len(), |cols| {
-            for (i, p) in PRESETS.iter().enumerate() {
-                let is_current = decode(p.value).signature == current_sig;
-                if preset_card(&mut cols[i], i, p, self.selected == Some(i), is_current) {
-                    self.selected = Some(i);
-                }
-            }
-        });
-        ui.add_space(6.0);
-
-        // ---- actions
+        // ---- section tabs (a dot marks a section with unsaved changes)
         ui.horizontal(|ui| {
-            let can = common::is_admin() && self.run.is_none();
-            if ui.add_enabled(can && self.selected.is_some(), theme::primary_button("   Apply selected preset   ")).clicked() {
-                let p = &PRESETS[self.selected.unwrap()];
-                if decode(p.value).signature == decode(self.current).signature {
-                    // nothing to write (same schedule, maybe stored as another value): the window opens in its "nothing to do" state
-                    let mut w = OpWindow::new("CPU SCHEDULER", "change", "changed", vec![]);
-                    w.empty_title = "Already set".into();
-                    w.empty_text = if p.value == self.current {
-                        format!("The scheduler is already on {} (0x{:02X}).", p.name, p.value)
-                    } else {
-                        format!("The scheduler is already on {} (stored as 0x{:02X}, the same schedule as 0x{:02X}).", p.name, self.current, p.value)
-                    };
-                    self.pending = None;
-                    self.op = Some(w);
-                } else {
-                    self.pending = Some((self.current, p.value, None));
-                    self.op = Some(op_window(self.current, p.value, false));
+            for (s, name) in [(Section::Processor, "Processor scheduling"), (Section::Multimedia, "Multimedia scheduler")] {
+                let on = self.section == s;
+                let dirty = !self.pending(s).is_empty();
+                let text = if dirty { format!("  {name}  •  ") } else { format!("  {name}  ") };
+                let rt = RichText::new(text).size(15.0).strong().color(if on { theme::ACCENT } else { theme::TEXT_DIM });
+                if ui.selectable_label(on, rt).clicked() {
+                    self.section = s;
                 }
             }
-            let has_undo = self.history.iter().any(|h| !h.undone);
-            if ui.add_enabled(can && has_undo, egui::Button::new("Undo last change")).clicked() {
-                self.undo_window();
+        });
+        ui.add_space(6.0);
+
+        let section = self.section;
+        egui::ScrollArea::vertical().id_salt(("sched-page", section == Section::Processor)).auto_shrink([false, false]).show(ui, |ui| {
+            // ---- what is applied now in this section
+            let applied = self.applied(section);
+            theme::card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if applied.is_empty() {
+                    ui.label(RichText::new("Everything is at the Windows default.").color(theme::TEXT_DIM));
+                } else {
+                    theme::section(ui, &format!("Applied now - {} changed from default", applied.len()));
+                    for a in &applied {
+                        ui.label(RichText::new(a).color(theme::OK));
+                    }
+                }
+            });
+            ui.add_space(6.0);
+
+            match section {
+                Section::Processor => self.prio_card(ui, can),
+                Section::Multimedia => {
+                    theme::card(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        theme::section(ui, "Multimedia scheduler");
+                        egui::Grid::new("mmcss-sys").num_columns(3).spacing([14.0, 6.0]).show(ui, |ui| {
+                            for (n, label, _) in SYS_FIELDS {
+                                self.row(ui, "", n, label, can);
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    theme::card(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            theme::section(ui, "Task");
+                            let name = self.tasks.get(self.task).cloned().unwrap_or_default();
+                            let changed: Vec<String> = self.pending(Section::Multimedia).into_iter().map(|c| c.task).collect();
+                            egui::ComboBox::from_id_salt("mmcss-task").width(200.0).selected_text(&name).show_ui(ui, |ui| {
+                                for (i, t) in self.tasks.iter().enumerate() {
+                                    let label = if changed.contains(t) { format!("{t}  •") } else { t.clone() };
+                                    ui.selectable_value(&mut self.task, i, label);
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        if let Some(task) = self.tasks.get(self.task).cloned() {
+                            egui::Grid::new(("mmcss-task-grid", &task)).num_columns(3).spacing([14.0, 6.0]).show(ui, |ui| {
+                                for (n, label, _) in TASK_FIELDS {
+                                    self.row(ui, &task, n, label, can);
+                                }
+                            });
+                        }
+                    });
+                }
             }
-            if ui.button("Refresh").clicked() {
-                self.current = read_value();
-                self.selected = preset_index(self.current);
+            ui.add_space(6.0);
+
+            // ---- actions for this section only
+            let pending = self.pending(section);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(can && !pending.is_empty(), theme::primary_button(&format!("   Apply ({})   ", pending.len()))).clicked() {
+                    self.save(section);
+                }
+                if ui.add_enabled(!pending.is_empty(), egui::Button::new("Cancel")).on_hover_text("Discard the changes on this tab that are not applied yet.").clicked() {
+                    for (k, v) in self.cur.iter().filter(|(k, _)| section_of(&k.0) == section) {
+                        self.edit.insert(k.clone(), v.clone());
+                    }
+                }
+                if ui.add_enabled(can && self.last_save(section).is_some(), egui::Button::new("Undo last apply")).clicked() {
+                    self.undo_last(section);
+                }
+                if ui.button("Backup registry entries").clicked() {
+                    self.report_for = section;
+                    self.report = vec![match self.backup(section) {
+                        Ok(p) => (format!("Backup saved: {p}"), theme::OK),
+                        Err(e) => (format!("Backup failed: {e}"), theme::LOCKED),
+                    }];
+                }
+                if ui.button("Reload").on_hover_text("Read the registry again.").clicked() {
+                    self.reload(section);
+                }
+            });
+            if !pending.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Not applied yet:").size(12.5).color(theme::ACCENT));
+                for c in &pending {
+                    ui.label(RichText::new(format!("  {}", c.line())).size(12.5).color(theme::TEXT_DIM));
+                }
+            }
+            if !self.report.is_empty() && self.report_for == section {
+                ui.add_space(4.0);
+                for (l, c) in &self.report {
+                    ui.label(RichText::new(l).size(12.5).color(*c));
+                }
             }
         });
-        ui.add_space(2.0);
-        ui.label(RichText::new("Turn lengths are nominal and only matter when threads share a core. This is the same value Bitsum TweakScheduler edits - use one tool or the other.").size(12.5).color(theme::TEXT_DIM));
     }
 }
 
@@ -417,65 +661,84 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_known_values() {
-        // (value, game turn ms, background turn ms, (long, fixed, boost), ratio)
-        let cases: &[(u32, f64, f64, (bool, bool, u32), &str)] = &[
-            (0x02, 93.8, 31.3, (false, false, 2), "3:1"),
-            (0x26, 93.8, 31.3, (false, false, 2), "3:1"),
-            (0x2A, 93.8, 93.8, (false, true, 2), "1:1 (equal turns)"),
-            (0x16, 187.5, 62.5, (true, false, 2), "3:1"),
-            (0x00, 31.3, 31.3, (false, false, 0), "1:1"),
-            (0x3F, 93.8, 31.3, (false, false, 2), "3:1"),
-        ];
-        for &(v, fg, bg, sig, ratio) in cases {
-            let d = decode(v);
-            assert_eq!(d.fg_ms, fg, "game turn 0x{v:02X}");
-            assert_eq!(d.bg_ms, bg, "background turn 0x{v:02X}");
-            assert_eq!(d.signature, sig, "signature 0x{v:02X}");
-            assert_eq!(d.boost, sig.2, "boost 0x{v:02X}");
-            assert_eq!(d.ratio, ratio, "ratio 0x{v:02X}");
-        }
-        assert_eq!(decode(0x2A).kind, "Fixed");
-        assert_eq!(decode(0x16).interval, "Long");
-        assert_eq!(decode(0x26).interval, "Short");
+    fn mmcss_defaults_and_display() {
+        assert_eq!(default_of("", "SystemResponsiveness"), Some(RegVal::D(20)));
+        assert_eq!(default_of("Games", "Priority"), Some(RegVal::D(2)));
+        assert_eq!(default_of("Games", "Background Only"), Some(RegVal::S("False".into())));
+        assert_eq!(default_of("Audio", "BackgroundPriority"), None);
+        assert_eq!(default_of("Playback", "BackgroundPriority"), Some(RegVal::D(4)));
+        assert_eq!(show("NetworkThrottlingIndex", &Some(RegVal::D(DISABLED))), "Disabled");
+        assert_eq!(show("SystemResponsiveness", &Some(RegVal::D(10))), "10%");
+        assert_eq!(show("Affinity", &Some(RegVal::D(0))), "all");
+        assert_eq!(show("BackgroundPriority", &None), "(not set)");
+        assert!(choices("Priority").contains(&Some(RegVal::D(8))));
+        assert_eq!(choices("BackgroundPriority")[0], None);
+    }
+
+    /// The two tabs are saved apart: each one's pending list holds only its own settings.
+    #[test]
+    fn sched_sections_apply_separately() {
+        assert_eq!(section_of(PRIO), Section::Processor);
+        assert_eq!(section_of(FG), Section::Processor);
+        assert_eq!(section_of(""), Section::Multimedia);
+        assert_eq!(section_of("Games"), Section::Multimedia);
+        let mut cur = BTreeMap::new();
+        cur.insert((PRIO.to_string(), PRIO_NAME), Some(RegVal::D(2)));
+        cur.insert(("Games".to_string(), "Priority"), Some(RegVal::D(2)));
+        let mut edit = cur.clone();
+        edit.insert((PRIO.to_string(), PRIO_NAME), Some(RegVal::D(0x26)));
+        edit.insert(("Games".to_string(), "Priority"), Some(RegVal::D(6)));
+        let tab = SchedulerTab { cur, edit, tasks: vec!["Games".into()], task: 0, history: vec![], section: Section::Processor, report: vec![], report_for: Section::Processor };
+        let p: Vec<String> = tab.pending(Section::Processor).iter().map(|c| c.line()).collect();
+        let m: Vec<String> = tab.pending(Section::Multimedia).iter().map(|c| c.line()).collect();
+        assert_eq!(p, vec!["Win32PrioritySeparation: 0x2 → 0x26".to_string()]);
+        assert_eq!(m, vec!["Games › Priority: 2 → 6".to_string()]);
     }
 
     #[test]
-    fn preset_matching_by_schedule() {
-        for (i, p) in PRESETS.iter().enumerate() {
-            assert_eq!(preset_index(p.value), Some(i));
-            assert_eq!(preset_of(p.value).map(|q| q.value), Some(p.value));
+    fn mmcss_priority_separation() {
+        // 0x2 = Windows default: OS chooses interval and length, 3:1 boost
+        assert_eq!(prio_parts(0x2), (0, 0, 2));
+        assert_eq!(prio_parts(0x26), (2, 1, 2), "short, variable, 3:1");
+        assert_eq!(prio_parts(0x18), (1, 2, 0), "long, fixed, 1:1");
+        assert_eq!(prio_parts(0x3F), (0, 0, 2), "3 means default in every field");
+        for v in [0x2, 0x26, 0x18, 0x14, 0x29] {
+            let (i, l, b) = prio_parts(v);
+            assert_eq!(prio_value(i, l, b), v);
         }
-        // 0x26 and 0x3F store the default schedule in other bits
-        assert_eq!(preset_index(0x26), Some(0));
-        assert_eq!(preset_index(0x3F), Some(0));
-        assert_eq!(label_of(0x26), "Windows default");
-        // long + fixed + no boost matches no preset
-        assert_eq!(preset_index(0x18), None);
-        assert!(preset_of(0x18).is_none());
-        assert_eq!(label_of(0x18), "Custom value 0x18");
+        assert_eq!(default_of(PRIO, PRIO_NAME), Some(RegVal::D(2)));
+        assert_eq!(default_of(FG, FG_NAME), Some(RegVal::D(200000)));
+        assert_eq!(show(PRIO_NAME, &Some(RegVal::D(0x26))), "0x26");
+        assert_eq!(show(FG_NAME, &Some(RegVal::D(0))), "0 ms");
+        assert_eq!(place(PRIO, PRIO_NAME), PRIO_NAME);
+        assert_eq!(place("Games", "Priority"), "Games › Priority");
     }
 
     #[test]
-    fn history_rules() {
-        let mut h = Vec::new();
-        // a failed change records nothing
-        assert!(!apply_result(&mut h, 0x02, 0x16, None, false, "t".into()));
-        assert!(h.is_empty());
-        // successful changes are recorded
-        assert!(apply_result(&mut h, 0x02, 0x16, None, true, "t".into()));
-        assert!(apply_result(&mut h, 0x16, 0x2A, None, true, "t".into()));
-        assert_eq!(h.len(), 2);
-        // a failed undo keeps the entry as not undone, so the next undo picks it again
-        assert!(!apply_result(&mut h, 0x2A, 0x16, Some(1), false, "t".into()));
-        assert!(!h[1].undone);
-        assert_eq!(h.iter().rposition(|e| !e.undone), Some(1));
-        // a successful undo marks it; the next undo goes to the older change
-        assert!(apply_result(&mut h, 0x2A, 0x16, Some(1), true, "t".into()));
-        assert!(h[1].undone && !h[0].undone);
-        assert_eq!(h.iter().rposition(|e| !e.undone), Some(0));
-        // an index that is not in the history changes nothing
-        assert!(!apply_result(&mut h, 0x16, 0x02, Some(9), true, "t".into()));
-        assert_eq!(h.len(), 2);
+    fn mmcss_diff_lists_only_edits() {
+        let mut cur = BTreeMap::new();
+        cur.insert(("Games".to_string(), "Priority"), Some(RegVal::D(2)));
+        cur.insert(("Games".to_string(), "Scheduling Category"), Some(RegVal::S("Medium".into())));
+        cur.insert((String::new(), "SystemResponsiveness"), Some(RegVal::D(20)));
+        let mut edit = cur.clone();
+        assert!(diff(&cur, &edit).is_empty());
+        edit.insert(("Games".to_string(), "Priority"), Some(RegVal::D(6)));
+        edit.insert((String::new(), "SystemResponsiveness"), Some(RegVal::D(10)));
+        let d = diff(&cur, &edit);
+        assert_eq!(d.len(), 2);
+        let lines: Vec<String> = d.iter().map(|c| c.line()).collect();
+        assert!(lines.contains(&"Games › Priority: 2 → 6".to_string()));
+        assert!(lines.contains(&"SystemResponsiveness: 20% → 10%".to_string()));
+    }
+
+    /// Read-only: the registry on this PC can be read and every known task is found.
+    #[test]
+    #[ignore]
+    fn mmcss_live_read() {
+        let (m, tasks) = read_all();
+        println!("{tasks:?}");
+        assert!(tasks.iter().any(|t| t == "Games"));
+        assert!(m.contains_key(&("Games".to_string(), "Priority")));
+        println!("Win32PrioritySeparation {:?}, ForegroundLockTimeout {:?}", m[&(PRIO.to_string(), PRIO_NAME)], m[&(FG.to_string(), FG_NAME)]);
     }
 }

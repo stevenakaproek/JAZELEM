@@ -24,6 +24,23 @@ enum Mode {
     Undo,
     /// Apply just one tweak (a group: G_TASKS, G_EDGE, G_XBOX or G_ONEDRIVE).
     Only(&'static str),
+    /// Apply several tweaks picked by hand: a bit per entry of GROUPS.
+    Pick(u8),
+}
+
+/// The tweaks in the order the page lists them.
+const GROUPS: [&str; 4] = [G_TASKS, G_EDGE, G_XBOX, G_ONEDRIVE];
+
+/// The run for the rows the user selected (None when nothing is selected).
+fn pick_mode(sel: &[bool; 4]) -> Option<Mode> {
+    let picked: Vec<&'static str> = GROUPS.iter().zip(sel).filter(|(_, s)| **s).map(|(g, _)| *g).collect();
+    match picked.len() {
+        0 => None,
+        1 => Some(Mode::Only(picked[0])),
+        3 if !sel[3] => Some(Mode::Apply),
+        4 => Some(Mode::ApplyOneDrive),
+        _ => Some(Mode::Pick(sel.iter().enumerate().filter(|(_, s)| **s).fold(0u8, |m, (i, _)| m | (1 << i)))),
+    }
 }
 
 /// The script's -Only name for a group.
@@ -43,6 +60,7 @@ impl Mode {
             Mode::ApplyOneDrive => vec!["-RemoveOneDrive".into()],
             Mode::Undo => vec!["-Undo".into()],
             Mode::Only(g) => vec!["-Only".into(), only_name(g).into()],
+            Mode::Pick(_) => vec!["-Only".into(), self.groups().into_iter().map(only_name).collect::<Vec<_>>().join(",")],
         };
         a.extend(["-StatePath".to_string(), state.display().to_string()]);
         a
@@ -56,12 +74,14 @@ impl Mode {
             Mode::Only(G_EDGE) => "Stop Edge preloading",
             Mode::Only(G_XBOX) => "Turn on Teredo",
             Mode::Only(_) => "Remove OneDrive",
+            Mode::Pick(_) => "Apply selected tweaks",
         }
     }
     fn groups(self) -> Vec<&'static str> {
         match self {
             Mode::ApplyOneDrive => vec![G_TASKS, G_EDGE, G_XBOX, G_ONEDRIVE],
             Mode::Only(g) => vec![g],
+            Mode::Pick(m) => GROUPS.iter().enumerate().filter(|(i, _)| m & (1 << i) != 0).map(|(_, g)| *g).collect(),
             _ => vec![G_TASKS, G_EDGE, G_XBOX],
         }
     }
@@ -69,37 +89,74 @@ impl Mode {
 
 #[derive(Default, Clone)]
 struct Status {
-    teredo: String,
-    teredo_state: String,
-    widgets_policy: String,
-    widgets_running: bool,
-    edge_boost: String,
+    teredo_type: String,
+    /// Both Edge policies (Startup Boost, background mode) are 0.
+    edge_off: bool,
+    /// The script's tasks that exist on this PC and are still switched on (None = could not be read).
+    tasks_on: Option<usize>,
+    onedrive_installed: bool,
+}
+
+impl Status {
+    /// Whether a tweak is in place on this PC now (None = not known).
+    fn applied(&self, group: &str) -> Option<bool> {
+        match group {
+            G_TASKS => self.tasks_on.map(|n| n == 0),
+            G_EDGE => Some(self.edge_off),
+            G_XBOX => Some(self.teredo_type.eq_ignore_ascii_case("enterpriseclient")),
+            _ => Some(!self.onedrive_installed),
+        }
+    }
+
+    /// The current value shown at the right of a row.
+    fn now(&self, group: &str) -> String {
+        match group {
+            G_TASKS => match self.tasks_on {
+                Some(0) => "All off".into(),
+                Some(n) => format!("{n} still on"),
+                None => "-".into(),
+            },
+            G_EDGE => if self.edge_off { "Off".into() } else { "On".into() },
+            G_XBOX => if self.teredo_type.is_empty() { "-".into() } else { self.teredo_type.clone() },
+            _ => if self.onedrive_installed { "Installed".into() } else { "Not installed".into() },
+        }
+    }
+}
+
+/// The script's scheduled tasks that exist here and are not disabled.
+fn tasks_still_on() -> Option<usize> {
+    #[derive(serde::Deserialize)]
+    struct T {
+        p: String,
+        s: i32,
+    }
+    // State: 1 = Disabled
+    let all = common::ps_json::<T>("Get-ScheduledTask | Select-Object @{n='p';e={$_.TaskPath + $_.TaskName}}, @{n='s';e={[int]$_.State}}").ok()?;
+    let wanted: Vec<String> = script_tasks().iter().map(|p| p.to_lowercase()).collect();
+    Some(all.iter().filter(|t| t.s != 1 && wanted.contains(&t.p.to_lowercase())).count())
+}
+
+fn onedrive_installed() -> bool {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    [
+        format!(r"{}\Microsoft\OneDrive\OneDrive.exe", env("LOCALAPPDATA")),
+        format!(r"{}\Microsoft OneDrive\OneDrive.exe", env("ProgramFiles")),
+        format!(r"{}\Microsoft OneDrive\OneDrive.exe", env("ProgramFiles(x86)")),
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists())
 }
 
 fn read_status() -> Status {
-    let mut teredo_state = String::new();
-    let teredo = common::run("netsh", &["interface", "teredo", "show", "state"])
-        .map(|(_, t)| {
-            let get = |k: &str| t.lines().find(|l| l.trim_start().starts_with(k)).and_then(|l| l.split(':').nth(1)).map(|s| s.trim().to_string()).unwrap_or_default();
-            teredo_state = get("State");
-            format!("type {}, state {}", get("Type"), get("State"))
-        })
-        .unwrap_or_else(|e| e);
+    let teredo_type = common::run("netsh", &["interface", "teredo", "show", "state"])
+        .map(|(_, t)| t.lines().find(|l| l.trim_start().starts_with("Type")).and_then(|l| l.split(':').nth(1)).map(|s| s.trim().to_string()).unwrap_or_default())
+        .unwrap_or_default();
     let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
-    let widgets_policy = hklm
-        .open_subkey(r"SOFTWARE\Policies\Microsoft\Dsh")
-        .and_then(|k| k.get_value::<u32, _>("AllowNewsAndInterests"))
-        .map(|v| if v == 0 { "off by policy".to_string() } else { format!("policy = {v}") })
-        .unwrap_or_else(|_| "not set".into());
-    let edge_boost = hklm
+    let edge_off = hklm
         .open_subkey(r"SOFTWARE\Policies\Microsoft\Edge")
-        .and_then(|k| k.get_value::<u32, _>("StartupBoostEnabled"))
-        .map(|v| if v == 0 { "off".to_string() } else { "on".to_string() })
-        .unwrap_or_else(|_| "Windows default (on)".into());
-    let widgets_running = common::run("tasklist", &["/FI", "IMAGENAME eq WidgetBoard.exe", "/NH"])
-        .map(|(_, t)| t.contains("WidgetBoard.exe"))
+        .map(|k| k.get_value::<u32, _>("StartupBoostEnabled").ok() == Some(0) && k.get_value::<u32, _>("BackgroundModeEnabled").ok() == Some(0))
         .unwrap_or(false);
-    Status { teredo, teredo_state, widgets_policy, widgets_running, edge_boost }
+    Status { teredo_type, edge_off, tasks_on: tasks_still_on(), onedrive_installed: onedrive_installed() }
 }
 
 // ------------------------------------------------------------------ what the script does / did
@@ -257,11 +314,12 @@ fn preview_items(mode: Mode, saved: Option<&Saved>, kept_off: &std::collections:
         v.push(OpItem::new("edge-bg", "Background mode", G_EDGE).detail("off"));
         v.push(OpItem::new("teredo", "Teredo", G_XBOX).detail("enterpriseclient, kept on by Group Policy"));
     }
-    if matches!(mode, Mode::ApplyOneDrive | Mode::Only(_)) {
+    if matches!(mode, Mode::ApplyOneDrive | Mode::Only(_) | Mode::Pick(_)) {
         v.push(OpItem::new("onedrive", "OneDrive", G_ONEDRIVE).detail("uninstalled, its tasks disabled"));
     }
-    if let Mode::Only(g) = mode {
-        v.retain(|i| i.group == g);
+    if matches!(mode, Mode::Only(_) | Mode::Pick(_)) {
+        let groups = mode.groups();
+        v.retain(|i| groups.iter().any(|g| i.group == *g));
     }
     v
 }
@@ -302,6 +360,14 @@ fn preview_window_with(mode: Mode, saved: Option<&Saved>, kept_off: &std::collec
             } else {
                 w.reassure = "The state before is saved first. \"Undo tweaks\" puts back every tweak applied so far, not just this one.".into();
             }
+        }
+        Mode::Pick(_) => {
+            let groups = mode.groups();
+            w.preview_text = format!("Applies: {}. The other tweaks are left alone.", groups.join(", "));
+            if groups.contains(&G_ONEDRIVE) {
+                w.warning = Some("OneDrive will be uninstalled. \"Undo tweaks\" does not bring it back - reinstall it from the Microsoft Store if you want it again.".into());
+            }
+            w.reassure = "The state before is saved first. \"Undo tweaks\" puts back every tweak applied so far.".into();
         }
         Mode::Undo => match saved {
             Some(s) if !s.inexact => {
@@ -570,15 +636,6 @@ const DEMO_LOG: &[&str] = &[
 
 // ------------------------------------------------------------------ tab
 
-/// A hero-row stat that is left out when the window is too narrow for it (instead of wrapping letter by letter).
-fn stat_fit(ui: &mut egui::Ui, gap: f32, value: &str, label: &str, c: egui::Color32) {
-    if ui.available_width() < gap + 7.0 * label.chars().count().max(value.chars().count() * 2) as f32 {
-        return;
-    }
-    ui.add_space(gap);
-    theme::stat(ui, value, label, c);
-}
-
 /// Give empty tick boxes an outline so they can be seen on a card.
 fn visible_checkboxes(ui: &mut egui::Ui) {
     let widgets = &mut ui.visuals_mut().widgets;
@@ -599,11 +656,13 @@ pub struct TweaksTab {
     pending: Option<Mode>,
     show_details: bool,
     demo: bool,
+    /// Rows picked by hand (GROUPS order).
+    selected: [bool; 4],
 }
 
 impl TweaksTab {
     pub fn new() -> Self {
-        let mut tab = TweaksTab { status: None, job: None, stream: None, mode: None, op: None, pending: None, show_details: false, demo: false };
+        let mut tab = TweaksTab { status: None, job: None, stream: None, mode: None, op: None, pending: None, show_details: false, demo: false, selected: [false; 4] };
         if let Some(stage) = opwin::demo_stage("tweaks") {
             // sample window for screenshots - the script is not started
             let mut w = preview_window(Mode::Apply);
@@ -670,6 +729,7 @@ impl TweaksTab {
             None => update_steps(op, &parse_log(&s.lines), script_tasks().len()),
             Some(code) => {
                 self.status = None; // refresh after a run
+                self.selected = [false; 4];
                 op.items = result_items(&s.lines, code);
                 op.can_undo = self.mode != Some(Mode::Undo);
                 op.undo_label = "Undo tweaks".into();
@@ -716,86 +776,75 @@ impl Tab for TweaksTab {
         self.pump();
         self.window(ui.ctx());
 
-        theme::page_header(ui, "Post-install Tweaks", "Re-applies what a fresh Windows install brings back: telemetry tasks, Edge preloading, and Teredo for Xbox online play.");
-        common::admin_banner(ui);
+        // shown inside the Optimization tab, which draws the page header and admin banner
         egui::ScrollArea::vertical().id_salt("tweaks-page").auto_shrink([false, false]).show(ui, |ui| self.page(ui));
     }
 }
 
 impl TweaksTab {
     fn page(&mut self, ui: &mut egui::Ui) {
-        // ---- hero: is Xbox online play ready?
-        theme::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            match &self.status {
-                None => {
-                    theme::hero(ui, "...", "Xbox online play", "Reading the Teredo, Edge and Widgets state", theme::TEXT_FAINT);
-                    theme::sweep(ui, ui.available_width());
-                }
-                Some(s) => {
-                    let ready = s.teredo.contains("qualified") || s.teredo.contains("dormant");
-                    ui.horizontal(|ui| {
-                        let caption = if s.teredo_state.is_empty() { s.teredo.clone() } else { format!("Teredo {}", s.teredo.split(", state").next().unwrap_or(&s.teredo)) };
-                        theme::hero(ui, if ready { "Ready" } else { "Off" }, "Xbox online play", &caption, if ready { theme::ACCENT } else { theme::JUNK });
-                        if !s.teredo_state.is_empty() {
-                            stat_fit(ui, 30.0, &s.teredo_state, "Teredo state", if ready { theme::TEXT } else { theme::JUNK });
-                        }
-                        let boost_off = s.edge_boost == "off";
-                        stat_fit(
-                            ui,
-                            22.0,
-                            if boost_off { "Off" } else { "On" },
-                            if s.edge_boost.starts_with("Windows default") { "Edge startup boost  ·  Windows default" } else { "Edge startup boost" },
-                            if boost_off { theme::TEXT } else { theme::JUNK },
-                        );
-                        stat_fit(
-                            ui,
-                            22.0,
-                            if s.widgets_running { "Running" } else { "Not running" },
-                            &if s.widgets_policy == "not set" { "Widgets  ·  policy not set".to_string() } else { format!("Widgets  ·  {}", s.widgets_policy) },
-                            if s.widgets_running { theme::JUNK } else { theme::TEXT },
-                        );
-                    });
-                }
-            }
-        });
-        if self.status.as_ref().map(|s| s.widgets_running).unwrap_or(false) {
-            theme::banner(ui, theme::OPTIONAL, "Widgets is running and Windows blocks scripts from its policy. Remove Widgets in the Remove Bloat tab (Optional list), or open gpedit.msc > Computer Configuration > Administrative Templates > Windows Components > Widgets > Allow widgets = Disabled, then sign out.");
-        }
-        ui.add_space(6.0);
-
-        // ---- what it does + the actions
+        // ---- the tweaks + the actions
         let running = self.stream.as_ref().map(|s| s.exit.is_none()).unwrap_or(false);
         let can = common::is_admin() && !running;
         theme::card(ui, |ui| {
             ui.set_width(ui.available_width());
-            theme::section(ui, "What the tweaks do");
-            let n_tasks = script_tasks().len();
-            let rows: [(&'static str, String); 4] = [
-                (G_TASKS, format!("{n_tasks} telemetry, tips, maps and family-safety tasks are disabled. Xbox and Steam tasks are kept.")),
-                (G_EDGE, "Startup Boost and background mode off, so Edge no longer preloads. Edge stays installed.".into()),
-                (G_XBOX, "Teredo on as \"enterpriseclient\", set as a Group Policy so Windows keeps it.".into()),
-                (G_ONEDRIVE, "Uninstalled only when you choose \"Apply + remove OneDrive\" or \"Remove\" here.".into()),
-            ];
-            egui::Grid::new("tweaks-what").num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
-                for (name, text) in &rows {
-                    ui.label(RichText::new(*name).strong().color(theme::TEXT));
-                    ui.label(RichText::new(text).color(theme::TEXT_DIM));
-                    // apply just this one tweak
-                    let button = if *name == G_ONEDRIVE { theme::danger_button("Remove") } else { egui::Button::new("Apply") };
-                    if ui.add_enabled(can, button).on_hover_text(Mode::Only(name).title()).clicked() {
-                        self.ask(Mode::Only(name));
-                    }
-                    ui.end_row();
-                }
+            ui.horizontal(|ui| {
+                theme::section(ui, "Tweaks");
+                ui.label(RichText::new("click the ones you want, then Apply selected").size(12.0).color(theme::TEXT_FAINT));
             });
+            ui.add_space(2.0);
+            let n_tasks = script_tasks().len();
+            let rows: [(&'static str, &'static str, String); 4] = [
+                (G_TASKS, "Telemetry and tips tasks off", format!("{n_tasks} telemetry, tips, maps and family-safety tasks are disabled. Xbox and Steam tasks are kept.")),
+                (G_EDGE, "Edge preloading off", "Startup Boost and background mode off. Edge stays installed.".into()),
+                (G_XBOX, "Teredo on for Xbox online play", "Teredo set to \"enterpriseclient\" by Group Policy so Windows keeps it.".into()),
+                (G_ONEDRIVE, "Remove OneDrive", "Uninstalls OneDrive. \"Undo tweaks\" does not bring it back.".into()),
+            ];
+            for (i, (group, name, text)) in rows.iter().enumerate() {
+                let applied = self.status.as_ref().and_then(|s| s.applied(group));
+                let selectable = can && applied == Some(false);
+                let sel = self.selected[i] && selectable;
+                let clicked = theme::select_row(ui, ("tweak", i), sel, selectable, |ui| {
+                    ui.horizontal(|ui| {
+                        match applied {
+                            Some(a) => theme::applied_badge(ui, a),
+                            None => theme::chip(ui, "checking...", theme::DIM),
+                        }
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.set_width((ui.available_width() - 200.0).max(240.0));
+                            ui.label(RichText::new(*name).strong().color(if *group == G_ONEDRIVE { theme::LOCKED } else { theme::TEXT }));
+                            ui.label(RichText::new(text).size(12.5).color(theme::TEXT_DIM));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(s) = &self.status {
+                                let c = if applied == Some(true) { theme::OK } else if sel { theme::ACCENT } else { theme::TEXT_DIM };
+                                ui.label(RichText::new(s.now(group)).color(c));
+                            }
+                        });
+                    });
+                });
+                if clicked {
+                    self.selected[i] = !self.selected[i];
+                }
+                ui.add_space(3.0);
+            }
+            // only rows that still need applying count
+            let picked: [bool; 4] = std::array::from_fn(|i| self.selected[i] && self.status.as_ref().and_then(|s| s.applied(GROUPS[i])) == Some(false));
+            let n = picked.iter().filter(|s| **s).count();
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(can, theme::primary_button("   Apply tweaks   ")).clicked() {
-                    self.ask(Mode::Apply);
+                if ui
+                    .add_enabled(can && n > 0, theme::primary_button(&format!("   Apply selected ({n})   ")))
+                    .on_disabled_hover_text(if common::is_admin() { "Click the tweaks you want to apply." } else { "Run PC Tuner as administrator to apply tweaks." })
+                    .clicked()
+                {
+                    if let Some(m) = pick_mode(&picked) {
+                        self.ask(m);
+                    }
                 }
-                if ui.add_enabled(can, theme::danger_button("Apply + remove OneDrive")).clicked() {
-                    self.ask(Mode::ApplyOneDrive);
+                if n > 0 && ui.button("Clear selection").clicked() {
+                    self.selected = [false; 4];
                 }
                 if ui.add_enabled(can, egui::Button::new("Undo tweaks")).clicked() {
                     self.ask(Mode::Undo);
@@ -967,7 +1016,22 @@ mod tests {
         for g in [G_TASKS, G_EDGE, G_XBOX, G_ONEDRIVE] {
             assert!(SCRIPT.contains(&format!("Test-Do '{}'", only_name(g))) || only_name(g) == "OneDrive");
         }
-        assert!(SCRIPT.contains("[ValidateSet('Tasks', 'Edge', 'Teredo', 'OneDrive')]"));
+        assert!(SCRIPT.contains("if ($o -notin 'Tasks', 'Edge', 'Teredo', 'OneDrive')"));
+
+        // several picked by hand: one run, -Only "A,B" (the script splits it)
+        let none2 = Default::default();
+        assert_eq!(pick_mode(&[false; 4]), None);
+        assert_eq!(pick_mode(&[false, true, false, false]), Some(Mode::Only(G_EDGE)));
+        assert_eq!(pick_mode(&[true, true, true, false]), Some(Mode::Apply));
+        assert_eq!(pick_mode(&[true; 4]), Some(Mode::ApplyOneDrive));
+        let m = pick_mode(&[true, false, true, false]).unwrap();
+        assert_eq!(m.groups(), vec![G_TASKS, G_XBOX]);
+        assert_eq!(&m.args(std::path::Path::new(r"C:\x\s.json"))[..2], &["-Only".to_string(), "Tasks,Teredo".into()]);
+        let picked = preview_items(m, None, &none2).iter().map(|i| i.group.clone()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(picked.into_iter().collect::<Vec<_>>(), vec![G_TASKS.to_string(), G_XBOX.to_string()]);
+        let with_od = pick_mode(&[false, true, false, true]).unwrap();
+        assert!(preview_window_with(with_od, None, &none2).warning.is_some(), "OneDrive in the pick warns");
+        assert!(preview_window_with(m, None, &none2).warning.is_none());
 
         // a run of just one section still parses
         let edge = lines(&["Edge background launching:", "  Startup Boost and background mode turned off (Edge shows \"Managed by your organization\" - expected)", "Done."]);

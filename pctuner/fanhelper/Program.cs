@@ -4,10 +4,12 @@
 // and drives fan headers on request. PC Tuner starts it hidden and talks over stdin/stdout:
 //   helper -> app : one JSON status line per second
 //   app -> helper : ping | set <id> <percent> | curve <id> <cpu|gpu|hottest> t:d,... | auto <id> | autoall
+//                   | trigger <id> <cpu|gpu|hottest> <idle temp> <load temp> <idle %> <load %>
 //                   | pump <id> 0|1 | quit
+//   (trigger: idle speed until the load temperature, then the load speed until it falls to the idle temperature)
 //
 // Safety rules live here, so they hold even if the PC Tuner window freezes or crashes:
-//   - fans never below 20 %, pumps never below 50 %
+//   - no speed floor of its own: fans and pumps go as low as PC Tuner asks (the controller's minimum still holds)
 //   - any CPU or GPU temperature >= 90 C: every controlled fan to 100 % until both are below 80 C
 //   - if temperatures cannot be read for 5 s while fans are controlled: fans go back to the BIOS until
 //     they can be read again (the settings are kept and come back by themselves; status "blind":true)
@@ -44,8 +46,11 @@ namespace PCTunerFan
     /// <summary>Pure safety rules (unit-tested by --selftest).</summary>
     public static class Safety
     {
-        public const float FanFloor = 20f;
-        public const float PumpFloor = 50f;
+        // No software floor: the user sets fan and pump speeds as low as they like (0 % allowed). The
+        // controller's own minimum still applies (SetSoftware clamps to MinSoftwareValue), and so does the
+        // 90 C override below.
+        public const float FanFloor = 0f;
+        public const float PumpFloor = 0f;
         public const float HotOn = 90f;
         public const float HotOff = 80f;
         public const double WatchdogSeconds = 10.0;
@@ -153,13 +158,30 @@ namespace PCTunerFan
         readonly HashSet<string> pumpOverride = new HashSet<string>();
         readonly HashSet<string> notPump = new HashSet<string>();
 
-        /// <summary>A fan that follows a temperature curve.</summary>
+        /// <summary>A fan that follows a temperature: a graph curve, or a trigger (two steady speeds).</summary>
         class Curve
         {
             public string Source = "hottest"; // cpu | gpu | hottest
             public List<(float t, float d)> Points = new List<(float t, float d)>();
             public float? LastTemp;
+            // trigger: idle speed until LoadTemp is reached, then the load speed until it falls to IdleTemp
+            public bool Trigger;
+            public float IdleTemp, LoadTemp, IdleDuty, LoadDuty;
+            public bool Loaded;
         }
+
+        /// <summary>Trigger latch: on at the load temperature, off at the idle temperature, unchanged between.</summary>
+        public static bool TriggerLoaded(bool loaded, float temp, float idleTemp, float loadTemp)
+        {
+            if (temp >= loadTemp) return true;
+            if (temp <= idleTemp) return false;
+            return loaded;
+        }
+
+        static string Src(string s) => s == "cpu" || s == "gpu" ? s : "hottest";
+
+        static bool Num(string s, out float v) =>
+            float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v) && !float.IsNaN(v) && !float.IsInfinity(v);
         readonly Dictionary<string, Curve> curves = new Dictionary<string, Curve>();
 
         DateTime lastFromApp;
@@ -267,10 +289,25 @@ namespace PCTunerFan
                     if (!io.Controllable(parts[1])) { Say("not controllable: " + parts[1]); break; }
                     var pts = ParsePoints(parts[3]);
                     if (pts == null) { Say("bad curve: " + parts[3]); break; }
-                    string src = parts[2] == "cpu" || parts[2] == "gpu" ? parts[2] : "hottest";
                     if (!curves.TryGetValue(parts[1], out var cur)) curves[parts[1]] = cur = new Curve();
-                    cur.Source = src;
+                    cur.Source = Src(parts[2]);
                     cur.Points = pts;
+                    cur.Trigger = false;
+                    break;
+                case "trigger" when parts.Length >= 7:
+                    // trigger <id> <cpu|gpu|hottest> <idle temp> <load temp> <idle %> <load %>
+                    if (!io.Controllable(parts[1])) { Say("not controllable: " + parts[1]); break; }
+                    if (!Num(parts[3], out var it) || !Num(parts[4], out var lt) || !Num(parts[5], out var idl) || !Num(parts[6], out var ld) || lt <= it)
+                    { Say("bad trigger: " + string.Join(" ", parts.Skip(3))); break; }
+                    bool same = curves.TryGetValue(parts[1], out var trg) && trg.Trigger;
+                    if (trg == null) curves[parts[1]] = trg = new Curve();
+                    trg.Source = Src(parts[2]);
+                    trg.Trigger = true;
+                    trg.IdleTemp = it;
+                    trg.LoadTemp = lt;
+                    trg.IdleDuty = Math.Max(0, Math.Min(100, idl));
+                    trg.LoadDuty = Math.Max(0, Math.Min(100, ld));
+                    if (!same) trg.Loaded = false; // a new trigger starts idle; an edited one keeps its state
                     break;
                 case "auto" when parts.Length >= 2:
                     GiveBack(parts[1]);
@@ -299,6 +336,14 @@ namespace PCTunerFan
                 // the chosen sensor is missing: follow whichever temperature is known
                 if (!src.HasValue && (cpu.HasValue || gpu.HasValue)) src = Math.Max(cpu ?? 0, gpu ?? 0);
                 if (!src.HasValue) continue; // no temperature at all: the "blind" rule hands the fan back
+                if (kv.Value.Trigger)
+                {
+                    // the gap between the two temperatures is the hysteresis: raw temperature here
+                    var c = kv.Value;
+                    c.Loaded = TriggerLoaded(c.Loaded, src.Value, c.IdleTemp, c.LoadTemp);
+                    requested[kv.Key] = c.Loaded ? c.LoadDuty : c.IdleDuty;
+                    continue;
+                }
                 float t = Safety.Hysteresis(kv.Value.LastTemp, src.Value);
                 kv.Value.LastTemp = t;
                 requested[kv.Key] = Safety.CurveDuty(kv.Value.Points, t);
@@ -395,6 +440,7 @@ namespace PCTunerFan
             try
             {
                 if (args.Contains("--selftest")) return SelfTest();
+                if (args.Contains("--ramled")) return RamLed.Run(args); // RAM LED tab: one-shot, never touches the fans
                 if (args.Contains("--dump"))
                 {
                     int i = Array.IndexOf(args, "--dump");
@@ -445,7 +491,7 @@ namespace PCTunerFan
             {
                 var h = stack.Pop();
                 yield return h;
-                foreach (var s in h.SubHardware.Reverse()) stack.Push(s);
+                foreach (var s in Enumerable.Reverse(h.SubHardware)) stack.Push(s);
             }
         }
 
@@ -739,8 +785,9 @@ namespace PCTunerFan
         {
             int fails = 0;
             void Check(bool ok, string what) { Console.Out.WriteLine((ok ? "ok    " : "FAIL  ") + what); if (!ok) fails++; }
-            Check(Safety.Clamp(5, false) == 20, "fan floor 20 %");
-            Check(Safety.Clamp(5, true) == 50, "pump floor 50 %");
+            Check(Safety.Clamp(5, false) == 5, "fan: low speed allowed");
+            Check(Safety.Clamp(5, true) == 5, "pump: low speed allowed");
+            Check(Safety.Clamp(0, false) == 0 && Safety.Clamp(-10, true) == 0, "never below 0 %");
             Check(Safety.Clamp(150, false) == 100, "max 100 %");
             Check(Safety.Clamp(float.NaN, false) == 100, "NaN -> 100 %");
             Check(Safety.Clamp(65, false) == 65, "normal value kept");
@@ -767,6 +814,7 @@ namespace PCTunerFan
             Check(Safety.Hysteresis(65, 63) == 65, "hysteresis ignores a 2 C drop");
             Check(Safety.Hysteresis(65, 62) == 62, "hysteresis follows a 3 C drop");
             ControllerTests(Check);
+            RamLed.SelfTest(Check);
             Console.Out.WriteLine(fails == 0 ? "selftest passed" : $"selftest FAILED ({fails})");
             return fails == 0 ? 0 : 1;
         }
@@ -805,6 +853,42 @@ namespace PCTunerFan
             }
         }
 
+        /// <summary>Trigger curves: idle speed, latch on at the load temperature, off at the idle temperature.</summary>
+        static void TriggerTests(Action<bool, string> Check, DateTime t0)
+        {
+            DateTime At(double s) => t0.AddSeconds(s);
+            Check(Controller.TriggerLoaded(false, 64.9f, 55, 65) == false, "trigger: below the load temperature stays idle");
+            Check(Controller.TriggerLoaded(false, 65f, 55, 65) == true, "trigger: on at the load temperature");
+            Check(Controller.TriggerLoaded(true, 56f, 55, 65) == true, "trigger: stays on between the two temperatures");
+            Check(Controller.TriggerLoaded(true, 55f, 55, 65) == false, "trigger: off at the idle temperature");
+
+            var io = new FakeIO();
+            io.Ctl.Add("case");
+            var c = new Controller(io, t0);
+            c.Handle("trigger case hottest 55 65 30 70", At(0));
+            c.Tick(At(1), 50, 45);
+            Check(io.Duty["case"] == 30 && c.HasCurve("case"), "trigger: idle speed at the desktop");
+            c.Tick(At(2), 50, 66);
+            Check(io.Duty["case"] == 70, "trigger: gaming speed once the hotter chip reaches 65 C");
+            c.Tick(At(3), 58, 60);
+            Check(io.Duty["case"] == 70, "trigger: no dip while the temperature wobbles between 55 and 65 C");
+            c.Handle("trigger case hottest 55 65 30 75", At(3));
+            c.Tick(At(4), 58, 60);
+            Check(io.Duty["case"] == 75, "trigger: an edited trigger keeps its gaming state");
+            c.Tick(At(5), 50, 54);
+            Check(io.Duty["case"] == 30, "trigger: back to idle at 55 C");
+            c.Tick(At(6), 91, 50);
+            Check(io.Duty["case"] == 100, "trigger: the 90 C override still wins");
+            int seq = c.MessageSeq;
+            c.Handle("trigger case cpu 65 55 30 70", At(7));
+            Check(c.MessageSeq == seq + 1 && c.Message.StartsWith("bad trigger"), "trigger: load below idle is refused");
+            c.Handle("trigger case cpu 55 65 x 70", At(7));
+            Check(c.Message.StartsWith("bad trigger"), "trigger: a bad number is refused");
+            c.Handle("curve case cpu 30:20,80:100", At(8));
+            c.Tick(At(9), 30, 30);
+            Check(io.Duty["case"] == 20, "trigger: a curve command turns the fan back into a graph curve");
+        }
+
         /// <summary>The safety loop with fake fans and a fake clock: floors, 90 C override, blind rule, watchdog, reset.</summary>
         static void ControllerTests(Action<bool, string> Check)
         {
@@ -820,14 +904,14 @@ namespace PCTunerFan
             c.Handle("set pump 5", At(0));
             c.Handle("set nope 50", At(0));
             Check(c.Tick(At(1), 50, 50) == null, "controller: a normal tick keeps running");
-            Check(D(io, "fan") == 20, "controller: requested 5 % -> 20 % on a fan");
-            Check(D(io, "pump") == 50, "controller: requested 5 % -> 50 % on a pump");
+            Check(D(io, "fan") == 5, "controller: requested 5 % -> 5 % on a fan");
+            Check(D(io, "pump") == 5, "controller: requested 5 % -> 5 % on a pump");
             Check(c.Message == "not controllable: nope" && c.MessageSeq == 1, "controller: an unknown fan is refused with a notice");
             Check(c.Tick(At(2), 50, 50) == null && c.MessageSeq == 1 && c.Message != "", "controller: the notice stays (not cleared every tick)");
             c.Handle("pump fan 1", At(2));
             c.Handle("pump pump 0", At(2));
             c.Tick(At(3), 50, 50);
-            Check(D(io, "fan") == 50 && D(io, "pump") == 20, "controller: pump ticks move the floor both ways");
+            Check(D(io, "fan") == 5 && D(io, "pump") == 5, "controller: marking a fan as a pump does not raise its speed");
             c.Handle("pump fan 0", At(3));
             c.Handle("pump pump 1", At(3));
             c.Handle("set fan 40", At(3));
@@ -841,6 +925,7 @@ namespace PCTunerFan
             c.Handle("curve other cpu 28:82,28:54", At(6));
             c.Tick(At(7), 20, 50);
             Check(D(io, "other") == 82 && c.HasCurve("other"), "controller: a curve drives its fan");
+            TriggerTests(Check, t0);
 
             // blind: no temperature for more than 5 s -> BIOS, settings kept, back when temperatures return
             c.Handle("ping", At(8));

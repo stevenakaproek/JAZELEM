@@ -1,6 +1,6 @@
 //! Services tab - port of ServiceManager.ps1.
 //! Change service startup types with full undo, gaming-dependency warnings, locked core services,
-//! Safe / Safe + Optional presets. History lives in %LOCALAPPDATA%\PCTuner\services-history.json
+//! safe-to-change services (the Safe + Optional lists) shown in green with a suggested type. History lives in %LOCALAPPDATA%\PCTuner\services-history.json
 //! (imported once from the PowerShell tool's %LOCALAPPDATA%\ServiceManager\history.json).
 
 use crate::common::{self, Job, Tab};
@@ -443,6 +443,7 @@ fn preset_plan(include_optional: bool) -> Vec<(String, String)> {
 /// The preset plan as it is applied and counted on the hero chip. Optional overrides Safe, so the
 /// Safe preset leaves a service alone when it is already at its Safe + Optional target (e.g.
 /// PcaSvc Disabled) - applying Safe never reverts an Optional choice.
+#[cfg(test)]
 fn live_preset_plan(b: &dyn Backend, include_optional: bool) -> Vec<(String, String)> {
     let plan = preset_plan(include_optional);
     if include_optional {
@@ -717,6 +718,12 @@ fn preset_window(include_optional: bool, work: &[Work]) -> OpWindow {
     win
 }
 
+/// Services that are safe to change, with the startup type suggested for each (the Safe + Optional
+/// lists; never a gaming or core service). Keyed by lower-case service name. Shown in green.
+fn suggestions() -> HashMap<String, String> {
+    preset_plan(true).into_iter().map(|(n, t)| (n.to_lowercase(), t)).collect()
+}
+
 /// Preview for reverting history entries (already sorted newest first).
 /// `picked` = the history indices the user chose; other entries are newer changes pulled in by undo_chain.
 fn undo_window(entries: &[(usize, HistEntry)], picked: &[usize]) -> OpWindow {
@@ -790,8 +797,6 @@ enum JobResult {
 
 struct Loaded {
     list: Vec<Svc>,
-    /// Changes the Safe preset would still make.
-    safe_pending: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -801,6 +806,7 @@ enum SortCol {
     Startup,
     Status,
     Note,
+    Suggested,
 }
 
 const ROW_H: f32 = 27.0;
@@ -810,8 +816,9 @@ pub struct ServicesTab {
     list: Vec<Svc>,
     load_job: Option<Job<Result<Loaded, String>>>,
     load_error: Option<String>,
-    safe_pending: Option<usize>,
     selected: HashSet<String>,
+    /// Safe-to-change services and their suggested startup type (lower-case name -> type), shown green.
+    suggest: HashMap<String, String>,
     search: String,
     running_only: bool,
     hide_locked: bool,
@@ -851,8 +858,8 @@ impl ServicesTab {
             list: vec![],
             load_job: None,
             load_error: None,
-            safe_pending: None,
             selected: HashSet::new(),
+            suggest: suggestions(),
             search: String::new(),
             running_only: false,
             hide_locked: false,
@@ -874,7 +881,7 @@ impl ServicesTab {
     fn start_load(&mut self) {
         self.load_job = Some(Job::spawn(|| {
             let list = load_services()?;
-            Ok(Loaded { list, safe_pending: pending_plan(&System, &live_preset_plan(&System, false)).len() })
+            Ok(Loaded { list })
         }));
     }
 
@@ -901,6 +908,11 @@ impl ServicesTab {
                 SortCol::Startup => a.start.cmp(&b.start),
                 SortCol::Status => a.state.cmp(&b.state),
                 SortCol::Note => a.note.cmp(b.note),
+                // safe-to-change services first, grouped by the suggested type
+                SortCol::Suggested => {
+                    let key = |s: &Svc| self.suggest.get(&s.name_lc).map(|t| (0, t.as_str())).unwrap_or((1, ""));
+                    key(a).cmp(&key(b))
+                }
             }
             .then_with(|| a.display_lc.cmp(&b.display_lc));
             if self.sort_asc { o } else { o.reverse() }
@@ -937,12 +949,8 @@ impl ServicesTab {
         self.open_op(win, OpKind::Apply { plan, verb: format!("set to {ty}"), preset: None });
     }
 
-    fn request_preset(&mut self, include_optional: bool) {
-        let name = preset_name(include_optional);
-        let plan = live_preset_plan(&System, include_optional);
-        let work = pending_plan(&System, &plan);
-        let win = preset_window(include_optional, &work);
-        self.open_op(win, OpKind::Apply { plan, verb: format!("changed by {name} preset"), preset: Some(name) });
+    fn clear_selection(&mut self) {
+        self.selected.clear();
     }
 
     fn start_apply(&mut self, plan: Vec<(String, String)>, verb: String, preset: Option<&'static str>) {
@@ -1024,6 +1032,9 @@ impl ServicesTab {
                     self.history.extend(o.entries);
                     common::save_json(HISTORY, &self.history);
                     self.start_load();
+                    if preset.is_some() && ok > 0 {
+                        self.clear_selection();
+                    }
                     let mut summary = format!("{ok} {verb}");
                     if o.skipped > 0 {
                         summary += &format!(", {} already set", o.skipped);
@@ -1108,9 +1119,10 @@ impl ServicesTab {
             .max_scroll_height(avail)
             .auto_shrink([false, false])
             .column(Column::initial(190.0).at_least(60.0).clip(true))
-            .column(Column::initial(310.0).at_least(80.0).clip(true))
+            .column(Column::initial(290.0).at_least(80.0).clip(true))
             .column(Column::initial(150.0).at_least(60.0).clip(true))
             .column(Column::initial(90.0).at_least(50.0).clip(true))
+            .column(Column::initial(150.0).at_least(60.0).clip(true))
             .column(Column::remainder().at_least(60.0).clip(true))
             .header(HEADER_H, |mut header| {
                 for (col, label) in [
@@ -1119,6 +1131,7 @@ impl ServicesTab {
                     (SortCol::Startup, "Startup"),
                     (SortCol::Status, "Status"),
                     (SortCol::Note, "Note"),
+                    (SortCol::Suggested, "Suggested"),
                 ] {
                     header.col(|ui| {
                         let active = sort == col;
@@ -1140,9 +1153,12 @@ impl ServicesTab {
                 body.rows(ROW_H, rows.len(), |mut row| {
                     let s = &self.list[rows[row.index()]];
                     row.set_selected(self.selected.contains(&s.name));
+                    // green: safe to change (Safe + Optional lists), with the suggested type in the last column
+                    let suggested = self.suggest.get(&s.name_lc);
                     let c = match s.note {
                         NOTE_GAMING => Some(theme::GAMING),
                         NOTE_LOCKED => Some(theme::LOCKED),
+                        _ if suggested.is_some() => Some(theme::OK),
                         _ if s.start == "Disabled" => Some(theme::DIM),
                         _ => None,
                     };
@@ -1159,6 +1175,13 @@ impl ServicesTab {
                     row.col(|ui| cell(ui, &s.start, start_c));
                     row.col(|ui| cell(ui, &s.state, c.or(if s.state == "Running" { None } else { Some(theme::TEXT_DIM) })));
                     row.col(|ui| cell(ui, s.note, c));
+                    // the suggested startup type; "done" when the service is already set that way
+                    let txt = match suggested {
+                        Some(t) if *t == s.start => format!("{t} ✔"),
+                        Some(t) => t.clone(),
+                        None => String::new(),
+                    };
+                    row.col(|ui| cell(ui, &txt, suggested.map(|_| theme::OK)));
                     if row.response().clicked() {
                         toggled = Some(s.name.clone());
                     }
@@ -1344,7 +1367,6 @@ impl Tab for ServicesTab {
             match r {
                 Ok(l) => {
                     self.list = l.list;
-                    self.safe_pending = Some(l.safe_pending);
                     self.load_error = None;
                 }
                 Err(e) => self.load_error = Some(e),
@@ -1408,10 +1430,16 @@ impl Tab for ServicesTab {
                 theme::stat(ui, &self.list.len().to_string(), "total", theme::TEXT);
                 ui.add_space(22.0);
                 theme::stat(ui, &undoable.to_string(), "changes that can be undone", if undoable > 0 { theme::TEXT } else { theme::DIM });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match self.safe_pending {
-                    None => chip(ui, "Safe preset: checking...", theme::DIM),
-                    Some(0) => chip(ui, "Safe preset: applied", theme::OK),
-                    Some(n) => chip(ui, &format!("Safe preset: {n} pending"), theme::JUNK),
+                // safe-to-change services (green) that are not yet at their suggested type
+                let open = self.list.iter().filter(|s| self.suggest.get(&s.name_lc).is_some_and(|t| *t != s.start)).count();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.list.is_empty() {
+                        chip(ui, "Checking...", theme::DIM);
+                    } else if open == 0 {
+                        chip(ui, "Every green service is at its suggested type", theme::OK);
+                    } else {
+                        chip(ui, &format!("{open} green services not at their suggested type"), theme::OK);
+                    }
                 });
             });
         });
@@ -1445,7 +1473,7 @@ impl Tab for ServicesTab {
                         self.request_change("Automatic");
                     }
                     if total > 0 && ui.button("Clear").on_hover_text("Clear the selection.").clicked() {
-                        self.selected.clear();
+                        self.clear_selection();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let has_undo = self.history.iter().any(|h| !h.undone);
@@ -1458,6 +1486,7 @@ impl Tab for ServicesTab {
                     });
                 });
                 ui.horizontal(|ui| {
+                    legend(ui, theme::OK, "Safe to change (see Suggested)");
                     legend(ui, theme::GAMING, "Gaming dependency");
                     legend(ui, theme::LOCKED, "Locked core service");
                     legend(ui, theme::DIM, "Disabled");
@@ -1481,28 +1510,12 @@ impl Tab for ServicesTab {
         theme::card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let w = (ui.available_width() - 560.0).clamp(130.0, 260.0);
+                let w = (ui.available_width() - 680.0).clamp(130.0, 260.0);
                 ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search services").desired_width(w));
                 ui.scope(|ui| {
                     outline_checks(ui);
                     ui.checkbox(&mut self.running_only, "Running only");
                     ui.checkbox(&mut self.hide_locked, "Hide locked").on_hover_text("Hide core Windows services (they cannot be changed).");
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(can, egui::Button::new("Safe + Optional"))
-                        .on_hover_text("Safe preset plus: Windows Search, SysMain, file sharing, diagnostics, Windows AI, Phone Link, Logitech RGB, smart card / biometrics.")
-                        .clicked()
-                    {
-                        self.request_preset(true);
-                    }
-                    if ui
-                        .add_enabled(can, theme::primary_button("Apply Safe preset"))
-                        .on_hover_text("Telemetry, printing, remote desktop host, unused networking and consumer extras. No gaming impact.")
-                        .clicked()
-                    {
-                        self.request_preset(false);
-                    }
                 });
             });
             ui.add_space(2.0);
@@ -1572,6 +1585,17 @@ mod tests {
         assert!(get(&safe, "WSearch").is_none());
         assert!(opt.iter().all(|(n, _)| !matches!(note_for(n), NOTE_GAMING | NOTE_LOCKED)));
         println!("safe preset: {} entries, safe+optional: {} entries", safe.len(), opt.len());
+    }
+
+    #[test]
+    fn services_green_suggestions() {
+        // green = Safe + Optional, keyed by lower-case name; Optional wins over Safe; never gaming / core
+        let s = suggestions();
+        assert_eq!(s.get("diagtrack").map(String::as_str), Some("Disabled"));
+        assert_eq!(s.get("pcasvc").map(String::as_str), Some("Disabled"));
+        assert!(s.contains_key("wsearch"), "Optional services are green too");
+        assert!(!s.contains_key("rpcss"), "a locked core service is never green");
+        assert!(s.keys().all(|n| !matches!(note_for(n), NOTE_GAMING | NOTE_LOCKED)));
     }
 
     #[test]
