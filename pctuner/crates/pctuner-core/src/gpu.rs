@@ -267,6 +267,13 @@ pub struct Live {
     /// the offsets the driver reports right now (core MHz, NVML memory value)
     pub core_ofs: i32,
     pub mem_ofs_raw: i32,
+    /// core voltage, mV (None when the driver does not say)
+    pub volt_mv: Option<f64>,
+    /// video memory in use / installed, MB
+    pub vram_used_mb: i64,
+    pub vram_total_mb: i64,
+    /// GPU fan speed, %
+    pub fan_pct: i64,
 }
 
 /// One reading through the NVIDIA driver; None when it cannot be read.
@@ -288,6 +295,10 @@ pub fn gpu_live() -> Option<Live> {
         full_clocks: r.pstate == 0,
         core_ofs,
         mem_ofs_raw,
+        volt_mv: crate::nvapi::core_voltage().map(f64::from),
+        vram_used_mb: r.vram_used_mb as i64,
+        vram_total_mb: r.vram_total_mb as i64,
+        fan_pct: r.fan_pct as i64,
     })
 }
 
@@ -313,6 +324,8 @@ pub struct State {
     pub error: Option<String>,
     pub ab_running: bool,
     pub ab_autostart: bool,
+    /// the power limit the card has right now, % of its default
+    pub power_pct: Option<u32>,
 }
 
 pub fn card_limits(saved: &Saved) -> Result<Limits, String> {
@@ -334,6 +347,7 @@ pub fn current_state() -> State {
         saved,
         ab_running: ab_running(),
         ab_autostart: ab_autostart(),
+        power_pct: power_now_pct(),
     }
 }
 
@@ -648,7 +662,9 @@ pub fn unregister_task() -> Result<(), String> {
 
 /// Does the sign-in task have work: a saved tune other than Stock to set again, or an armed trial?
 pub fn task_needed(saved: &Saved, trial: Option<&Trial>) -> bool {
-    trial.map(|t| t.armed()).unwrap_or(false) || tune_index(&saved.applied).is_some_and(|i| i != 0)
+    trial.map(|t| t.armed()).unwrap_or(false)
+        || tune_index(&saved.applied).is_some_and(|i| i != 0)
+        || saved.tuning.is_some_and(|t| t.power != 100)
 }
 
 /// Register or remove the sign-in task to match what is saved now.
@@ -728,6 +744,34 @@ pub fn revert_outcome(t: &Trial, crash_text: String, applied: Applied, fallback_
     }
 }
 
+/// Set only the power limit (a percentage of the card's default), keeping the tune that is on. It is saved
+/// with the tune, so the sign-in task sets it again after a restart. Runs in a Job; administrator.
+pub fn set_power_only(pct: u32) -> Result<(), String> {
+    let g = nvml::Gpu::open()?;
+    let (lo, hi, def, _) = g.power_limits()?;
+    let watts = (def * pct / 100).clamp(lo, hi);
+    g.set_power_limit(watts)?;
+    let mut s = load_saved();
+    let mut t = s.tuning.unwrap_or(STOCK);
+    t.power = pct;
+    s.tuning = Some(t);
+    if s.applied.is_empty() {
+        s.applied = PRESETS[0].name.to_string();
+    }
+    if s.applied == CUSTOM_NAME {
+        s.custom = Some(t);
+    }
+    common::save_json(SAVED_FILE, &s);
+    sync_task().map(|_| ())
+}
+
+/// The power limit the card has right now, as a percentage of its default.
+pub fn power_now_pct() -> Option<u32> {
+    let g = nvml::Gpu::open().ok()?;
+    let (_, _, def, cur) = g.power_limits().ok()?;
+    (def > 0).then(|| ((cur as f64 / def as f64) * 100.0).round() as u32)
+}
+
 fn save_applied(name: &str, t: Tuning, custom: bool) {
     let mut s = load_saved();
     s.applied = name.to_string();
@@ -798,7 +842,7 @@ pub fn guard_main(dry_run: bool) -> i32 {
     // no crash to deal with: set the saved tune again (the driver forgets it at every restart)
     let saved = load_saved();
     match (tune_index(&saved.applied), saved.tuning) {
-        (Some(i), Some(t)) if i != 0 => {
+        (Some(i), Some(t)) if i != 0 || t.power != 100 => {
             guard_log(&format!("[{mode}] setting {} again: {}", saved.applied, t.describe()));
             if dry_run {
                 return 0;
@@ -1244,6 +1288,17 @@ impl Gpu {
                 self.next_refresh = Instant::now();
             }
         }
+    }
+
+    /// The power slider: set only the power limit (percent of the default), in the background.
+    pub fn set_power(&mut self, pct: u32) {
+        let Some(l) = self.state.as_ref().and_then(|s| s.limits) else { return };
+        if !self.can_act() || self.chore.is_some() {
+            return;
+        }
+        let pct = pct.clamp(l.power.0, l.power.1);
+        self.status = format!("Power limit set to {pct} % ({} W).", l.power_default_w * pct / 100);
+        self.chore = Some(Job::spawn(move || set_power_only(pct).map_err(|e| format!("The power limit could not be set:\n{e}"))));
     }
 
     /// Change one custom value (kept inside the card's limits).

@@ -21,6 +21,8 @@ enum Action {
     Select { index: usize },
     /// A custom value was changed.
     Custom { field: Field, value: i64 },
+    /// The power slider was let go: set only the power limit.
+    Power { pct: u32 },
     /// "OK" in the message window.
     DismissError,
     Op { ev: OpEvent },
@@ -70,17 +72,21 @@ impl GpuTab {
             chips.push(json!({ "text": format!("Memory {} MHz ({:+} over stock {})", l.mem, l.mem_offset, l.mem_stock), "tone": pctuner_core::common::Tone::Dim }));
         }
         let series = |f: &dyn Fn(&Live) -> f64| -> Vec<f64> { self.g.history.iter().map(f).collect() };
+        // every reading the page can show as a tile (the page keeps which ones and their order)
         let live = live.map(|l| {
-            json!({
-                "core": l.core,
-                "temp": l.temp,
-                "power": l.power,
-                "util": l.util,
-                "coreHist": series(&|l| l.core as f64),
-                "tempHist": series(&|l| l.temp as f64),
-                "powerHist": series(&|l| l.power),
-                "utilHist": series(&|l| l.util as f64),
-            })
+            let tile = |key: &str, label: &str, unit: &str, value: Option<f64>, sub: Option<String>, f: &dyn Fn(&Live) -> f64| {
+                json!({ "key": key, "label": label, "unit": unit, "value": value, "sub": sub, "hist": series(f) })
+            };
+            json!([
+                tile("core", "Core clock", "MHz", Some(l.core as f64), None, &|l| l.core as f64),
+                tile("temp", "Temperature", "°C", Some(l.temp as f64), None, &|l| l.temp as f64),
+                tile("power", "Power draw", "W", Some(l.power), None, &|l| l.power),
+                tile("util", "GPU load", "%", Some(l.util as f64), None, &|l| l.util as f64),
+                tile("volt", "Core voltage", "mV", l.volt_mv, None, &|l| l.volt_mv.unwrap_or(0.0)),
+                tile("vram", "Memory used", "MB", Some(l.vram_used_mb as f64), (l.vram_total_mb > 0).then(|| format!("of {} MB", l.vram_total_mb)), &|l| l.vram_used_mb as f64),
+                tile("memclock", "Memory clock", "MHz", Some(l.mem as f64), None, &|l| l.mem as f64),
+                tile("fan", "Fan speed", "%", Some(l.fan_pct as f64), None, &|l| l.fan_pct as f64),
+            ])
         });
         json!({ "name": name, "unit": unit, "caption": caption, "tone": tone, "chips": chips, "error": s.error, "live": live })
     }
@@ -162,6 +168,13 @@ impl Backend for GpuTab {
             "custom": self.custom(),
             "customSelected": g.selected == Some(CUSTOM),
             "customCurrent": current == Some(CUSTOM),
+            "power": st.and_then(|s| s.limits.map(|l| json!({
+                "pct": s.power_pct.unwrap_or(100),
+                "min": l.power.0,
+                "max": l.power.1,
+                "defaultW": l.power_default_w,
+                "can": g.can_act() && g.chore.is_none(),
+            }))),
             "afterburner": {
                 "running": st.map(|s| s.ab_running).unwrap_or(false),
                 "autostart": st.map(|s| s.ab_autostart).unwrap_or(false),
@@ -209,6 +222,11 @@ impl Backend for GpuTab {
             Action::Custom { field, value } => {
                 if !self.g.busy() {
                     self.g.set_custom(field, value);
+                }
+            }
+            Action::Power { pct } => {
+                if !self.g.busy() {
+                    self.g.set_power(pct);
                 }
             }
             Action::DismissError => self.g.error = None,

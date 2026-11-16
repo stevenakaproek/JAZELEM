@@ -1,9 +1,9 @@
 // RTX 5080 Profiles: which tune is applied right now (with live graphs), the four presets, custom values and
 // the safety trial. Everything is set straight through the NVIDIA driver - no MSI Afterburner needed.
-import { RefreshCw, RotateCcw, SlidersHorizontal, X } from "lucide-react";
+import { Plus, RefreshCw, RotateCcw, SlidersHorizontal, X } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import { OpSheet } from "../components/OpSheet";
-import { Badge, Banner, Button, ErrorState, Group, Hero, LoadingState, NumberField, Page, Sheet, Slider, Sparkline, Spinner, Stat, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
+import { Badge, Banner, Button, ContextMenu, ErrorState, Group, Hero, LoadingState, NumberField, Page, Sheet, Slider, Sparkline, Spinner, Stat, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow, Tone } from "../lib/types";
 import { useTab } from "../lib/useTab";
@@ -16,15 +16,15 @@ export type GpuTrial =
   | { kind: "pending"; preset: string; previous: string; appliedAt: string; unguarded: boolean; canKeep: boolean; canRevert: boolean }
   | { kind: "reverted"; preset: string; text: string; reason: string; lastError: string };
 
-export interface GpuLive {
-  core: number;
-  temp: number;
-  power: number;
-  util: number;
-  coreHist: number[];
-  tempHist: number[];
-  powerHist: number[];
-  utilHist: number[];
+/** One live reading, shown as a tile (the page keeps which ones and their order). */
+export interface GpuTile {
+  key: string;
+  label: string;
+  unit: string;
+  value: number | null;
+  /** "of 16303 MB" */
+  sub: string | null;
+  hist: number[];
 }
 
 export interface GpuHero {
@@ -35,7 +35,7 @@ export interface GpuHero {
   chips: { text: string; tone: Tone }[];
   /** the NVIDIA driver could not be read */
   error: string | null;
-  live: GpuLive | null;
+  live: GpuTile[] | null;
 }
 
 export interface GpuPreset {
@@ -68,6 +68,8 @@ export interface View {
   custom: GpuCustom | null;
   customSelected: boolean;
   customCurrent: boolean;
+  /** the power slider (null until the card has been read) */
+  power: { pct: number; min: number; max: number; defaultW: number; can: boolean } | null;
   afterburner: { running: boolean; autostart: boolean; canClose: boolean };
   applyLabel: string;
   canApply: boolean;
@@ -83,6 +85,7 @@ export type Action =
   | { kind: "click"; click: GpuClick }
   | { kind: "select"; index: number }
   | { kind: "custom"; field: GpuField; value: number }
+  | { kind: "power"; pct: number }
   | { kind: "dismiss_error" }
   | { kind: "op"; ev: OpEvent };
 
@@ -131,11 +134,115 @@ function TrialNotice({ t, act }: { t: GpuTrial; act: Act }) {
   );
 }
 
-function Tile({ value, unit, label, series }: { value: number; unit: string; label: string; series: number[] }) {
+const TILE_KEY = "pctuner.gpu.tiles";
+const DEFAULT_TILES = ["core", "temp", "power", "util", "volt", "vram"];
+
+function loadTiles(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(TILE_KEY) ?? "null");
+    if (Array.isArray(v) && v.every((x) => typeof x === "string")) return v;
+  } catch {
+    // no saved layout (or storage blocked): the default
+  }
+  return DEFAULT_TILES;
+}
+
+function saveTiles(keys: string[]) {
+  try {
+    localStorage.setItem(TILE_KEY, JSON.stringify(keys));
+  } catch {
+    // the layout just is not remembered
+  }
+}
+
+/** Live readings as tiles: drag a tile to move it, the cross removes it, "Add" brings one back. */
+function TelemetryTiles({ tiles }: { tiles: GpuTile[] }) {
+  const [order, setOrder] = useState<string[]>(loadTiles);
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [over, setOver] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const byKey = new Map(tiles.map((t) => [t.key, t]));
+  const shown = order.filter((k) => byKey.has(k));
+  const hidden = tiles.filter((t) => !shown.includes(t.key));
+  const update = (next: string[]) => {
+    setOrder(next);
+    saveTiles(next);
+  };
+  const moveTo = (key: string, target: string) => {
+    if (key === target) return;
+    const next = shown.filter((k) => k !== key);
+    next.splice(next.indexOf(target), 0, key);
+    update(next);
+  };
   return (
-    <div>
-      <Stat value={value.toFixed(0)} unit={unit} label={label} />
-      <Sparkline values={series} />
+    <div className="gpu-tiles" onDragEnd={() => (setDragging(null), setOver(null))}>
+      {shown.map((k) => {
+        const t = byKey.get(k)!;
+        return (
+          <div
+            key={k}
+            className={cx("gpu-tile", dragging === k && "dragging", over === k && dragging !== k && "drop-target")}
+            draggable
+            title="Drag to move"
+            onDragStart={(e) => {
+              setDragging(k);
+              e.dataTransfer.effectAllowed = "move";
+              e.dataTransfer.setData("text/plain", k);
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setOver(k);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              const from = e.dataTransfer.getData("text/plain") || dragging;
+              if (from) moveTo(from, k);
+              setDragging(null);
+              setOver(null);
+            }}
+          >
+            <button type="button" className="gpu-tile-remove" title={`Remove ${t.label}`} aria-label={`Remove ${t.label}`} onClick={() => update(shown.filter((x) => x !== k))}>
+              <X size={12} />
+            </button>
+            <Stat value={t.value === null ? "-" : t.value.toFixed(0)} unit={t.unit} label={t.sub ? `${t.label} ${t.sub}` : t.label} />
+            <Sparkline values={t.hist} />
+          </div>
+        );
+      })}
+      {hidden.length > 0 && (
+        <button type="button" className="gpu-tile gpu-tile-add" onClick={(e) => setMenu({ x: e.clientX, y: e.clientY })}>
+          <Plus size={16} />
+          Add reading
+        </button>
+      )}
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={hidden.map((t) => ({ label: t.label, onClick: () => update([...shown, t.key]) }))} onClose={() => setMenu(null)} />}
+    </div>
+  );
+}
+
+/** Power limit, on its own: set at once for whatever tune is on, and kept after restarts. */
+function PowerSlider({ p, act }: { p: NonNullable<View["power"]>; act: Act }) {
+  const [v, setV] = useState(p.pct);
+  useEffect(() => setV(p.pct), [p.pct]);
+  const watts = Math.round((p.defaultW * v) / 100);
+  return (
+    <div className="gpu-power">
+      <div className="hstack" style={{ gap: 8 }}>
+        <span className="gpu-power-label">Power limit</span>
+        <span className="gpu-power-value">
+          {v} % <span className="secondary">({watts} W)</span>
+        </span>
+        <span className="spacer" />
+        {v !== 100 && (
+          <Button variant="plain" disabled={!p.can} onClick={() => act({ kind: "power", pct: 100 })}>
+            Default (100 %)
+          </Button>
+        )}
+      </div>
+      <Slider label="Power limit" value={v} min={p.min} max={p.max} disabled={!p.can} onChange={setV} onCommit={(x) => x !== p.pct && act({ kind: "power", pct: x })} />
+      <div className="tertiary gpu-small">
+        {p.min} % - {p.max} % of the card's {p.defaultW} W. Set at once for the tune that is on and kept after restarts; applying a preset sets its own power limit.
+      </div>
     </div>
   );
 }
@@ -170,14 +277,8 @@ function HeroCard({ view, act }: { view: View; act: Act }) {
           ))}
         </div>
         {h.error && <Banner kind="error">{h.error}</Banner>}
-        {h.live && (
-          <div className="gpu-tiles">
-            <Tile value={h.live.core} unit="MHz" label="Core clock" series={h.live.coreHist} />
-            <Tile value={h.live.temp} unit="°C" label="Temperature" series={h.live.tempHist} />
-            <Tile value={h.live.power} unit="W" label="Power draw" series={h.live.powerHist} />
-            <Tile value={h.live.util} unit="%" label="GPU load" series={h.live.utilHist} />
-          </div>
-        )}
+        {h.live && <TelemetryTiles tiles={h.live} />}
+        {view.power && <PowerSlider p={view.power} act={act} />}
       </div>
     </Group>
   );

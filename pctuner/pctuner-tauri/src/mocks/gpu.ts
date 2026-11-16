@@ -1,4 +1,4 @@
-import type { Action, GpuCustom, GpuLive, GpuTrial, View } from "../tabs/Gpu";
+import type { Action, GpuCustom, GpuTile, GpuTrial, View } from "../tabs/Gpu";
 import { mockAdmin, mockParams } from "./env";
 import { MockOp, makeOp, opItem } from "./op";
 import type { MockTab } from "./types";
@@ -29,20 +29,32 @@ let trial: { preset: string; previous: string; status: "pending" | "reverted" } 
 if (trial?.status === "pending") current = 5;
 if (trial?.status === "reverted") current = 0;
 
-const hist: { core: number; temp: number; power: number; util: number }[] = [];
+type Sample = { core: number; temp: number; power: number; util: number; volt: number; vram: number; memclock: number; fan: number };
+const hist: Sample[] = [];
 let t = 0;
 function sample() {
   t += 1;
   const wave = Math.sin(t / 7);
-  hist.push({ core: 2790 + Math.round(wave * 12), temp: 61 + Math.round(wave * 3), power: 232 + wave * 18, util: 93 + Math.round(wave * 5) });
+  hist.push({ core: 2790 + Math.round(wave * 12), temp: 61 + Math.round(wave * 3), power: 232 + wave * 18, util: 93 + Math.round(wave * 5), volt: 925 + Math.round(wave * 5), vram: 9800 + Math.round(wave * 300), memclock: 15001, fan: 48 + Math.round(wave * 3) });
   if (hist.length > 60) hist.shift();
 }
 for (let i = 0; i < 40; i++) sample();
 
-function live(): GpuLive {
+function live(): GpuTile[] {
   const l = hist[hist.length - 1];
-  return { ...l, coreHist: hist.map((h) => h.core), tempHist: hist.map((h) => h.temp), powerHist: hist.map((h) => h.power), utilHist: hist.map((h) => h.util) };
+  const tile = (key: keyof Sample, label: string, unit: string, sub: string | null = null): GpuTile => ({ key, label, unit, value: l[key], sub, hist: hist.map((h) => h[key]) });
+  return [
+    tile("core", "Core clock", "MHz"),
+    tile("temp", "Temperature", "°C"),
+    tile("power", "Power draw", "W"),
+    tile("util", "GPU load", "%"),
+    tile("volt", "Core voltage", "mV"),
+    tile("vram", "Memory used", "MB", "of 16303 MB"),
+    tile("memclock", "Memory clock", "MHz"),
+    tile("fan", "Fan speed", "%"),
+  ];
 }
+let powerPct = 100;
 
 function tuning(i: number) {
   return i === CUSTOM ? { max: custom.maxMhz, core: custom.core, mem: custom.mem, power: custom.power } : { ...PRESETS[i] };
@@ -145,6 +157,7 @@ export const gpu: MockTab<View, Action> = {
       custom: noDriver ? null : customView(),
       customSelected: selected === CUSTOM,
       customCurrent: current === CUSTOM,
+      power: noDriver ? null : { pct: powerPct, min: 70, max: 125, defaultW: 360, can: mockAdmin && !busy },
       afterburner: { running: state === "afterburner", autostart: state === "afterburner", canClose: true },
       applyLabel: selected === null ? "Apply preset" : `Apply ${name(selected)}`,
       canApply: !busy && selected !== null && !noDriver,
@@ -160,6 +173,10 @@ export const gpu: MockTab<View, Action> = {
     switch (a.kind) {
       case "select":
         selected = a.index;
+        break;
+      case "power":
+        powerPct = Math.min(125, Math.max(70, a.pct));
+        status = `Power limit set to ${powerPct} % (${Math.round((360 * powerPct) / 100)} W).`;
         break;
       case "custom": {
         const l = customView().limits;

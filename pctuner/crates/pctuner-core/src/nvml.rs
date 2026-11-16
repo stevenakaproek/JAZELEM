@@ -53,6 +53,17 @@ struct Api {
     temperature: unsafe extern "C" fn(Dev, c_uint, *mut c_uint) -> Ret,
     pstate: unsafe extern "C" fn(Dev, *mut c_uint) -> Ret,
     utilization: unsafe extern "C" fn(Dev, *mut Utilization) -> Ret,
+    memory: unsafe extern "C" fn(Dev, *mut Memory) -> Ret,
+    fan_speed: unsafe extern "C" fn(Dev, *mut c_uint) -> Ret,
+}
+
+/// nvmlMemory_t (v1): bytes.
+#[repr(C)]
+#[derive(Default)]
+struct Memory {
+    total: u64,
+    free: u64,
+    used: u64,
 }
 
 // the function pointers come from a library that stays loaded for the life of the process
@@ -108,6 +119,8 @@ fn load() -> Result<Api, String> {
         temperature: f!("nvmlDeviceGetTemperature"),
         pstate: f!("nvmlDeviceGetPerformanceState"),
         utilization: f!("nvmlDeviceGetUtilizationRates"),
+        memory: f!("nvmlDeviceGetMemoryInfo"),
+        fan_speed: f!("nvmlDeviceGetFanSpeed"),
     };
     let r = unsafe { init() };
     if r != NVML_SUCCESS {
@@ -163,6 +176,11 @@ pub struct Reading {
     pub temp_c: u32,
     pub pstate: u32,
     pub util: u32,
+    /// video memory in use / installed, MiB
+    pub vram_used_mb: u32,
+    pub vram_total_mb: u32,
+    /// fan speed, % of maximum (0 when the fans are stopped or it cannot be read)
+    pub fan_pct: u32,
 }
 
 impl Gpu {
@@ -252,6 +270,12 @@ impl Gpu {
         let _ = self.call("", |a, d| unsafe { (a.temperature)(d, 0, &mut r.temp_c) });
         let _ = self.call("", |a, d| unsafe { (a.pstate)(d, &mut r.pstate) });
         let _ = self.call("", |a, d| unsafe { (a.utilization)(d, &mut u) });
+        let mut m = Memory::default();
+        if self.call("", |a, d| unsafe { (a.memory)(d, &mut m) }).is_ok() {
+            r.vram_used_mb = (m.used / (1024 * 1024)) as u32;
+            r.vram_total_mb = (m.total / (1024 * 1024)) as u32;
+        }
+        let _ = self.call("", |a, d| unsafe { (a.fan_speed)(d, &mut r.fan_pct) });
         r.power_w = mw as f32 / 1000.0;
         r.util = u.gpu;
         r

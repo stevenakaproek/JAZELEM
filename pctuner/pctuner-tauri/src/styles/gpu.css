@@ -67,3 +67,82 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* live reading tiles: drag to reorder, cross to remove, "Add reading" */
+.gpu-tile {
+  position: relative;
+  padding: var(--s2);
+  border-radius: var(--r-md);
+  cursor: grab;
+  transition: background var(--t-fast) var(--ease-out), box-shadow var(--t-fast) var(--ease-out), opacity var(--t-fast);
+}
+.gpu-tile:hover {
+  background: var(--fill-control);
+}
+.gpu-tile.dragging {
+  opacity: 0.4;
+}
+.gpu-tile.drop-target {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+.gpu-tile-remove {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--bg-elevated-3);
+  color: var(--text-secondary);
+  opacity: 0;
+  cursor: pointer;
+}
+.gpu-tile:hover .gpu-tile-remove,
+.gpu-tile-remove:focus-visible {
+  opacity: 1;
+}
+.gpu-tile-remove:hover {
+  color: var(--text);
+}
+.gpu-tile-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 90px;
+  border: 1px dashed var(--separator);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+}
+.gpu-tile-add:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.gpu-power {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  padding-top: var(--s3);
+  border-top: 0.5px solid var(--separator);
+}
+.gpu-power .slider {
+  width: 100%;
+}
+.gpu-power-label {
+  font-weight: 600;
+}
+.gpu-power-value {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+@media (prefers-reduced-motion: reduce) {
+  .gpu-tile {
+    transition: none;
+  }
+}

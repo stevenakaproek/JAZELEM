@@ -54,6 +54,67 @@ pub fn clock_at(curve: &[VfPoint], mv: f32) -> Option<VfPoint> {
     curve.iter().find(|p| p.mv >= mv).copied()
 }
 
+const ID_CURRENT_VOLTAGE: u32 = 0x465F_9BCF;
+/// NV_GPU_VOLT_STATUS (version 1, 76 bytes): version, flags, 8 reserved, value in µV, 8 reserved
+/// (offset checked on this RTX 5080: 895 mV at idle).
+const VOLT_SIZE: usize = 0x4C;
+const VOLT_AT: usize = 8 + 32;
+
+/// The core voltage in mV from a raw NV_GPU_VOLT_STATUS answer (None when it does not look like one).
+pub fn parse_voltage(buf: &[u8]) -> Option<f32> {
+    let uv = u32::from_le_bytes(buf.get(VOLT_AT..VOLT_AT + 4)?.try_into().ok()?);
+    let mv = uv as f32 / 1000.0;
+    (300.0..=1500.0).contains(&mv).then_some(mv)
+}
+
+struct Volt {
+    handle: *mut c_void,
+    get: unsafe extern "C" fn(*mut c_void, *mut u8) -> i32,
+}
+unsafe impl Send for Volt {}
+unsafe impl Sync for Volt {}
+
+static VOLT: std::sync::OnceLock<Option<Volt>> = std::sync::OnceLock::new();
+
+/// The first NVIDIA card's core voltage right now, in mV. Read-only; None when the driver does not say.
+pub fn core_voltage() -> Option<f32> {
+    let v = VOLT
+        .get_or_init(|| {
+            use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+            let name: Vec<u16> = "nvapi64.dll".encode_utf16().chain(Some(0)).collect();
+            let lib = unsafe { LoadLibraryW(name.as_ptr()) };
+            if lib.is_null() {
+                return None;
+            }
+            let qi = unsafe { GetProcAddress(lib, c"nvapi_QueryInterface".as_ptr() as *const u8) }?;
+            let qi: QueryInterface = unsafe { std::mem::transmute(qi) };
+            let p = |id: u32| {
+                let f = unsafe { qi(id) };
+                (!f.is_null()).then_some(f)
+            };
+            let init: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(p(ID_INITIALIZE)?) };
+            let enum_gpus: unsafe extern "C" fn(*mut *mut c_void, *mut u32) -> i32 = unsafe { std::mem::transmute(p(ID_ENUM_GPUS)?) };
+            let get: unsafe extern "C" fn(*mut c_void, *mut u8) -> i32 = unsafe { std::mem::transmute(p(ID_CURRENT_VOLTAGE)?) };
+            if unsafe { init() } != 0 {
+                return None;
+            }
+            let mut gpus = [std::ptr::null_mut::<c_void>(); 64];
+            let mut n = 0u32;
+            if unsafe { enum_gpus(gpus.as_mut_ptr(), &mut n) } != 0 || n == 0 {
+                return None;
+            }
+            Some(Volt { handle: gpus[0], get })
+        })
+        .as_ref()?;
+    let mut buf = vec![0u8; VOLT_SIZE];
+    buf[0..4].copy_from_slice(&((1u32 << 16) | VOLT_SIZE as u32).to_le_bytes());
+    let r = unsafe { (v.get)(v.handle, buf.as_mut_ptr()) };
+    if r != 0 {
+        return None;
+    }
+    parse_voltage(&buf)
+}
+
 /// Read the first NVIDIA card's curve. Read-only.
 pub fn read_curve() -> Result<Vec<VfPoint>, String> {
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -141,5 +202,16 @@ mod tests {
         for p in c.iter().step_by(8) {
             println!("  {:7.1} mV  {:7.1} MHz", p.mv, p.mhz);
         }
+        println!("core voltage now: {:?}", core_voltage());
+    }
+
+    #[test]
+    fn nvapi_parse_voltage() {
+        let mut b = vec![0u8; VOLT_SIZE];
+        b[VOLT_AT..VOLT_AT + 4].copy_from_slice(&925_000u32.to_le_bytes());
+        assert_eq!(parse_voltage(&b), Some(925.0));
+        b[VOLT_AT..VOLT_AT + 4].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(parse_voltage(&b), None, "not a voltage");
+        assert_eq!(parse_voltage(&[0u8; 8]), None);
     }
 }
