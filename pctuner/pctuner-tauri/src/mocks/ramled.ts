@@ -3,15 +3,15 @@ import { mockAdmin, mockParams } from "./env";
 import type { MockTab } from "./types";
 
 // two G.SKILL Trident Z5 RGB sticks in slots A2 / B2 of the MSI MAG X870E TOMAHAWK WIFI, and the
-// Gigabyte RTX 5080 XTREME WATERFORCE (its controller cannot be read back: unknown until set)
+// Gigabyte RTX 5080 XTREME WATERFORCE (ENE controller AUMA0-E6K5-1107 at 0x67, 4 LEDs)
 // "?state=empty | loading | error | gpuerror" shows the other faces of the tab
 type Mode = "off" | "rainbow" | "static" | "unknown";
 const state = mockParams.get("state");
 
 function makeSection(target: LedTarget) {
   const gpu = target === "gpu";
-  const devices = state === "empty" ? [] : gpu ? [{ name: "Gigabyte RGB Fusion 2 (Blackwell)", addr: 0x75 }] : [{ name: "AUDA0-E6K5-0101", addr: 0x71 }, { name: "AUDA0-E6K5-0101", addr: 0x73 }];
-  let mode: Mode = gpu ? "unknown" : "rainbow";
+  const devices = state === "empty" ? [] : gpu ? [{ name: "AUMA0-E6K5-1107", addr: 0x67 }] : [{ name: "AUDA0-E6K5-0101", addr: 0x71 }, { name: "AUDA0-E6K5-0101", addr: 0x73 }];
+  let mode: Mode = "rainbow";
   let lastOn: { mode: Mode; shown: string } = { mode: "rainbow", shown: "" };
   let color = "#ffffff";
   let shown = "#ffffff";
@@ -80,7 +80,7 @@ function makeSection(target: LedTarget) {
               title: gpu ? "Graphics card" : `Stick ${i + 1}`,
               state: describe(),
               lit,
-              detail: gpu ? `3 zones  ·  ${d.name}  ·  I2C address 0x75` : `8 LEDs  ·  controller ${d.name}  ·  SMBus address 0x${d.addr.toString(16).toUpperCase()}`,
+              detail: gpu ? `4 LEDs  ·  controller ${d.name}  ·  I2C address 0x67` : `8 LEDs  ·  controller ${d.name}  ·  SMBus address 0x${d.addr.toString(16).toUpperCase()}`,
             }))
           : [],
       };

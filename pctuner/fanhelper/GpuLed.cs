@@ -5,14 +5,15 @@
 //
 // The LED controller sits on the card's own I2C bus, reached through the NVIDIA driver (nvapi64.dll:
 // NvAPI_I2CReadEx / NvAPI_I2CWriteEx on port 1 - the layout OpenRGB's i2c_smbus_nvapi uses). Two kinds:
-//   - Gigabyte RTX 5080 XTREME WATERFORCE (subsystem 1458:418B): RGB Fusion 2 "Blackwell" controller at 0x75,
-//     64-byte packets, three zones (OpenRGB GigabyteRGBFusion2BlackwellGPUController, WATERFORCE layout)
-//   - ASUS cards: ENE controller at 0x67, the same register protocol as the RAM sticks (EneDevice)
+//   - ENE controller at 0x67, the same register protocol as the RAM sticks (EneDevice): ASUS cards, and this
+//     PC's Gigabyte RTX 5080 XTREME WATERFORCE (1458:418B), whose controller reads AUMA0-E6K5-1107
+//   - fallback for that Gigabyte model: the RGB Fusion 2 "Blackwell" controller OpenRGB lists at 0x75
+//     (64-byte packets, three zones) - not present on this PC's card
 //
 // Safety rules:
-//   - only these exact cards / vendors are touched, and only their one LED address
-//   - Gigabyte: only the identify packet is sent until the controller has answered like a Fusion 2 Blackwell one
-//   - ASUS: nothing is written until 0x67 has answered with the ENE test pattern and a known controller name
+//   - only ASUS- and Gigabyte-made NVIDIA cards are looked at, and only address 0x67 (and 0x75 on the one model)
+//   - ENE: nothing is written until 0x67 has answered with the ENE test pattern and a known controller name
+//   - Fusion 2: only the identify packet is sent until the controller has answered like a Fusion 2 Blackwell one
 //   - the Fusion 2 controller takes at most 9 mode packets a second: packets are spaced 150 ms apart
 
 using System;
@@ -142,12 +143,16 @@ namespace PCTunerFan
                     Size = size,
                     Speed = 0xFFFF,
                     SpeedKhz = 0,
-                    PortId = 1,
-                    IsPortIdSet = 1,
+                    PortId = Port,
+                    IsPortIdSet = PortSet,
+                    IsDdcPort = Ddc,
                 };
             }
 
             public int LastStatus;
+            // normally port 1 (where the RGB controllers are); the probe tries the others, read-only
+            public byte Port = 1, Ddc = 0;
+            public uint PortSet = 1;
 
             int Call(I2CFn f, NvI2cInfoV3 i)
             {
@@ -193,6 +198,8 @@ namespace PCTunerFan
         }
 
         public static bool IsAsusNvidia(uint deviceId, uint subSystemId) => (deviceId & 0xFFFF) == NvidiaVendor && (subSystemId & 0xFFFF) == AsusVendor;
+
+        public static bool IsGigabyteNvidia(uint deviceId, uint subSystemId) => (deviceId & 0xFFFF) == NvidiaVendor && (subSystemId & 0xFFFF) == GigabyteVendor;
 
         public static bool IsGigabyteWaterforce5080(uint deviceId, uint subSystemId) =>
             deviceId == (0x2C02u << 16 | NvidiaVendor) && (subSystemId & 0xFFFF) == GigabyteVendor && subSystemId >> 16 == GigabyteRtx5080XtremeWaterforce;
@@ -290,37 +297,38 @@ namespace PCTunerFan
                     string busName = $"NVIDIA {dev >> 16:X4} subsystem {sub & 0xFFFF:X4}:{sub >> 16:X4} I2C port 1";
                     if (cmd == "probe") Console.Error.WriteLine($"gpu {g}: PCI ids call {pr}, device {dev:X8}, subsystem {sub:X8}, admin={IsAdmin()}");
                     if (pr != 0) continue;
-                    if (IsGigabyteWaterforce5080(dev, sub))
+                    if (!IsAsusNvidia(dev, sub) && !IsGigabyteNvidia(dev, sub)) continue;
+                    var bus = new NvBus(handles[g], read, write);
+                    buses.Add(bus);
+                    if (cmd == "probe")
                     {
-                        var bus = new NvBus(handles[g], read, write);
-                        buses.Add(bus);
-                        if (cmd == "probe")
-                        {
-                            bool w = bus.Write(Fusion2Gpu.Addr, Fusion2Gpu.Packet(Fusion2Gpu.RegIdentify, 0x01));
-                            int ws = bus.LastStatus;
-                            var ans = bus.Read(Fusion2Gpu.Addr, 4);
-                            Console.Error.WriteLine($"gpu {g}: identify write status {ws}, read status {bus.LastStatus}, answer {RamLed.Hex(ans)}");
-                            continue;
-                        }
-                        var d = Fusion2Gpu.Probe(bus, Fusion2Gpu.WaterforceZones);
-                        if (d == null) why = $"The Gigabyte RTX 5080's LED controller did not answer (NVIDIA driver status {bus.LastStatus}).{(IsAdmin() ? "" : " PC Tuner must run as administrator.")} If RGB Fusion or Gigabyte Control Center is running, close it and try again.";
-                        if (d != null && cmd != "probe") result.Add(ApplyFusion(d, $"gpu{g}-75", busName, cmd, rest, save));
+                        // read-only: what answers a plain 1-byte read on each port, then the ENE identity at 0x67
+                        for (byte port = 0; port < 8; port++)
+                            for (byte a = 0x08; a <= 0x77; a++)
+                            {
+                                bus.Port = port;
+                                var got = bus.Read(a, 1);
+                                if (bus.LastStatus == 0) Console.Error.WriteLine($"gpu {g}: port {port} addr 0x{a:X2} answers: {RamLed.Hex(got)}");
+                            }
+                        bus.Port = 1;
+                        Console.Error.WriteLine($"gpu {g}: ENE name at 0x67: {EneDevice.NameAt(bus, EneDevice.GpuAddr, true) ?? "(no ENE pattern)"}");
+                        continue;
                     }
-                    else if (IsAsusNvidia(dev, sub))
+                    // ENE controller at 0x67 (ASUS cards, and this Gigabyte RTX 5080: AUMA0-E6K5-1107)
+                    var ed = EneDevice.Probe(bus, EneDevice.GpuAddr, out var s, gpu: true);
+                    if (ed != null)
                     {
-                        var bus = new NvBus(handles[g], read, write);
-                        buses.Add(bus);
-                        if (cmd == "probe")
-                        {
-                            var pat = Enumerable.Range(0, 16).Select(k => bus.ReadByteData(EneDevice.GpuAddr, (byte)(0xA0 + k)));
-                            Console.Error.WriteLine($"gpu {g}: ENE pattern at 0x67: {string.Join(" ", pat)}");
-                            continue;
-                        }
-                        var d = EneDevice.Probe(bus, EneDevice.GpuAddr, out var s, gpu: true);
-                        if (d == null) continue;
                         s.Id = $"gpu{g}-{EneDevice.GpuAddr:x2}";
                         s.Bus = busName;
-                        ene.Add((d, s));
+                        ene.Add((ed, s));
+                        continue;
+                    }
+                    // otherwise the Gigabyte RGB Fusion 2 "Blackwell" controller OpenRGB lists for this model
+                    if (IsGigabyteWaterforce5080(dev, sub))
+                    {
+                        var d = Fusion2Gpu.Probe(bus, Fusion2Gpu.WaterforceZones);
+                        if (d != null) result.Add(ApplyFusion(d, $"gpu{g}-75", busName, cmd, rest, save));
+                        else why = $"The graphics card's LED controller did not answer (NVIDIA driver status {bus.LastStatus}). If RGB Fusion or Gigabyte Control Center is running, close it and try again.";
                     }
                 }
                 if (ene.Count > 0) result.AddRange(RamLed.Apply(ene, cmd, rest, save));
@@ -365,6 +373,7 @@ namespace PCTunerFan
         {
             Check(Marshal.SizeOf(typeof(NvI2cInfoV3)) == 64, "gpu led: NV_I2C_INFO_V3 is 64 bytes on x64");
             Check(IsAsusNvidia(0x2C0210DE, 0x89D71043) && !IsAsusNvidia(0x2C0210DE, 0x418B1458), "gpu led: ASUS cards recognised");
+            Check(IsGigabyteNvidia(0x2C0210DE, 0x418B1458) && !IsGigabyteNvidia(0x2C0210DE, 0x89D71043) && !IsGigabyteNvidia(0x13C01002, 0x418B1458), "gpu led: Gigabyte NVIDIA cards recognised");
             Check(IsGigabyteWaterforce5080(0x2C0210DE, 0x418B1458) && !IsGigabyteWaterforce5080(0x2C0210DE, 0x41761458) && !IsGigabyteWaterforce5080(0x2B8510DE, 0x418B1458), "gpu led: only the Gigabyte RTX 5080 XTREME WATERFORCE");
 
             var f = new FakeFusion();

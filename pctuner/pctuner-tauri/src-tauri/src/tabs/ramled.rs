@@ -92,7 +92,7 @@ fn section(r: &RamLed) -> Value {
             "state": describe(s),
             "lit": is_lit(s) && s.mode != MODE_UNKNOWN,
             "detail": if gpu {
-                format!("{} zones  ·  {}  ·  I2C address 0x{:02X}", s.leds, s.name, s.addr)
+                format!("{} LEDs  ·  controller {}  ·  I2C address 0x{:02X}", s.leds, s.name, s.addr)
             } else {
                 format!("{} LEDs  ·  controller {}  ·  SMBus address 0x{:02X}", s.leds, s.name, s.addr)
             },

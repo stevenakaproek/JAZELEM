@@ -140,7 +140,7 @@ export function Ramled() {
           <h2 className="ramled-heading">RTX 5080</h2>
           <Section view={view.gpu} target="gpu" act={act} />
           <div className="group-footer">
-            Works without Gigabyte Control Center / RGB Fusion. If it is running, close it: it can overwrite these settings. The card's controller cannot be read back, so PC Tuner shows the lighting it set last.
+            Works without Gigabyte Control Center / RGB Fusion. If it is running, close it: it can overwrite these settings.
           </div>
         </>
       )}
