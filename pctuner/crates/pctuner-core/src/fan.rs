@@ -42,6 +42,69 @@ pub struct FanInfo {
     pub requested: Option<f32>,
     /// The helper is running a curve for this fan.
     pub curve: bool,
+    /// The speed sensor this fan's RPM is read from ("" = none).
+    #[serde(rename = "rpmId")]
+    pub rpm_id: String,
+}
+
+/// One fan speed sensor (every one the helper sees, paired or not).
+#[derive(Deserialize, Serialize, Clone, Default, Debug, PartialEq)]
+#[serde(default)]
+pub struct RpmInfo {
+    pub id: String,
+    pub hw: String,
+    pub name: String,
+    pub rpm: Option<f32>,
+}
+
+/// The fan test the helper is running or last ran: "calibrate" (duty sweep) or "pair" (find the speed sensor).
+#[derive(Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default)]
+pub struct JobInfo {
+    pub seq: u64,
+    pub kind: String,
+    pub id: String,
+    pub step: u32,
+    pub steps: u32,
+    pub duty: Option<f32>,
+    pub done: bool,
+    pub error: String,
+    pub paired: String,
+    pub start: Option<f32>,
+    pub stop: Option<f32>,
+    pub max: Option<f32>,
+    pub points: Vec<[f32; 2]>,
+}
+
+/// A fan's measured behaviour (saved per fan, a fact about the hardware).
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default)]
+pub struct Calibration {
+    /// (duty %, RPM) from 100 % down to 0 %
+    pub points: Vec<[f32; 2]>,
+    /// lowest duty that still spins on the way down (None: it never spun)
+    pub stop: Option<f32>,
+    /// duty it starts again at from standstill (None: it never stopped, or did not start up to 60 %)
+    pub start: Option<f32>,
+    pub max: Option<f32>,
+    pub when: String,
+}
+
+impl Calibration {
+    pub fn from_job(j: &JobInfo, when: String) -> Self {
+        Calibration { points: j.points.clone(), stop: j.stop, start: j.start, max: j.max, when }
+    }
+    /// "Stops below 20 %, starts at 30 %, 1400 RPM max" - or that it never stops.
+    pub fn summary(&self) -> String {
+        let max = self.max.map(|m| format!("{m:.0} RPM at 100 %")).unwrap_or_else(|| "no RPM reading".into());
+        let never_stops = self.points.iter().any(|p| p[0] == 0.0 && p[1] > 0.0);
+        match (self.stop, self.start) {
+            _ if never_stops => format!("{max}, never stops (still spins at 0 %)"),
+            (Some(s), Some(st)) => format!("{max}, stops below {s:.0} %, starts again at {st:.0} %"),
+            (Some(s), None) => format!("{max}, stops below {s:.0} %, did not start again up to 60 %"),
+            _ => max,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Default, Debug)]
@@ -69,6 +132,9 @@ pub struct Status {
     pub msg_seq: u64,
     pub fans: Vec<FanInfo>,
     pub temps: Vec<TempInfo>,
+    /// Every fan speed sensor (for pairing).
+    pub rpms: Vec<RpmInfo>,
+    pub job: Option<JobInfo>,
 }
 
 // ------------------------------------------------------------------ what each fan should do
@@ -228,6 +294,10 @@ pub struct ProfileStore {
     /// "This is a pump" choices (override the name-based guess). A fact about the hardware, so the same
     /// for every profile.
     pub pumps: BTreeMap<String, bool>,
+    /// Speed sensor chosen for a fan control (control id -> sensor id), when not the built-in pairing.
+    pub pairs: BTreeMap<String, String>,
+    /// Calibration results per fan control.
+    pub calib: BTreeMap<String, Calibration>,
 }
 
 /// Curve points as the editor keeps them: in temperature order (a stable sort, so equal temperatures keep
@@ -833,6 +903,7 @@ pub fn demo_status(t: f64) -> Status {
         gpu,
         requested: None,
         curve: false,
+        rpm_id: id.replace("/control/", "/fan/"),
     };
     let board = "Nuvoton NCT6687D";
     Status {
@@ -850,6 +921,11 @@ pub fn demo_status(t: f64) -> Status {
             fan("/lpc/nct6687d/0/fan/4", board, "System Fan #3", 790.0 + 25.0 * w(0.6, 2.0), None, false, false),
             fan("/gpu-nvidia/0/control/1", "NVIDIA GeForce RTX 5080", "GPU Fan", 1150.0 + 30.0 * w(0.5, 0.5), Some(40.0), false, true),
         ],
+        rpms: [("/lpc/nct6687d/0/fan/0", "CPU Fan", 1180.0), ("/lpc/nct6687d/0/fan/1", "Pump Fan", 2650.0), ("/lpc/nct6687d/0/fan/2", "System Fan #1", 820.0), ("/lpc/nct6687d/0/fan/3", "System Fan #2", 805.0), ("/lpc/nct6687d/0/fan/4", "System Fan #3", 790.0)]
+            .iter()
+            .map(|(id, name, rpm)| RpmInfo { id: (*id).into(), hw: board.into(), name: (*name).into(), rpm: Some(*rpm) })
+            .collect(),
+        job: None,
         temps: vec![
             TempInfo { id: "c".into(), hw: "AMD Ryzen 7 9800X3D".into(), kind: "Cpu".into(), name: "Core (Tctl/Tdie)".into(), value: Some(cpu) },
             TempInfo { id: "g".into(), hw: "NVIDIA GeForce RTX 5080".into(), kind: "GpuNvidia".into(), name: "GPU Core".into(), value: Some(gpu) },
@@ -945,6 +1021,8 @@ pub struct Fan {
     pub note: Option<String>,
     /// An own setting changed at this time and is not saved yet (saved shortly after, so a curve drag is one write).
     pub pin_dirty: Option<Instant>,
+    /// The last fan test result taken from the helper (its seq; the helper counts from 1 again after a restart).
+    pub job_seen: u64,
 }
 
 impl Fan {
@@ -982,6 +1060,7 @@ impl Fan {
             new_name: String::new(),
             note: None,
             pin_dirty: None,
+            job_seen: 0,
         };
         // apply the last profile at startup (only as administrator: otherwise nothing can be controlled)
         if startup && !demo {
@@ -1089,6 +1168,7 @@ impl Fan {
                 self.sent_at.clear();
                 self.handed_back.clear();
                 self.msg_dismissed = 0;
+                self.job_seen = 0;
             }
             Err(e) => self.error = Some(e),
         }
@@ -1139,6 +1219,9 @@ impl Fan {
         let mut cmds: Vec<(String, String)> = vec![];
         for (id, choice) in &self.store.pumps {
             cmds.push((format!("pump:{id}"), format!("pump {id} {}", if *choice { 1 } else { 0 })));
+        }
+        for (id, sensor) in &self.store.pairs {
+            cmds.push((format!("pair:{id}"), format!("pair {id} {sensor}")));
         }
         for (id, s) in &self.settings {
             cmds.push((id.clone(), command_for(id, s)));
@@ -1365,6 +1448,84 @@ impl Fan {
         }
     }
 
+    /// The fan test running now (None when none is running).
+    pub fn running_test(&self) -> Option<JobInfo> {
+        let sh = self.shared.lock().ok()?;
+        sh.status.as_ref()?.job.clone().filter(|j| !j.done)
+    }
+
+    /// The last finished test, while it is the newest one (for its message on the card).
+    pub fn last_test(&self) -> Option<JobInfo> {
+        let sh = self.shared.lock().ok()?;
+        sh.status.as_ref()?.job.clone().filter(|j| j.done)
+    }
+
+    /// Start a fan test on one fan: "calibrate" or "pair". Administrator only; one at a time.
+    pub fn start_test(&mut self, kind: &str, id: &str) -> Result<(), String> {
+        if !common::is_admin() {
+            return Err("Run PC Tuner as administrator to test fans.".into());
+        }
+        if self.running_test().is_some() {
+            return Err("A fan test is already running.".into());
+        }
+        let cmd = match kind {
+            "calibrate" => format!("calibrate {id}"),
+            "pair" => format!("pairdetect {id}"),
+            _ => return Err("unknown test".into()),
+        };
+        match &self.helper {
+            Some(h) if !h.reset_only && h.send(&cmd) => Ok(()),
+            _ => Err("The fan helper is not running.".into()),
+        }
+    }
+
+    pub fn cancel_test(&mut self) {
+        if let Some(h) = &self.helper {
+            h.send("jobcancel");
+        }
+    }
+
+    /// Choose a fan's speed sensor by hand ("auto" = the built-in pairing). Saved for every profile.
+    pub fn pair(&mut self, id: &str, sensor: &str) {
+        if sensor == "auto" {
+            self.store.pairs.remove(id);
+            self.sent.remove(&format!("pair:{id}"));
+            if let Some(h) = &self.helper {
+                if common::is_admin() {
+                    h.send(&format!("pair {id} auto"));
+                }
+            }
+        } else {
+            self.store.pairs.insert(id.to_string(), sensor.to_string());
+        }
+        // a calibration was measured on the old sensor
+        self.store.calib.remove(id);
+        self.save_store();
+    }
+
+    /// Keep a finished test's result: a calibration, or the speed sensor pairing found.
+    pub fn take_test_result(&mut self) {
+        let job = self.shared.lock().ok().and_then(|sh| sh.status.as_ref().and_then(|s| s.job.clone()));
+        let Some(j) = job.filter(|j| j.done && j.seq > self.job_seen) else { return };
+        self.job_seen = j.seq;
+        if !j.error.is_empty() {
+            return;
+        }
+        match j.kind.as_str() {
+            "calibrate" => {
+                self.store.calib.insert(j.id.clone(), Calibration::from_job(&j, common::now()));
+            }
+            "pair" if !j.paired.is_empty() => {
+                self.store.pairs.insert(j.id.clone(), j.paired.clone());
+                // the helper already uses it
+                self.sent.insert(format!("pair:{}", j.id), format!("pair {} {}", j.id, j.paired));
+                self.store.calib.remove(&j.id);
+            }
+            _ => return,
+        }
+        self.save_store();
+    }
+
     /// May fans be changed (administrator, or the demo screen)?
     pub fn can(&self) -> bool {
         common::is_admin() || self.demo
@@ -1397,6 +1558,7 @@ impl Fan {
     pub fn tick(&mut self) {
         if self.started {
             self.watch();
+            self.take_test_result();
             self.sync();
         }
         if self.pin_dirty.map(|t| t.elapsed() > Duration::from_millis(600)).unwrap_or(false) {
@@ -1772,6 +1934,49 @@ mod tests {
     }
 
     /// Pump choices belong to the hardware: switching profiles never drops them, old per-profile ones are merged.
+    #[test]
+    fn fan_tests_keep_their_results() {
+        let mut f = Fan::new_with(ProfileStore::default(), true, false);
+        let job = |seq: u64, kind: &str, error: &str| JobInfo {
+            seq,
+            kind: kind.into(),
+            id: "/lpc/nct6687d/0/control/0".into(),
+            done: true,
+            error: error.into(),
+            paired: "/lpc/nct6687d/0/fan/2".into(),
+            stop: Some(20.0),
+            start: Some(30.0),
+            max: Some(1400.0),
+            points: vec![[100.0, 1400.0], [20.0, 600.0], [10.0, 0.0], [0.0, 0.0]],
+            ..Default::default()
+        };
+        let put = |f: &mut Fan, j: JobInfo| f.shared.lock().unwrap().status = Some(Status { job: Some(j), ..Default::default() });
+        // a calibration is kept per fan, once
+        put(&mut f, job(1, "calibrate", ""));
+        f.take_test_result();
+        let c = f.store.calib.get("/lpc/nct6687d/0/control/0").cloned().expect("kept");
+        assert_eq!((c.stop, c.start, c.max, c.points.len()), (Some(20.0), Some(30.0), Some(1400.0), 4));
+        assert_eq!(c.summary(), "1400 RPM at 100 %, stops below 20 %, starts again at 30 %");
+        // a detected pairing replaces the calibration (it was measured on the old sensor)
+        put(&mut f, job(2, "pair", ""));
+        f.take_test_result();
+        assert_eq!(f.store.pairs.get("/lpc/nct6687d/0/control/0").map(String::as_str), Some("/lpc/nct6687d/0/fan/2"));
+        assert!(f.store.calib.is_empty());
+        // a failed or cancelled test changes nothing
+        put(&mut f, job(3, "calibrate", "Cancelled."));
+        f.take_test_result();
+        assert!(f.store.calib.is_empty() && f.job_seen == 3);
+        // choosing the default sensor again forgets the pairing
+        f.pair("/lpc/nct6687d/0/control/0", "auto");
+        assert!(f.store.pairs.is_empty());
+        // a fan that never stops says so
+        let never = Calibration { points: vec![[100.0, 900.0], [0.0, 300.0]], stop: Some(0.0), max: Some(900.0), ..Default::default() };
+        assert_eq!(never.summary(), "900 RPM at 100 %, never stops (still spins at 0 %)");
+        // the helper's status line
+        let s = parse_status(r#"{"fans":[{"id":"a","rpmId":"s1"}],"rpms":[{"id":"s1","hw":"x","name":"Fan #1","rpm":800}],"job":{"seq":4,"kind":"pair","id":"a","step":1,"steps":2,"duty":100,"done":false,"error":"","paired":"","start":null,"stop":null,"max":null,"points":[]}}"#).unwrap();
+        assert_eq!((s.fans[0].rpm_id.as_str(), s.rpms[0].rpm, s.job.as_ref().map(|j| j.duty)), ("s1", Some(800.0), Some(Some(100.0))));
+    }
+
     #[test]
     fn fan_pump_choices_are_global() {
         let mut store = ProfileStore::default();

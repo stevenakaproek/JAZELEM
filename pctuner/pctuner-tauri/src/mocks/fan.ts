@@ -1,5 +1,5 @@
 import type { Tone } from "../lib/types";
-import type { FanAction, FanCardView, FanSetting, FanView } from "../tabs/Fan";
+import type { FanAction, FanCardView, FanSetting, FanTools, FanView } from "../tabs/Fan";
 import { mockAdmin, mockParams } from "./env";
 import type { MockTab } from "./types";
 
@@ -91,10 +91,41 @@ function card(f: MockFan): FanCardView {
     live,
     liveDuty,
     afterburner: f.gpu && ours,
+    tools: tools(f),
   };
 }
 
 const state = mockParams.get("state");
+
+// speed sensor pairing and calibration: the CPU fan is calibrated, a test can be run on the others
+const sensors = [
+  { id: "none", label: "None (no speed reading)" },
+  ...fans.filter((f) => !f.gpu).map((f, i) => ({ id: `/lpc/nct6687d/0/fan/${i}`, label: `${f.name} (${board})${f.base ? ` - ${f.base} RPM` : ""}` })),
+  { id: "/gpu-nvidia/0/fan/1", label: "GPU Fan (NVIDIA GeForce RTX 5080) - 1150 RPM" },
+];
+const pairs: Record<string, string> = Object.fromEntries(fans.map((f, i) => [f.id, f.gpu ? "/gpu-nvidia/0/fan/1" : `/lpc/nct6687d/0/fan/${i}`]));
+const manual = new Set<string>();
+const calib: Record<string, NonNullable<FanTools["calib"]>> = {
+  cpu: { summary: "1650 RPM at 100 %, stops below 20 %, starts again at 30 %", points: [[100, 1650], [90, 1540], [80, 1420], [70, 1290], [60, 1150], [50, 1010], [40, 860], [30, 700], [20, 520], [10, 0], [0, 0]], when: "2026-11-16 10:20:41" },
+};
+let test: { id: string; kind: "calibrate" | "pair"; step: number; steps: number } | null = state === "calibrating" ? { id: "sys1", kind: "calibrate", step: 4, steps: 24 } : null;
+const results: Record<string, { ok: boolean; text: string }> = {};
+const DUTIES = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60];
+
+function tools(f: MockFan): FanTools | null {
+  if (!f.controllable || f.pump) return null;
+  const mine = test && test.id === f.id ? test : null;
+  return {
+    sensors,
+    sensor: pairs[f.id] ?? "none",
+    manual: manual.has(f.id),
+    calib: calib[f.id] ?? null,
+    test: mine ? { kind: mine.kind, step: mine.step, steps: mine.steps, duty: mine.kind === "pair" ? (mine.step === 0 ? 30 : 100) : DUTIES[Math.min(mine.step, DUTIES.length - 1)] } : null,
+    otherRunning: test !== null && !mine,
+    result: results[f.id] ?? null,
+    canTest: mockAdmin && test === null,
+  };
+}
 
 export const fan: MockTab<FanView, FanAction> = {
   view() {
@@ -222,11 +253,45 @@ export const fan: MockTab<FanView, FanAction> = {
       case "pump":
         if (f) f.pump = a.on;
         break;
+      case "pair_sensor":
+        if (a.sensor === "auto") {
+          manual.delete(a.id);
+          pairs[a.id] = sensors[fans.findIndex((x) => x.id === a.id) + 1]?.id ?? "none";
+        } else {
+          manual.add(a.id);
+          pairs[a.id] = a.sensor;
+        }
+        delete calib[a.id];
+        break;
+      case "test":
+        if (mockAdmin && !test) {
+          test = { id: a.id, kind: a.test, step: 0, steps: a.test === "pair" ? 2 : 24 };
+          delete results[a.id];
+        }
+        break;
+      case "cancel_test":
+        if (test) results[test.id] = { ok: false, text: "Cancelled." };
+        test = null;
+        break;
       default:
         break;
     }
   },
   tick() {
+    if (test && tick % 2 === 0 && state !== "calibrating") {
+      test.step += 1;
+      if (test.step >= test.steps) {
+        const t = test;
+        test = null;
+        if (t.kind === "pair") {
+          manual.add(t.id);
+          results[t.id] = { ok: true, text: `Paired with ${sensors.find((s) => s.id === pairs[t.id])?.label.split(" (")[0] ?? "its sensor"}.` };
+        } else {
+          calib[t.id] = { summary: "1180 RPM at 100 %, stops below 30 %, starts again at 35 %", points: [[100, 1180], [90, 1100], [80, 1010], [70, 920], [60, 820], [50, 720], [40, 600], [30, 470], [20, 0], [10, 0], [0, 0]], when: "2026-11-16 10:31:05" };
+          results[t.id] = { ok: true, text: "Calibration finished." };
+        }
+      }
+    }
     if (tick % 2 === 0) step();
     else tick += 1;
     return tick % 2 === 1;

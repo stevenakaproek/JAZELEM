@@ -34,6 +34,21 @@ export interface FanCardView {
   live: number | null;
   liveDuty: number | null;
   afterburner: boolean;
+  /** speed sensor pairing and calibration (null for read-only fans and pumps) */
+  tools: FanTools | null;
+}
+
+export interface FanTools {
+  sensors: { id: string; label: string }[];
+  /** the sensor this fan's RPM comes from ("none") */
+  sensor: string;
+  /** chosen by hand or by Detect (not the built-in pairing) */
+  manual: boolean;
+  calib: { summary: string; points: [number, number][]; when: string } | null;
+  test: { kind: "calibrate" | "pair"; step: number; steps: number; duty: number | null } | null;
+  otherRunning: boolean;
+  result: { ok: boolean; text: string } | null;
+  canTest: boolean;
 }
 
 interface Temp {
@@ -81,7 +96,10 @@ export type FanAction =
   | { kind: "curve_remove"; id: string; index: number }
   | { kind: "trigger"; id: string; idle_temp: number; load_temp: number; idle: number; load: number }
   | { kind: "follow"; id: string }
-  | { kind: "pump"; id: string; on: boolean };
+  | { kind: "pump"; id: string; on: boolean }
+  | { kind: "pair_sensor"; id: string; sensor: string }
+  | { kind: "test"; id: string; test: "calibrate" | "pair" }
+  | { kind: "cancel_test" };
 
 type Act = (a: FanAction) => Promise<void>;
 
@@ -124,6 +142,93 @@ function ManualControl({ f, disabled, act }: { f: FanCardView; disabled: boolean
       <div className="tertiary" style={{ fontSize: "var(--text-sm)" }}>
         Lowest allowed: {f.floor.toFixed(0)} %
       </div>
+    </div>
+  );
+}
+
+/** The calibration result: RPM at each duty, 0-100 %. */
+function CalibChart({ points }: { points: [number, number][] }) {
+  const max = Math.max(1, ...points.map((p) => p[1]));
+  const W = 260,
+    H = 70;
+  const sorted = [...points].sort((a, b) => a[0] - b[0]);
+  const xy = (p: [number, number]) => `${(p[0] / 100) * W},${H - (p[1] / max) * (H - 6)}`;
+  return (
+    <svg className="fan-calib" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="RPM at each duty">
+      <polyline points={sorted.map(xy).join(" ")} fill="none" stroke="var(--accent)" strokeWidth="2" />
+      {sorted.map((p) => {
+        const [x, y] = xy(p).split(",").map(Number);
+        return <circle key={p[0]} cx={x} cy={y} r="2.5" fill={p[1] > 0 ? "var(--accent)" : "var(--text-tertiary)"}><title>{`${p[0]} % - ${p[1].toFixed(0)} RPM`}</title></circle>;
+      })}
+    </svg>
+  );
+}
+
+/** Which speed sensor this fan is read from, and its calibration (duty sweep). */
+function FanToolsPanel({ f, t, disabled, act }: { f: FanCardView; t: FanTools; disabled: boolean; act: Act }) {
+  const [open, setOpen] = useState(false);
+  const busy = t.test !== null;
+  return (
+    <div className="fan-tools">
+      <button type="button" className="fan-tools-head" aria-expanded={open || busy} onClick={() => setOpen(!open)}>
+        <ChevronRight size={14} className={cx("fan-tools-chev", (open || busy) && "open")} />
+        Speed sensor &amp; calibration
+        <span className="spacer" />
+        {t.calib ? <span className="tertiary">calibrated</span> : <span className="tertiary">not calibrated</span>}
+      </button>
+      {(open || busy) && (
+        <div className="stack" style={{ gap: 8 }}>
+          <label className="stack" style={{ gap: 4 }}>
+            <span className="secondary" style={{ fontSize: "var(--text-sm)" }}>Speed sensor (where the RPM above comes from)</span>
+            <span className="hstack" style={{ gap: 8 }}>
+              <select className="input select" style={{ flex: 1, minWidth: 0 }} value={t.sensor} disabled={disabled || busy || t.otherRunning} aria-label={`${f.name} speed sensor`} onChange={(e) => act({ kind: "pair_sensor", id: f.id, sensor: e.target.value })}>
+                {t.sensors.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.label}
+                  </option>
+                ))}
+              </select>
+              <Button disabled={!t.canTest} title="Runs this fan at 30 %, then 100 % (about 12 seconds) and pairs the speed sensor that follows it." onClick={() => act({ kind: "test", id: f.id, test: "pair" })}>
+                Detect
+              </Button>
+              {t.manual && (
+                <Button variant="plain" disabled={disabled || busy} title="Back to the pairing the board reports." onClick={() => act({ kind: "pair_sensor", id: f.id, sensor: "auto" })}>
+                  Use default
+                </Button>
+              )}
+            </span>
+          </label>
+          <div className="hstack" style={{ gap: 8, flexWrap: "wrap" }}>
+            <Button disabled={!t.canTest || t.sensor === "none"} title={t.sensor === "none" ? "Pair a speed sensor first." : "Steps this fan from 100 % down to 0 % and back up (about 1-2 minutes), recording the RPM. Stops at once if anything reaches 90 °C."} onClick={() => act({ kind: "test", id: f.id, test: "calibrate" })}>
+              {t.calib ? "Calibrate again" : "Calibrate"}
+            </Button>
+            {t.otherRunning && <span className="tertiary" style={{ fontSize: "var(--text-sm)" }}>Another fan is being tested.</span>}
+          </div>
+          {t.test && (
+            <div className="stack" style={{ gap: 4 }}>
+              <div className="hstack" style={{ gap: 8 }}>
+                <span className="secondary" style={{ fontSize: "var(--text-sm)" }}>
+                  {t.test.kind === "pair" ? "Detecting the speed sensor" : "Calibrating"} - step {t.test.step + 1} of {t.test.steps}
+                  {t.test.duty !== null ? `, running at ${t.test.duty.toFixed(0)} %` : ""}
+                </span>
+                <span className="spacer" />
+                <Button variant="plain" onClick={() => act({ kind: "cancel_test" })}>
+                  Cancel
+                </Button>
+              </div>
+              <Progress value={t.test.steps ? t.test.step / t.test.steps : null} />
+            </div>
+          )}
+          {t.result && !busy && <div className={t.result.ok ? "tone-ok" : "tone-warn"} style={{ fontSize: "var(--text-sm)" }}>{t.result.text}</div>}
+          {t.calib && (
+            <div className="stack" style={{ gap: 4 }}>
+              <div style={{ fontSize: "var(--text-sm)" }}>{t.calib.summary}</div>
+              <CalibChart points={t.calib.points} />
+              <div className="tertiary" style={{ fontSize: "var(--text-xs)" }}>Measured {t.calib.when}</div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -203,6 +308,7 @@ function FanCard({ f, view, act }: { f: FanCardView; view: FanView; act: Act }) 
               <span>This is a pump</span>
             </label>
           )}
+          {f.tools && <FanToolsPanel f={f} t={f.tools} disabled={disabled} act={act} />}
           {f.afterburner && (
             <div className="tone-warn" style={{ fontSize: "var(--text-sm)" }}>
               MSI Afterburner is running. Turn off its fan control (Settings &gt; Fan &gt; untick "Enable user defined software automatic fan control") so the two don't fight.

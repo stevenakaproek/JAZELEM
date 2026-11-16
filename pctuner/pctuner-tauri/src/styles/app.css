@@ -1237,6 +1237,44 @@ html.tauri .sidebar {
   gap: var(--s2);
   min-width: 0;
 }
+.fan-tools {
+  border-top: 0.5px solid var(--separator);
+  padding-top: var(--s2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.fan-tools-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.fan-tools-head:hover {
+  color: var(--text);
+}
+.fan-tools-chev {
+  transition: transform var(--t-base) var(--ease-spring);
+}
+.fan-tools-chev.open {
+  transform: rotate(90deg);
+}
+.fan-calib {
+  width: 100%;
+  max-width: 320px;
+  height: 70px;
+  border-radius: var(--r-sm);
+  background: var(--fill-control);
+}
+
 .fan-name {
   font-size: var(--text-md);
   font-weight: 600;

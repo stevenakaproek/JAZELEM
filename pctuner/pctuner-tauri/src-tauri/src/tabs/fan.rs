@@ -32,6 +32,11 @@ enum Action {
     Trigger { id: String, idle_temp: f32, load_temp: f32, idle: f32, load: f32 },
     Follow { id: String },
     Pump { id: String, on: bool },
+    /// Choose the speed sensor of a fan ("auto" = the built-in pairing).
+    PairSensor { id: String, sensor: String },
+    /// Start a fan test: "calibrate" or "pair".
+    Test { id: String, test: String },
+    CancelTest,
 }
 
 fn hist(h: Option<&VecDeque<f32>>) -> Vec<f32> {
@@ -107,6 +112,42 @@ impl FanTab {
             "live": live,
             "liveDuty": live_duty,
             "afterburner": info.gpu && ours && f.afterburner_running(),
+            "tools": Self::tools(f, s, info, can),
+        })
+    }
+
+    /// Speed sensor pairing and calibration for one controllable fan (null for read-only fans and pumps).
+    fn tools(f: &Fan, s: &Status, info: &FanInfo, can: bool) -> Value {
+        if !info.controllable || info.pump {
+            return Value::Null;
+        }
+        let label = |r: &RpmInfo| format!("{} ({}){}", r.name, r.hw, r.rpm.map(|v| format!(" - {v:.0} RPM")).unwrap_or_default());
+        let mut sensors: Vec<Value> = s.rpms.iter().map(|r| json!({ "id": r.id, "label": label(r) })).collect();
+        sensors.insert(0, json!({ "id": "none", "label": "None (no speed reading)" }));
+        let running = s.job.as_ref().filter(|j| !j.done);
+        let mine = running.filter(|j| j.id == info.id);
+        let last = s.job.as_ref().filter(|j| j.done && j.id == info.id).map(|j| {
+            let ok = j.error.is_empty();
+            let text = if !ok {
+                j.error.clone()
+            } else if j.kind == "pair" {
+                let name = s.rpms.iter().find(|r| r.id == j.paired).map(|r| r.name.clone()).unwrap_or_else(|| j.paired.clone());
+                format!("Paired with {name}.")
+            } else {
+                "Calibration finished.".to_string()
+            };
+            json!({ "ok": ok, "text": text })
+        });
+        let calib = f.store.calib.get(&info.id).map(|c| json!({ "summary": c.summary(), "points": c.points, "when": c.when }));
+        json!({
+            "sensors": sensors,
+            "sensor": if info.rpm_id.is_empty() { "none".to_string() } else { info.rpm_id.clone() },
+            "manual": f.store.pairs.contains_key(&info.id),
+            "calib": calib,
+            "test": mine.map(|j| json!({ "kind": j.kind, "step": j.step, "steps": j.steps, "duty": j.duty })),
+            "otherRunning": running.is_some() && mine.is_none(),
+            "result": last,
+            "canTest": can && common::is_admin() && running.is_none() && !s.emergency && !s.blind,
         })
     }
 
@@ -240,6 +281,18 @@ impl Backend for FanTab {
                 }
             }
             Action::Follow { id } => f.apply(id, 0.0, CardAction::FollowProfile),
+            Action::PairSensor { id, sensor } => {
+                let known = sensor == "auto" || sensor == "none" || f.snapshot().0.is_some_and(|s| s.rpms.iter().any(|r| r.id == sensor));
+                if known && f.running_test().is_none() {
+                    f.pair(&id, &sensor);
+                }
+            }
+            Action::Test { id, test } => {
+                if let Err(e) = f.start_test(&test, &id) {
+                    f.note = Some(e);
+                }
+            }
+            Action::CancelTest => f.cancel_test(),
             Action::Pump { id, on } => {
                 if let Some((floor, _)) = Self::floor(&f, &id) {
                     f.apply(id, floor, CardAction::Pump(on));
