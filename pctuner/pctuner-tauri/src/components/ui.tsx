@@ -371,10 +371,14 @@ export function ContextMenu({ x, y, items, onClose }: { x: number; y: number; it
   useEffect(() => {
     const close = () => onClose();
     const key = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("click", close);
-    window.addEventListener("contextmenu", close);
+    // listen only once the click that opened the menu is over, or that same click would close it at once
+    const start = setTimeout(() => {
+      window.addEventListener("click", close);
+      window.addEventListener("contextmenu", close);
+    }, 0);
     window.addEventListener("keydown", key);
     return () => {
+      clearTimeout(start);
       window.removeEventListener("click", close);
       window.removeEventListener("contextmenu", close);
       window.removeEventListener("keydown", key);
@@ -388,7 +392,12 @@ export function ContextMenu({ x, y, items, onClose }: { x: number; y: number; it
         it === "separator" ? (
           <hr key={i} />
         ) : (
-          <button key={i} type="button" role="menuitem" disabled={it.disabled} onClick={it.onClick}>
+          <button key={i} type="button" role="menuitem" disabled={it.disabled}
+            onClick={() => {
+              it.onClick();
+              onClose();
+            }}
+          >
             {it.label}
           </button>
         ),

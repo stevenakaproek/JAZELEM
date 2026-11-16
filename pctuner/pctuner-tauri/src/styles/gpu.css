@@ -74,6 +74,8 @@
   padding: var(--s2);
   border-radius: var(--r-md);
   cursor: grab;
+  touch-action: none;
+  user-select: none;
   transition: background var(--t-fast) var(--ease-out), box-shadow var(--t-fast) var(--ease-out), opacity var(--t-fast);
 }
 .gpu-tile:hover {
@@ -145,4 +147,8 @@
   .gpu-tile {
     transition: none;
   }
+}
+.gpu-tiles.is-dragging,
+.gpu-tiles.is-dragging .gpu-tile {
+  cursor: grabbing;
 }

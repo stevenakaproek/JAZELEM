@@ -1,7 +1,7 @@
 // RTX 5080 Profiles: which tune is applied right now (with live graphs), the four presets, custom values and
 // the safety trial. Everything is set straight through the NVIDIA driver - no MSI Afterburner needed.
 import { Plus, RefreshCw, RotateCcw, SlidersHorizontal, X } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { OpSheet } from "../components/OpSheet";
 import { Badge, Banner, Button, ContextMenu, ErrorState, Group, Hero, LoadingState, NumberField, Page, Sheet, Slider, Sparkline, Spinner, Stat, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
 import { useShell } from "../lib/shell";
@@ -174,32 +174,53 @@ function TelemetryTiles({ tiles }: { tiles: GpuTile[] }) {
     next.splice(next.indexOf(target), 0, key);
     update(next);
   };
+  // Dragging is done with pointer events: the browser's own drag and drop never reaches the page inside
+  // the app window (the window takes it for file drops). A press only becomes a drag after 5 px.
+  const press = useRef<{ key: string; x: number; y: number; active: boolean } | null>(null);
+  const tileAt = (x: number, y: number) => document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-tile]")?.dataset.tile ?? null;
+  const end = () => {
+    press.current = null;
+    setDragging(null);
+    setOver(null);
+  };
+  useEffect(() => {
+    if (!dragging) return;
+    const key = (e: KeyboardEvent) => e.key === "Escape" && end();
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [dragging]);
   return (
-    <div className="gpu-tiles" onDragEnd={() => (setDragging(null), setOver(null))}>
+    <div className={cx("gpu-tiles", dragging && "is-dragging")}>
       {shown.map((k) => {
         const t = byKey.get(k)!;
         return (
           <div
             key={k}
+            data-tile={k}
             className={cx("gpu-tile", dragging === k && "dragging", over === k && dragging !== k && "drop-target")}
-            draggable
             title="Drag to move"
-            onDragStart={(e) => {
-              setDragging(k);
-              e.dataTransfer.effectAllowed = "move";
-              e.dataTransfer.setData("text/plain", k);
+            onPointerDown={(e) => {
+              if (e.button !== 0 || (e.target as HTMLElement).closest(".gpu-tile-remove")) return;
+              press.current = { key: k, x: e.clientX, y: e.clientY, active: false };
+              e.currentTarget.setPointerCapture(e.pointerId);
             }}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setOver(k);
+            onPointerMove={(e) => {
+              const p = press.current;
+              if (!p) return;
+              if (!p.active && Math.hypot(e.clientX - p.x, e.clientY - p.y) < 5) return;
+              if (!p.active) {
+                p.active = true;
+                setDragging(p.key);
+              }
+              setOver(tileAt(e.clientX, e.clientY));
             }}
-            onDrop={(e) => {
-              e.preventDefault();
-              const from = e.dataTransfer.getData("text/plain") || dragging;
-              if (from) moveTo(from, k);
-              setDragging(null);
-              setOver(null);
+            onPointerUp={(e) => {
+              const p = press.current;
+              const target = p?.active ? tileAt(e.clientX, e.clientY) : null;
+              end();
+              if (p && target) moveTo(p.key, target);
             }}
+            onPointerCancel={end}
           >
             <button type="button" className="gpu-tile-remove" title={`Remove ${t.label}`} aria-label={`Remove ${t.label}`} onClick={() => update(shown.filter((x) => x !== k))}>
               <X size={12} />
