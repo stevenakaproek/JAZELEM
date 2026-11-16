@@ -23,6 +23,12 @@ function Frame() {
     void shellAction({ kind: "active", tabs: [...tab.backends, ...(power ? ["power"] : [])] });
   }, [tab, power]);
 
+  useEffect(() => {
+    const onHash = () => setActive(initialTab());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
   const go = (id: string) => {
     setActive(id);
     history.replaceState(null, "", `#${id}`);

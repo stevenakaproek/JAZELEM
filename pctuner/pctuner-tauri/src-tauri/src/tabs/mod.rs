@@ -2,8 +2,9 @@
 
 use crate::backend::Backend;
 
+mod perf;
 mod power;
 
 pub fn all() -> Vec<(&'static str, Box<dyn Backend>)> {
-    vec![("power", Box::new(power::PowerTab::new()))]
+    vec![("perf", Box::new(perf::PerfTab::new())), ("power", Box::new(power::PowerTab::new()))]
 }

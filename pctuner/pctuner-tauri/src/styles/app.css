@@ -1217,3 +1217,8 @@ html.tauri .sidebar {
   color: var(--accent);
   flex-shrink: 0;
 }
+
+.check-space {
+  width: 20px;
+  flex-shrink: 0;
+}

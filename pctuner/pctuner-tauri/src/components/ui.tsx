@@ -48,8 +48,8 @@ export interface RowProps {
   title: ReactNode;
   subtitle?: ReactNode;
   icon?: ReactNode;
-  /** Shows the round selection mark; undefined = not a selectable row. */
-  checked?: boolean;
+  /** Shows the round selection mark; "none" keeps its space empty (aligned with selectable rows); undefined = no mark. */
+  checked?: boolean | "none";
   value?: ReactNode;
   accessory?: ReactNode;
   selected?: boolean;
@@ -63,13 +63,13 @@ export function Row({ title, subtitle, icon, checked, value, accessory, selected
   const Tag = onClick ? "button" : "div";
   return (
     <Tag
-      className={cx("row", onClick && !disabled && "clickable", (selected || checked) && "selected", disabled && "disabled")}
+      className={cx("row", onClick && !disabled && "clickable", (selected || checked === true) && "selected", disabled && "disabled")}
       onClick={disabled ? undefined : onClick}
       onContextMenu={onContextMenu}
       title={title2}
-      {...(onClick ? { type: "button" as const, "aria-pressed": checked } : {})}
+      {...(onClick ? { type: "button" as const, "aria-pressed": checked === true } : {})}
     >
-      {checked !== undefined && <Check on={checked} />}
+      {checked === "none" ? <span className="check-space" /> : checked !== undefined && <Check on={checked} />}
       {icon && <span className="row-icon">{icon}</span>}
       <span className="row-main">
         <div className="row-title">{title}</div>
