@@ -1,8 +1,7 @@
-//! RTX 5080 Profiles: which preset is applied (with live graphs), the four presets, the safety trial.
-//! All logic is pctuner_core::gpu; this backend builds the view and forwards the clicks.
+//! RTX 5080 Profiles: which tune is applied (with live graphs), the four presets, custom values and the
+//! safety trial. All logic is pctuner_core::gpu; this backend builds the view and forwards the clicks.
 
 use crate::backend::{json, op_event, parse, Backend};
-use pctuner_core::common::Tone;
 use pctuner_core::gpu::*;
 use pctuner_core::opwin::OpEvent;
 use serde_json::{json, Value};
@@ -18,8 +17,10 @@ pub struct GpuTab {
 enum Action {
     /// A button of the page (the core's own `Click`).
     Click { click: Click },
-    /// A preset card was clicked.
+    /// A preset card (0-3) or the Custom card (4) was clicked.
     Select { index: usize },
+    /// A custom value was changed.
+    Custom { field: Field, value: i64 },
     /// "OK" in the message window.
     DismissError,
     Op { ev: OpEvent },
@@ -56,24 +57,18 @@ impl GpuTab {
         }
     }
 
-    /// "Currently applied": the preset, the chips and the live graphs.
+    /// "Currently applied": the tune, the chips and the live graphs.
     fn hero(&self, current: Option<usize>) -> Value {
         let Some(s) = &self.g.state else { return Value::Null };
-        let (name, unit, caption, tone) = hero_text(s.cfg.is_some(), s.saved, current);
-        // one reading for the hero, the live-check chip and the memory chip, so they always agree
+        // one reading for the hero and the chips, so they always agree
         let live = self.g.live_shown();
+        let (name, unit, caption, tone) = hero_text(current, &s.saved, live);
         let mut chips: Vec<Value> = vec![];
-        let (text, c) = live_chip(live);
+        let (text, c) = live_chip(live, s.saved.factor());
         chips.push(json!({ "text": text, "tone": c }));
-        if s.ab_running {
-            chips.push(json!({ "text": "Afterburner running", "tone": Tone::Ok }));
-        } else {
-            chips.push(json!({ "text": "Afterburner not running - presets only hold while it runs", "tone": Tone::Junk }));
-        }
         if let Some(l) = live.filter(|l| l.full_clocks) {
-            chips.push(json!({ "text": format!("Memory {} MHz ({:+} over stock {})", l.mem, l.mem_offset, l.mem_stock), "tone": Tone::Dim }));
+            chips.push(json!({ "text": format!("Memory {} MHz ({:+} over stock {})", l.mem, l.mem_offset, l.mem_stock), "tone": pctuner_core::common::Tone::Dim }));
         }
-        let no_cfg = s.cfg.is_none().then(|| format!("No RTX 5080 profile file (VEN_10DE&DEV_2C02*.cfg) in {}\\Profiles.", ab_dir().display()));
         let series = |f: &dyn Fn(&Live) -> f64| -> Vec<f64> { self.g.history.iter().map(f).collect() };
         let live = live.map(|l| {
             json!({
@@ -87,7 +82,26 @@ impl GpuTab {
                 "utilHist": series(&|l| l.util as f64),
             })
         });
-        json!({ "name": name, "unit": unit, "caption": caption, "tone": tone, "chips": chips, "noCfg": no_cfg, "live": live })
+        json!({ "name": name, "unit": unit, "caption": caption, "tone": tone, "chips": chips, "error": s.error, "live": live })
+    }
+
+    /// The custom values with the card's limits (null until the card has been read).
+    fn custom(&self) -> Value {
+        let (Some(c), Some(l)) = (self.g.custom, self.g.state.as_ref().and_then(|s| s.limits)) else { return Value::Null };
+        json!({
+            "maxMhz": c.max_mhz,
+            "core": c.core,
+            "mem": c.mem,
+            "power": c.power,
+            "powerWatts": l.power_default_w * c.power / 100,
+            "limits": {
+                "maxMhz": [l.clock.0, l.clock.1],
+                "core": [l.core.0, l.core.1],
+                "mem": [l.mem.0, l.mem.1],
+                "power": [l.power.0, l.power.1],
+            },
+            "summary": c.describe(),
+        })
     }
 }
 
@@ -112,24 +126,32 @@ impl Backend for GpuTab {
         let g = &self.g;
         let busy = g.busy();
         let st = g.state.as_ref();
-        let current = st.and_then(|s| current_preset(s.saved, g.live_shown()));
+        let current = g.current();
+        let lifts = st.map(|s| s.saved.lifts.clone()).unwrap_or_default();
         let presets: Vec<Value> = PRESETS
             .iter()
             .enumerate()
             .map(|(i, p)| {
+                // the exact values once the card's curve has been read (at the first apply)
+                let detail = if i == 0 {
+                    "no offsets, no clock limit".to_string()
+                } else if lifts.len() == PRESETS.len() {
+                    format!("max {} MHz · core {:+} · memory +{}", p.target_mhz, lifts[i], p.mem)
+                } else {
+                    format!("max {} MHz · memory +{}", p.target_mhz, p.mem)
+                };
                 json!({
                     "index": i,
                     "name": p.name,
-                    "slot": p.slot,
+                    "detail": detail,
                     "text": p.text,
                     "selected": g.selected == Some(i),
                     "current": current == Some(i),
-                    "needsWrite": st.map(|s| s.cfg.is_some() && !s.slot_ok[i]).unwrap_or(false),
                 })
             })
             .collect();
         let apply_label = match g.selected {
-            Some(i) => format!("Apply {}", PRESETS[i].name),
+            Some(i) => format!("Apply {}", tune_name(i)),
             None => "Apply preset".into(),
         };
         json!({
@@ -137,9 +159,17 @@ impl Backend for GpuTab {
             "hero": self.hero(current),
             "canReset": g.work.is_none(),
             "presets": presets,
+            "custom": self.custom(),
+            "customSelected": g.selected == Some(CUSTOM),
+            "customCurrent": current == Some(CUSTOM),
+            "afterburner": {
+                "running": st.map(|s| s.ab_running).unwrap_or(false),
+                "autostart": st.map(|s| s.ab_autostart).unwrap_or(false),
+                "canClose": g.chore.is_none(),
+            },
             "applyLabel": apply_label,
-            "canApply": !busy && g.selected.is_some(),
-            "canRestore": !busy,
+            "canApply": !busy && g.selected.is_some() && (g.selected != Some(CUSTOM) || g.custom.is_some()),
+            "canEdit": !busy,
             "canRefresh": g.refresh.is_none(),
             "status": g.status,
             "error": g.error,
@@ -156,9 +186,9 @@ impl Backend for GpuTab {
                 let allowed = match click {
                     Click::Reset | Click::Revert => g.work.is_none(),
                     Click::Apply => !g.busy() && g.selected.is_some(),
-                    Click::Restore => !g.busy(),
                     Click::Refresh => g.refresh.is_none(),
                     Click::Keep => g.can_act(),
+                    Click::CloseAfterburner => g.chore.is_none(),
                     Click::Dismiss => true,
                 };
                 // the trial buttons only exist while their notice is shown
@@ -172,8 +202,13 @@ impl Backend for GpuTab {
                 }
             }
             Action::Select { index } => {
-                if index < PRESETS.len() {
+                if index <= CUSTOM && !self.g.busy() {
                     self.g.selected = Some(index);
+                }
+            }
+            Action::Custom { field, value } => {
+                if !self.g.busy() {
+                    self.g.set_custom(field, value);
                 }
             }
             Action::DismissError => self.g.error = None,

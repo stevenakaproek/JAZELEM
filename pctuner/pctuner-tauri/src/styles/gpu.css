@@ -22,8 +22,20 @@
 }
 .gpu-presets {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: var(--s3);
+}
+.gpu-custom-row {
+  align-items: flex-start;
+}
+.gpu-custom-row .slider {
+  width: 100%;
+  margin-top: var(--s2);
+}
+.gpu-custom-value {
+  margin-left: var(--s2);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
 }
 .gpu-preset {
   display: flex;
@@ -50,6 +62,11 @@
   white-space: pre-wrap;
 }
 
+@media (max-width: 1100px) {
+  .gpu-presets {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
 @media (max-width: 860px) {
   .gpu-presets,
   .gpu-tiles {

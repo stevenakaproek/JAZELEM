@@ -1,5 +1,5 @@
-//! RTX 5080 Profiles tab - drawing only. The Afterburner file handling, presets, live readout, trial
-//! guard and page state live in pctuner_core::gpu.
+//! RTX 5080 Profiles tab - drawing only. The presets, setting them on the card, the live readout, trial
+//! guard and page state live in pctuner_core::gpu. (Custom values are only in the new app.)
 
 use crate::common::{self, Tab};
 use crate::opwin::OpWindowUi as _;
@@ -20,7 +20,7 @@ fn stat_tile(ui: &mut egui::Ui, key: &str, value: f32, unit: &str, label: &str, 
 }
 
 /// A selectable preset card. Returns true when clicked.
-fn preset_card(ui: &mut egui::Ui, i: usize, p: &Preset, selected: bool, current: bool, needs_write: bool) -> bool {
+fn preset_card(ui: &mut egui::Ui, i: usize, p: &Preset, selected: bool, current: bool) -> bool {
     let id = egui::Id::new(("gpu-preset", i));
     let hovered = ui.ctx().read_response(id).map(|r| r.hovered()).unwrap_or(false);
     let t = ui.ctx().animate_bool_with_time(id.with("hover"), hovered, 0.12);
@@ -38,11 +38,7 @@ fn preset_card(ui: &mut egui::Ui, i: usize, p: &Preset, selected: bool, current:
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| theme::chip(ui, "current", theme::OK));
                 }
             });
-            ui.label(RichText::new(format!("Afterburner slot {}", p.slot)).size(12.0).color(theme::TEXT_FAINT));
             ui.label(RichText::new(p.text).color(theme::TEXT_DIM));
-            if needs_write {
-                ui.label(RichText::new("Slot needs writing (backup first)").size(12.0).color(theme::GAMING));
-            }
         });
     });
     ui.interact(r.response.rect, id, egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
@@ -122,8 +118,8 @@ impl GpuTab {
             };
             theme::section(ui, "Currently applied");
             ui.horizontal(|ui| {
-                let (name, unit, caption, c) = hero_text(s.cfg.is_some(), s.saved, current);
-                theme::hero(ui, name, unit, &caption, theme::tone(c));
+                let (name, unit, caption, c) = hero_text(current, &s.saved, self.g.live_shown());
+                theme::hero(ui, &name, &unit, &caption, theme::tone(c));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if ui
                         .add_enabled(self.g.work.is_none(), theme::danger_button("⟲  Reset to stock"))
@@ -138,19 +134,21 @@ impl GpuTab {
             // one reading for the hero, this chip and the memory chip, so they always agree
             let live = self.g.live_shown();
             ui.horizontal_wrapped(|ui| {
-                let (text, c) = live_chip(live);
+                let (text, c) = live_chip(live, s.saved.factor());
                 theme::chip(ui, &text, theme::tone(c));
-                if s.ab_running {
-                    theme::chip(ui, "Afterburner running", theme::OK);
-                } else {
-                    theme::chip(ui, "Afterburner not running - presets only hold while it runs", theme::JUNK);
-                }
                 if let Some(l) = live.filter(|l| l.full_clocks) {
                     theme::chip(ui, &format!("Memory {} MHz ({:+} over stock {})", l.mem, l.mem_offset, l.mem_stock), theme::DIM);
                 }
             });
-            if s.cfg.is_none() {
-                theme::banner(ui, theme::LOCKED, &format!("No RTX 5080 profile file (VEN_10DE&DEV_2C02*.cfg) in {}\\Profiles.", ab_dir().display()));
+            if let Some(e) = &s.error {
+                theme::banner(ui, theme::LOCKED, e);
+            }
+            if s.ab_running || s.ab_autostart {
+                theme::banner(
+                    ui,
+                    theme::GAMING,
+                    "MSI Afterburner is running or starts with Windows - it sets the GPU too and can overwrite PC Tuner's settings. Close it, and switch it off in Startup Cleaner.",
+                );
             }
 
             if let Some(l) = live {
@@ -186,12 +184,11 @@ impl Tab for GpuTab {
 
         let mut click: Option<Click> = None;
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            theme::page_header(ui, "RTX 5080 Profiles", "Switch the card between undervolt presets stored in MSI Afterburner, and see what is applied right now.");
+            theme::page_header(ui, "RTX 5080 Profiles", "Switch the card between undervolt presets, set straight through the NVIDIA driver, and see what is applied right now.");
             common::admin_banner(ui);
             self.trial_banner(ui, can, &mut click);
 
-            let st = self.g.state.as_ref();
-            let current = st.and_then(|s| current_preset(s.saved, self.g.live_shown()));
+            let current = self.g.current();
             self.hero_card(ui, current, &mut click);
 
             ui.add_space(8.0);
@@ -199,8 +196,7 @@ impl Tab for GpuTab {
             let mut pick = None;
             ui.columns(PRESETS.len(), |cols| {
                 for (i, p) in PRESETS.iter().enumerate() {
-                    let needs_write = st.map(|s| s.cfg.is_some() && !s.slot_ok[i]).unwrap_or(false);
-                    if preset_card(&mut cols[i], i, p, self.g.selected == Some(i), current == Some(i), needs_write) {
+                    if preset_card(&mut cols[i], i, p, self.g.selected == Some(i), current == Some(i)) {
                         pick = Some(i);
                     }
                 }
@@ -212,14 +208,11 @@ impl Tab for GpuTab {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let label = match self.g.selected {
-                    Some(i) => format!("   Apply {}   ", PRESETS[i].name),
+                    Some(i) => format!("   Apply {}   ", tune_name(i)),
                     None => "   Apply preset   ".into(),
                 };
                 if ui.add_enabled(!busy && self.g.selected.is_some(), theme::primary_button(&label)).clicked() {
                     click = Some(Click::Apply);
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Restore last backup")).clicked() {
-                    click = Some(Click::Restore);
                 }
                 if ui.add_enabled(self.g.refresh.is_none(), egui::Button::new("Refresh")).clicked() {
                     click = Some(Click::Refresh);
@@ -231,7 +224,7 @@ impl Tab for GpuTab {
             ui.add_space(2.0);
             ui.label(
                 RichText::new(
-                    "A preset you have not kept yet starts as a trial. The automatic revert runs at your next sign-in after a crash (it cannot act during a freeze) and needs MSI Afterburner.",
+                    "A preset you have not kept yet starts as a trial. The automatic revert runs at your next sign-in after a crash (it cannot act during a freeze). The driver forgets these settings at every restart, so PC Tuner sets them again 30 seconds after you sign in.",
                 )
                 .size(12.0)
                 .color(theme::TEXT_DIM),

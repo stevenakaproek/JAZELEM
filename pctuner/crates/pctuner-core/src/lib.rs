@@ -8,6 +8,8 @@ pub mod fan;
 pub mod gpolicy;
 pub mod gpu;
 pub mod network;
+pub mod nvapi;
+pub mod nvml;
 pub mod opwin;
 pub mod perf;
 pub mod power;

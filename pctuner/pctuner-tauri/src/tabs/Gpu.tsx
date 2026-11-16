@@ -1,13 +1,16 @@
-// RTX 5080 Profiles: which preset is applied right now (with live graphs), the four presets and the safety trial.
-import { RefreshCw, RotateCcw } from "lucide-react";
+// RTX 5080 Profiles: which tune is applied right now (with live graphs), the four presets, custom values and
+// the safety trial. Everything is set straight through the NVIDIA driver - no MSI Afterburner needed.
+import { RefreshCw, RotateCcw, SlidersHorizontal, X } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 import { OpSheet } from "../components/OpSheet";
-import { Badge, Banner, Button, ErrorState, Group, Hero, LoadingState, Page, Sheet, Sparkline, Spinner, Stat, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
+import { Badge, Banner, Button, ErrorState, Group, Hero, LoadingState, NumberField, Page, Sheet, Slider, Sparkline, Spinner, Stat, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow, Tone } from "../lib/types";
 import { useTab } from "../lib/useTab";
 import "../styles/gpu.css";
 
-export type GpuClick = "Reset" | "Apply" | "Restore" | "Refresh" | "Keep" | "Revert" | "Dismiss";
+export type GpuClick = "Reset" | "Apply" | "Refresh" | "Keep" | "Revert" | "Dismiss" | "CloseAfterburner";
+export type GpuField = "max_mhz" | "core" | "mem" | "power";
 
 export type GpuTrial =
   | { kind: "pending"; preset: string; previous: string; appliedAt: string; unguarded: boolean; canKeep: boolean; canRevert: boolean }
@@ -30,18 +33,29 @@ export interface GpuHero {
   caption: string;
   tone: Tone;
   chips: { text: string; tone: Tone }[];
-  noCfg: string | null;
+  /** the NVIDIA driver could not be read */
+  error: string | null;
   live: GpuLive | null;
 }
 
 export interface GpuPreset {
   index: number;
   name: string;
-  slot: number;
+  /** "max 2800 MHz · core +138 · memory +1500" */
+  detail: string;
   text: string;
   selected: boolean;
   current: boolean;
-  needsWrite: boolean;
+}
+
+export interface GpuCustom {
+  maxMhz: number;
+  core: number;
+  mem: number;
+  power: number;
+  powerWatts: number;
+  limits: { maxMhz: [number, number]; core: [number, number]; mem: [number, number]; power: [number, number] };
+  summary: string;
 }
 
 export interface View {
@@ -50,9 +64,14 @@ export interface View {
   hero: GpuHero | null;
   canReset: boolean;
   presets: GpuPreset[];
+  /** null until the card's limits are known */
+  custom: GpuCustom | null;
+  customSelected: boolean;
+  customCurrent: boolean;
+  afterburner: { running: boolean; autostart: boolean; canClose: boolean };
   applyLabel: string;
   canApply: boolean;
-  canRestore: boolean;
+  canEdit: boolean;
   canRefresh: boolean;
   status: string;
   error: string | null;
@@ -60,9 +79,17 @@ export interface View {
   opCan: boolean;
 }
 
-export type Action = { kind: "click"; click: GpuClick } | { kind: "select"; index: number } | { kind: "dismiss_error" } | { kind: "op"; ev: OpEvent };
+export type Action =
+  | { kind: "click"; click: GpuClick }
+  | { kind: "select"; index: number }
+  | { kind: "custom"; field: GpuField; value: number }
+  | { kind: "dismiss_error" }
+  | { kind: "op"; ev: OpEvent };
 
 type Act = (a: Action) => Promise<void>;
+
+/** Index of the Custom card (after the four presets). */
+const CUSTOM = 4;
 
 function TrialNotice({ t, act }: { t: GpuTrial; act: Act }) {
   if (t.kind === "pending") {
@@ -113,7 +140,7 @@ function Tile({ value, unit, label, series }: { value: number; unit: string; lab
   );
 }
 
-/** The most important thing on this screen: which preset is applied, with live graphs. */
+/** The most important thing on this screen: which tune is applied, with live graphs. */
 function HeroCard({ view, act }: { view: View; act: Act }) {
   const h = view.hero;
   if (!h) {
@@ -142,7 +169,7 @@ function HeroCard({ view, act }: { view: View; act: Act }) {
             </ToneBadge>
           ))}
         </div>
-        {h.noCfg && <Banner kind="error">{h.noCfg}</Banner>}
+        {h.error && <Banner kind="error">{h.error}</Banner>}
         {h.live && (
           <div className="gpu-tiles">
             <Tile value={h.live.core} unit="MHz" label="Core clock" series={h.live.coreHist} />
@@ -156,18 +183,124 @@ function HeroCard({ view, act }: { view: View; act: Act }) {
   );
 }
 
-function PresetCard({ p, onPick }: { p: GpuPreset; onPick: () => void }) {
+function TuneCard({ name, detail, text, selected, current, icon, onPick }: { name: string; detail: string; text: string; selected: boolean; current: boolean; icon?: ReactNode; onPick: () => void }) {
   return (
-    <button type="button" className={cx("card clickable gpu-preset", p.selected && "selected")} aria-pressed={p.selected} onClick={onPick}>
+    <button type="button" className={cx("card clickable gpu-preset", selected && "selected")} aria-pressed={selected} onClick={onPick}>
       <span className="hstack">
-        <span className="gpu-preset-name">{p.name}</span>
+        {icon}
+        <span className="gpu-preset-name">{name}</span>
         <span className="spacer" />
-        {p.current && <Badge color="green">current</Badge>}
+        {current && <Badge color="green">current</Badge>}
       </span>
-      <span className="tertiary gpu-small">Afterburner slot {p.slot}</span>
-      <span className="secondary">{p.text}</span>
-      {p.needsWrite && <span className="tone-warn gpu-small">Slot needs writing (backup first)</span>}
+      <span className="tertiary gpu-small">{detail}</span>
+      <span className="secondary">{text}</span>
     </button>
+  );
+}
+
+const sign = (v: number) => (v > 0 ? `+${v}` : `${v}`);
+
+/** One custom value: slider plus number field. The slider shows its value while dragging and sends it on release. */
+function CustomRow({ label, help, value, range, step, unit, show, disabled, onCommit }: { label: string; help: string; value: number; range: [number, number]; step: number; unit: string; show: (v: number) => string; disabled: boolean; onCommit: (v: number) => void }) {
+  const [v, setV] = useState(value);
+  useEffect(() => setV(value), [value]);
+  return (
+    <div className="row gpu-custom-row">
+      <span className="row-main">
+        <div className="row-title">
+          {label} <span className="gpu-custom-value">{show(v)}</span>
+        </div>
+        <div className="row-sub">{help}</div>
+        <Slider value={v} min={range[0]} max={range[1]} step={step} disabled={disabled} label={label} onChange={setV} onCommit={onCommit} />
+      </span>
+      <span className="row-accessory">
+        <NumberField value={value} min={range[0]} max={range[1]} disabled={disabled} suffix={unit} label={label} onCommit={onCommit} />
+      </span>
+    </div>
+  );
+}
+
+function CustomGroup({ c, disabled, act }: { c: GpuCustom; disabled: boolean; act: Act }) {
+  const set = (field: GpuField) => (value: number) => void act({ kind: "custom", field, value });
+  return (
+    <Group title="Custom values" footer="Applied like a preset: a safety trial first, set again at every sign-in. A lower clock limit with a higher core offset is an undervolt.">
+      <CustomRow
+        label="Core clock limit"
+        help="The highest clock the card may run. Above it the card stays on the same voltage instead of climbing."
+        value={c.maxMhz}
+        range={c.limits.maxMhz}
+        step={15}
+        unit="MHz"
+        show={(v) => `${v} MHz`}
+        disabled={disabled}
+        onCommit={set("max_mhz")}
+      />
+      <CustomRow
+        label="Core offset"
+        help="Moves the whole voltage/frequency curve: more MHz at every voltage. Too much crashes - raise it in small steps."
+        value={c.core}
+        range={c.limits.core}
+        step={5}
+        unit="MHz"
+        show={(v) => `${sign(v)} MHz`}
+        disabled={disabled}
+        onCommit={set("core")}
+      />
+      <CustomRow
+        label="Memory offset"
+        help="Faster video memory, in the MHz nvidia-smi and Afterburner show. Too much shows as artefacts or crashes."
+        value={c.mem}
+        range={c.limits.mem}
+        step={50}
+        unit="MHz"
+        show={(v) => `${sign(v)} MHz`}
+        disabled={disabled}
+        onCommit={set("mem")}
+      />
+      <CustomRow
+        label="Power limit"
+        help="How much power the card may draw, as a share of its default."
+        value={c.power}
+        range={c.limits.power}
+        step={1}
+        unit="%"
+        show={(v) => `${v}% (${Math.round((c.powerWatts / Math.max(c.power, 1)) * v)} W)`}
+        disabled={disabled}
+        onCommit={set("power")}
+      />
+    </Group>
+  );
+}
+
+function AfterburnerBanner({ ab, act }: { ab: View["afterburner"]; act: Act }) {
+  if (!ab.running && !ab.autostart) return null;
+  return (
+    <>
+      {ab.running && (
+        <Banner
+          kind="warn"
+          action={
+            <Button icon={<X />} disabled={!ab.canClose} onClick={() => act({ kind: "click", click: "CloseAfterburner" })}>
+              Close Afterburner
+            </Button>
+          }
+        >
+          MSI Afterburner is running. It sets the GPU too and can overwrite what PC Tuner sets - close it while you use this tab.
+        </Banner>
+      )}
+      {ab.autostart && (
+        <Banner
+          kind="warn"
+          action={
+            <Button onClick={() => (location.hash = "#startup")} title="Switch it off there (it can be undone).">
+              Open Startup Cleaner
+            </Button>
+          }
+        >
+          MSI Afterburner starts with Windows and applies its own settings. PC Tuner no longer needs it - switch it off in Startup Cleaner.
+        </Banner>
+      )}
+    </>
   );
 }
 
@@ -175,7 +308,7 @@ export function Gpu() {
   const { admin } = useShell();
   const { view, error, act } = useTab<View, Action>("gpu");
   return (
-    <Page title="RTX 5080 Profiles" subtitle="Switch the card between undervolt presets stored in MSI Afterburner, and see what is applied right now.">
+    <Page title="RTX 5080 Profiles" subtitle="Undervolt presets or your own values, set straight through the NVIDIA driver, and what is applied right now.">
       {error ? (
         <ErrorState text={error} />
       ) : !view ? (
@@ -183,6 +316,7 @@ export function Gpu() {
       ) : (
         <>
           <ViewOnlyBanner admin={admin} />
+          <AfterburnerBanner ab={view.afterburner} act={act} />
           {view.trial && <TrialNotice t={view.trial} act={act} />}
           <HeroCard view={view} act={act} />
           <section className="group-wrap">
@@ -191,23 +325,32 @@ export function Gpu() {
             </div>
             <div className="gpu-presets">
               {view.presets.map((p) => (
-                <PresetCard key={p.index} p={p} onPick={() => act({ kind: "select", index: p.index })} />
+                <TuneCard key={p.index} name={p.name} detail={p.detail} text={p.text} selected={p.selected} current={p.current} onPick={() => act({ kind: "select", index: p.index })} />
               ))}
+              <TuneCard
+                name="Custom"
+                icon={<SlidersHorizontal size={16} />}
+                detail={view.custom?.summary ?? "your own values"}
+                text="Your own clock limit, core and memory offsets and power limit."
+                selected={view.customSelected}
+                current={view.customCurrent}
+                onPick={() => act({ kind: "select", index: CUSTOM })}
+              />
             </div>
           </section>
+          {view.customSelected && view.custom && <CustomGroup c={view.custom} disabled={!view.canEdit} act={act} />}
           <div className="toolbar">
             <Button variant="primary" disabled={!view.canApply} onClick={() => act({ kind: "click", click: "Apply" })}>
               {view.applyLabel}
-            </Button>
-            <Button disabled={!view.canRestore} onClick={() => act({ kind: "click", click: "Restore" })}>
-              Restore last backup
             </Button>
             <Button icon={<RefreshCw />} disabled={!view.canRefresh} onClick={() => act({ kind: "click", click: "Refresh" })}>
               Refresh
             </Button>
             {view.status && <span className="secondary selectable">{view.status}</span>}
           </div>
-          <div className="secondary gpu-small">A preset you have not kept yet starts as a trial. The automatic revert runs at your next sign-in after a crash (it cannot act during a freeze) and needs MSI Afterburner.</div>
+          <div className="secondary gpu-small">
+            A tune you have not kept yet starts as a trial. The automatic revert runs at your next sign-in after a crash (it cannot act during a freeze). The driver forgets these settings at every restart, so PC Tuner sets them again 30 seconds after you sign in.
+          </div>
           {view.op && <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} />}
           {view.error && (
             <Sheet
