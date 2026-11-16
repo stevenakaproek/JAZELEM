@@ -14,6 +14,7 @@ pub mod nvml;
 pub mod opwin;
 pub mod perf;
 pub mod power;
+pub mod procs;
 pub mod ramled;
 pub mod scheduler;
 pub mod services;

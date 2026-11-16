@@ -8,6 +8,7 @@ import { gpu } from "./gpu";
 import { network } from "./network";
 import { perf } from "./perf";
 import { power } from "./power";
+import { procs } from "./procs";
 import { ramled } from "./ramled";
 import { scheduler } from "./scheduler";
 import { services } from "./services";
@@ -26,6 +27,7 @@ export const tabs: Record<string, MockTab> = {
   network: network as MockTab,
   perf: perf as MockTab,
   power: power as MockTab,
+  procs: procs as MockTab,
   ramled: ramled as MockTab,
   scheduler: scheduler as MockTab,
   services: services as MockTab,

@@ -1,11 +1,12 @@
 // The tab registry: sidebar order, icons, and which backends each page listens to.
-import { CircuitBoard, Cpu, Fan as FanIcon, Lightbulb, Rocket, ScrollText, Settings2, Trash2, Usb as UsbIcon, Zap, type LucideIcon } from "lucide-react";
+import { CircuitBoard, Cpu, Fan as FanIcon, Lightbulb, ListChecks, Rocket, ScrollText, Settings2, Trash2, Usb as UsbIcon, Zap, type LucideIcon } from "lucide-react";
 import type { ComponentType } from "react";
 import { Bloat } from "./Bloat";
 import { Fan } from "./Fan";
 import { Gpolicy } from "./Gpolicy";
 import { Gpu } from "./Gpu";
 import { Optimize } from "./Optimize";
+import { Processes } from "./Processes";
 import { Ramled } from "./Ramled";
 import { Scheduler } from "./Scheduler";
 import { Services } from "./Services";
@@ -28,6 +29,7 @@ export const TABS: TabDef[] = [
   { id: "optimize", title: "Optimization", icon: Zap, backends: ["perf", "network", "tweaks"], page: Optimize },
   { id: "gpolicy", title: "Group Policy", icon: ScrollText, backends: ["gpolicy"], page: Gpolicy },
   { id: "scheduler", title: "CPU Scheduler", icon: Cpu, backends: ["scheduler"], page: Scheduler },
+  { id: "procs", title: "Processes", icon: ListChecks, backends: ["procs"], page: Processes },
   { id: "gpu", title: "RTX 5080 Profiles", icon: CircuitBoard, backends: ["gpu"], page: Gpu },
   { id: "fan", title: "Fan Tuner", icon: FanIcon, backends: ["fan"], page: Fan },
   { id: "ramled", title: "RAM LED", icon: Lightbulb, backends: ["ramled"], page: Ramled },

@@ -9,6 +9,7 @@ mod gpu;
 mod network;
 mod perf;
 mod power;
+mod procs;
 mod ramled;
 mod scheduler;
 mod services;
@@ -26,6 +27,7 @@ pub fn all() -> Vec<(&'static str, Box<dyn Backend>)> {
         ("tweaks", Box::new(tweaks::TweaksTab::new())),
         ("gpolicy", Box::new(gpolicy::GpolicyTab::new())),
         ("scheduler", Box::new(scheduler::SchedulerTab::new())),
+        ("procs", Box::new(procs::ProcsTab::new())),
         ("gpu", Box::new(gpu::GpuTab::new())),
         ("fan", Box::new(fan::FanTab::new())),
         ("ramled", Box::new(ramled::RamledTab::new())),

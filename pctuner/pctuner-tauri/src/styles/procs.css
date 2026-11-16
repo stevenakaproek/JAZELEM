@@ -1,0 +1,65 @@
+/* Processes tab */
+.proc-row {
+  align-items: flex-start;
+}
+.proc-changed {
+  background: var(--accent-softer);
+}
+.proc-title {
+  gap: var(--s2);
+}
+.proc-file {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+}
+.proc-loses {
+  color: var(--text-tertiary);
+}
+.proc-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.proc-use {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.proc-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+  min-width: 132px;
+}
+.proc-buttons .btn {
+  justify-content: flex-start;
+}
+.proc-saved {
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+.proc-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+.proc-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-secondary);
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+.proc-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+.proc-table td:first-child {
+  color: var(--text-secondary);
+}
+.proc-total td {
+  font-weight: 500;
+}
