@@ -1,0 +1,324 @@
+//! Fan Tuner. The engine (helper process, safety watch, settings) runs on its own thread in pctuner-core,
+//! whether or not a window is open; this backend only builds the view and forwards what the user did.
+
+use crate::backend::{parse, Backend};
+use pctuner_core::common::{self, Tone};
+use pctuner_core::fan::*;
+use serde_json::{json, Value};
+use std::collections::VecDeque;
+
+pub struct FanTab {
+    e: FanEngine,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Action {
+    GiveBack,
+    Dismiss { seq: u64 },
+    LoadProfile { name: String },
+    SaveChanges,
+    ResetBuiltin,
+    DeleteProfile,
+    NewName { name: String },
+    SaveAsNew,
+    /// BIOS / Manual / Curve / Trigger for one fan (starts from the same defaults as the classic app).
+    Mode { id: String, mode: String },
+    Manual { id: String, percent: f32 },
+    Source { id: String, source: Source },
+    CurvePoint { id: String, index: usize, t: f32, d: f32 },
+    CurveAdd { id: String, t: f32, d: f32 },
+    CurveRemove { id: String, index: usize },
+    Trigger { id: String, idle_temp: f32, load_temp: f32, idle: f32, load: f32 },
+    Follow { id: String },
+    Pump { id: String, on: bool },
+}
+
+fn hist(h: Option<&VecDeque<f32>>) -> Vec<f32> {
+    h.map(|h| h.iter().copied().collect()).unwrap_or_default()
+}
+
+fn temp(v: Option<f32>) -> Value {
+    match v {
+        Some(t) => json!({ "value": t, "tone": temp_color(t) }),
+        None => Value::Null,
+    }
+}
+
+impl FanTab {
+    pub fn new() -> Self {
+        FanTab { e: FanEngine::new(Fan::new()) }
+    }
+
+    fn fan_card(f: &Fan, s: &Status, info: &FanInfo, rpm: Option<&VecDeque<f32>>, can: bool) -> Value {
+        let setting = f.settings.get(&info.id).cloned().unwrap_or_default();
+        let ours = setting != FanSetting::Bios;
+        let handed_back = f.handed_back.contains(&info.id);
+        let pinned = f.store.pinned.contains_key(&info.id);
+        let chip = if info.controllable {
+            let (text, tone) = fan_chip(info, &setting, can, s.emergency, s.blind, handed_back);
+            json!({ "text": text, "tone": tone })
+        } else {
+            json!({ "text": "read-only", "tone": Tone::Off })
+        };
+        let notice = if !can && ours {
+            Some("Saved setting below - not applied (view-only).")
+        } else if can && ours && handed_back {
+            Some("The helper did not take this setting, so the BIOS drives this fan. PC Tuner tries again every few seconds.")
+        } else {
+            None
+        };
+        let follow = if pinned {
+            match &f.active {
+                Some(p) => format!("Use {p}'s setting for this fan again."),
+                None => "Let the next profile you pick set this fan.".to_string(),
+            }
+        } else {
+            let who = f.active.as_ref().map(|p| format!("Follows {p}.")).unwrap_or_else(|| "Follows the profile.".into());
+            format!("{who} Change it here to give this fan its own setting.")
+        };
+        let source = match &setting {
+            FanSetting::Curve { source, .. } | FanSetting::Trigger { source, .. } => Some(*source),
+            _ => None,
+        };
+        let live = source.and_then(|src| src.read(s.cpu, s.gpu));
+        // where the fan is on its curve right now
+        let live_duty = match (&setting, live) {
+            (FanSetting::Curve { points, .. }, Some(t)) => Some(curve_duty(points, t.clamp(GRAPH_T.0, GRAPH_T.1)).max(floor_for(info.pump, info.min))),
+            (FanSetting::Trigger { load_temp, idle, load, .. }, Some(t)) => Some(info.percent.unwrap_or(if t >= *load_temp { *load } else { *idle })),
+            _ => None,
+        };
+        json!({
+            "id": info.id,
+            "name": info.name,
+            "hw": info.hw,
+            "rpm": info.rpm,
+            "percent": info.percent,
+            "controllable": info.controllable,
+            "pump": info.pump,
+            "gpu": info.gpu,
+            "pinned": info.controllable && pinned,
+            "chip": chip,
+            "hist": hist(rpm),
+            "floor": floor_for(info.pump, info.min),
+            "setting": setting,
+            "notice": notice,
+            "follow": follow,
+            "live": live,
+            "liveDuty": live_duty,
+            "afterburner": info.gpu && ours && f.afterburner_running(),
+        })
+    }
+
+    fn floor(f: &Fan, id: &str) -> Option<(f32, FanInfo)> {
+        let (status, ..) = f.snapshot();
+        let info = status?.fans.into_iter().find(|x| x.id == id)?;
+        Some((floor_for(info.pump, info.min), info))
+    }
+}
+
+impl Backend for FanTab {
+    // the engine thread does the periodic work
+
+    fn on_exit(&mut self) {
+        self.e.shutdown();
+    }
+
+    fn view(&self) -> Value {
+        let mut f = self.e.lock();
+        // the page is open: start the helper the first time (view-only shows the graphics card)
+        f.ensure_started();
+        let can = f.can();
+        let (status, rpm_hist, cpu_hist, gpu_hist, stale_for) = f.snapshot();
+        let (helper_gone, stuck) = (f.helper_is_gone(), f.fans_stuck());
+        let names = f.profile_names();
+        let name = f.new_name.trim().to_string();
+        let (name_ok, name_why) = new_name_check(&name, &f.store);
+        let sources: Vec<Value> = [Source::Cpu, Source::Gpu, Source::Hottest].iter().map(|s| json!({ "key": s, "label": s.label() })).collect();
+        let mut v = json!({
+            "can": can,
+            "viewOnly": !common::is_admin() && !f.demo,
+            "error": f.error,
+            "anyControlled": f.any_controlled(),
+            "profile": {
+                "names": names,
+                "active": f.active,
+                "modified": f.modified(),
+                "builtin": f.active.as_deref().is_some_and(|n| BUILTIN.contains(&n)),
+                "note": f.note,
+                "newName": f.new_name,
+                "newNameOk": name_ok,
+                "newNameWhy": name_why,
+            },
+            "sources": sources,
+            "graph": { "tMin": (GRAPH_T.0), "tMax": (GRAPH_T.1), "minPoints": MIN_POINTS, "maxPoints": MAX_POINTS },
+        });
+        if let Some(age) = stale_for {
+            // old numbers are not shown as live (and a stale 90 C banner never stays up)
+            let (head, sub) = stale_text(helper_gone, stuck, age.as_secs());
+            v["stale"] = json!({ "head": head, "sub": sub });
+            return v;
+        }
+        let Some(s) = status else {
+            if helper_gone {
+                let (head, sub) = stale_text(true, stuck, 0);
+                v["stale"] = json!({ "head": head, "sub": sub });
+            } else {
+                v["reading"] = json!(true);
+            }
+            return v;
+        };
+        let hottest = s.cpu.into_iter().chain(s.gpu).fold(f32::NAN, f32::max);
+        let which = if s.gpu.unwrap_or(f32::MIN) >= s.cpu.unwrap_or(f32::MIN) { "GPU" } else { "CPU" };
+        // headers that have never spun (nothing plugged in) go into a folded group at the end
+        let (shown, empty): (Vec<&FanInfo>, Vec<&FanInfo>) = s.fans.iter().partition(|x| {
+            x.gpu
+                || f.settings.get(&x.id).map(|st| *st != FanSetting::Bios).unwrap_or(false)
+                || rpm_hist.get(&x.id).map(|h| h.iter().any(|v| *v > 0.0)).unwrap_or(false)
+                || x.rpm.unwrap_or(0.0) > 0.0
+        });
+        let cards = |list: &[&FanInfo]| -> Vec<Value> { list.iter().map(|x| Self::fan_card(&f, &s, x, rpm_hist.get(&x.id), can)).collect() };
+        v["status"] = json!({
+            "emergency": s.emergency,
+            "blind": s.blind,
+            "msg": if !s.msg.is_empty() && s.msg_seq != f.msg_dismissed { json!({ "seq": s.msg_seq, "text": s.msg }) } else { Value::Null },
+            "hottest": if hottest.is_nan() { Value::Null } else { json!({ "value": hottest, "which": which, "tone": temp_color(hottest) }) },
+            "cpu": temp(s.cpu),
+            "gpu": temp(s.gpu),
+            "fansFound": s.fans.len(),
+            "controllable": s.fans.iter().filter(|x| x.controllable).count(),
+            "cpuHist": hist(Some(&cpu_hist)),
+            "gpuHist": hist(Some(&gpu_hist)),
+            "fans": cards(&shown),
+            "empty": cards(&empty),
+            "temps": s.temps.iter().map(|t| { let val = t.value.unwrap_or(0.0); json!({ "hw": t.hw, "name": t.name, "value": val, "tone": temp_color(val) }) }).collect::<Vec<_>>(),
+        });
+        v
+    }
+
+    fn act(&mut self, action: Value) -> Result<Value, String> {
+        let action = parse::<Action>(action)?;
+        let mut f = self.e.lock();
+        if let Action::Dismiss { seq } = action {
+            f.msg_dismissed = seq;
+            return Ok(Value::Null);
+        }
+        // a view-only PC Tuner never changes a fan or a profile
+        if !f.can() {
+            return Ok(Value::Null);
+        }
+        match action {
+            Action::Dismiss { .. } => {}
+            Action::GiveBack => f.give_all_back(),
+            Action::LoadProfile { name } => {
+                let (status, ..) = f.snapshot();
+                let fans = status.map(|s| s.fans).unwrap_or_default();
+                f.load_profile(&name, &fans);
+            }
+            Action::SaveChanges => {
+                if f.modified() {
+                    f.save_changes();
+                }
+            }
+            Action::ResetBuiltin => {
+                if let Some(n) = f.active.clone().filter(|n| BUILTIN.contains(&n.as_str())) {
+                    let (status, ..) = f.snapshot();
+                    let fans = status.map(|s| s.fans).unwrap_or_default();
+                    f.reset_builtin(&n, &fans);
+                }
+            }
+            Action::DeleteProfile => {
+                if let Some(n) = f.active.clone().filter(|n| !BUILTIN.contains(&n.as_str())) {
+                    f.delete_profile(&n);
+                }
+            }
+            Action::NewName { name } => f.new_name = name,
+            Action::SaveAsNew => {
+                let name = f.new_name.trim().to_string();
+                if new_name_check(&name, &f.store).0 {
+                    f.save_as_new();
+                }
+            }
+            Action::Follow { id } => f.apply(id, 0.0, CardAction::FollowProfile),
+            Action::Pump { id, on } => {
+                if let Some((floor, _)) = Self::floor(&f, &id) {
+                    f.apply(id, floor, CardAction::Pump(on));
+                }
+            }
+            Action::Mode { id, mode } => {
+                let Some((floor, info)) = Self::floor(&f, &id) else { return Ok(Value::Null) };
+                let old = f.settings.get(&id).cloned().unwrap_or_default();
+                let new = match mode.as_str() {
+                    "bios" if old != FanSetting::Bios => Some(FanSetting::Bios),
+                    "manual" if !matches!(old, FanSetting::Manual { .. }) => Some(FanSetting::Manual { percent: info.percent.unwrap_or(50.0).max(floor).round() }),
+                    "curve" if !matches!(old, FanSetting::Curve { .. }) => Some(default_curve(&info.name, info.gpu, info.pump, floor)),
+                    "trigger" if !matches!(old, FanSetting::Trigger { .. }) => Some(default_trigger(&info.name, info.gpu, info.pump, floor)),
+                    _ => None,
+                };
+                if let Some(s) = new {
+                    f.apply(id, floor, CardAction::Set(s));
+                }
+            }
+            Action::Manual { id, percent } => {
+                if let Some((floor, _)) = Self::floor(&f, &id) {
+                    if matches!(f.settings.get(&id), Some(FanSetting::Manual { .. })) && percent.is_finite() {
+                        f.apply(id, floor, CardAction::Set(FanSetting::Manual { percent: percent.round().clamp(floor, 100.0) }));
+                    }
+                }
+            }
+            Action::Source { id, source } => {
+                let Some((floor, _)) = Self::floor(&f, &id) else { return Ok(Value::Null) };
+                let new = match f.settings.get(&id).cloned() {
+                    Some(FanSetting::Curve { points, .. }) => Some(FanSetting::Curve { source, points }),
+                    Some(FanSetting::Trigger { idle_temp, load_temp, idle, load, .. }) => Some(FanSetting::Trigger { source, idle_temp, load_temp, idle, load }),
+                    _ => None,
+                };
+                if let Some(s) = new {
+                    f.apply(id, floor, CardAction::Set(s));
+                }
+            }
+            Action::CurvePoint { id, index, t, d } => {
+                let Some((floor, _)) = Self::floor(&f, &id) else { return Ok(Value::Null) };
+                if let Some(FanSetting::Curve { source, mut points }) = f.settings.get(&id).cloned() {
+                    if set_point(&mut points, index, t, d, floor) {
+                        f.apply(id, floor, CardAction::Set(FanSetting::Curve { source, points }));
+                    }
+                }
+            }
+            Action::CurveAdd { id, t, d } => {
+                let Some((floor, _)) = Self::floor(&f, &id) else { return Ok(Value::Null) };
+                if let Some(FanSetting::Curve { source, mut points }) = f.settings.get(&id).cloned() {
+                    if add_point(&mut points, t, d, floor).is_some() {
+                        f.apply(id, floor, CardAction::Set(FanSetting::Curve { source, points }));
+                    }
+                }
+            }
+            Action::CurveRemove { id, index } => {
+                let Some((floor, _)) = Self::floor(&f, &id) else { return Ok(Value::Null) };
+                if let Some(FanSetting::Curve { source, mut points }) = f.settings.get(&id).cloned() {
+                    if remove_point(&mut points, index) {
+                        f.apply(id, floor, CardAction::Set(FanSetting::Curve { source, points }));
+                    }
+                }
+            }
+            Action::Trigger { id, idle_temp, load_temp, idle, load } => {
+                let Some((floor, _)) = Self::floor(&f, &id) else { return Ok(Value::Null) };
+                if let Some(FanSetting::Trigger { source, idle_temp: old_it, load_temp: old_lt, idle: old_i, load: old_l }) = f.settings.get(&id).cloned() {
+                    // keep the gaming point above the idle point, moving whichever one was not just edited
+                    let mut it = idle_temp;
+                    if load_temp != old_lt && load_temp < it + 2.0 {
+                        it = load_temp - 2.0;
+                    }
+                    let fixed = fix_trigger(it, load_temp, idle, load, floor);
+                    if fixed != (old_it, old_lt, old_i, old_l) {
+                        let (idle_temp, load_temp, idle, load) = fixed;
+                        f.apply(id, floor, CardAction::Set(FanSetting::Trigger { source, idle_temp, load_temp, idle, load }));
+                    }
+                }
+            }
+        }
+        // send the change to the helper now instead of at the engine's next tick
+        f.sync();
+        Ok(Value::Null)
+    }
+}

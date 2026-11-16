@@ -2,6 +2,7 @@
 import { CircuitBoard, Cpu, Fan, Lightbulb, Rocket, ScrollText, Settings2, Trash2, Usb, Zap, type LucideIcon } from "lucide-react";
 import type { ComponentType } from "react";
 import { ComingSoon } from "./ComingSoon";
+import { Fan as FanPage } from "./Fan";
 import { Optimize } from "./Optimize";
 
 export interface TabDef {
@@ -23,7 +24,7 @@ export const TABS: TabDef[] = [
   { id: "gpolicy", title: "Group Policy", icon: ScrollText, backends: ["gpolicy"], page: soon("Group Policy") },
   { id: "scheduler", title: "CPU Scheduler", icon: Cpu, backends: ["scheduler"], page: soon("CPU Scheduler") },
   { id: "gpu", title: "RTX 5080 Profiles", icon: CircuitBoard, backends: ["gpu"], page: soon("RTX 5080 Profiles") },
-  { id: "fan", title: "Fan Tuner", icon: Fan, backends: ["fan"], page: soon("Fan Tuner") },
+  { id: "fan", title: "Fan Tuner", icon: Fan, backends: ["fan"], page: FanPage },
   { id: "ramled", title: "RAM LED", icon: Lightbulb, backends: ["ramled"], page: soon("RAM LED") },
   { id: "usb", title: "USB Port Finder", icon: Usb, backends: ["usb"], page: soon("USB Port Finder") },
 ];

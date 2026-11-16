@@ -1,0 +1,234 @@
+import type { Tone } from "../lib/types";
+import type { FanAction, FanCardView, FanSetting, FanView } from "../tabs/Fan";
+import { mockAdmin, mockParams } from "./env";
+import type { MockTab } from "./types";
+
+const tone = (t: number): Tone => (t >= 85 ? "Error" : t >= 70 ? "Warn" : "Accent");
+const curve = (source: "cpu" | "gpu" | "hottest"): FanSetting => ({ mode: "curve", source, points: [[30, 30], [50, 40], [65, 60], [75, 80], [85, 100]] });
+
+interface MockFan {
+  id: string;
+  name: string;
+  hw: string;
+  base: number;
+  gpu: boolean;
+  pump: boolean;
+  controllable: boolean;
+  floor: number;
+  setting: FanSetting;
+  pinned: boolean;
+  hist: number[];
+}
+
+const board = "MSI MAG X870E TOMAHAWK WIFI (NCT6687D)";
+const fans: MockFan[] = [
+  { id: "cpu", name: "CPU Fan", hw: board, base: 900, gpu: false, pump: false, controllable: true, floor: 0, setting: { mode: "manual", percent: 45 }, pinned: true, hist: [] },
+  { id: "pump", name: "Pump Fan", hw: board, base: 2400, gpu: false, pump: true, controllable: true, floor: 0, setting: curve("cpu"), pinned: false, hist: [] },
+  { id: "sys1", name: "System Fan #1", hw: board, base: 780, gpu: false, pump: false, controllable: true, floor: 0, setting: { mode: "trigger", source: "hottest", idle_temp: 55, load_temp: 65, idle: 30, load: 70 }, pinned: false, hist: [] },
+  { id: "sys2", name: "System Fan #2", hw: board, base: 760, gpu: false, pump: false, controllable: true, floor: 0, setting: curve("hottest"), pinned: false, hist: [] },
+  { id: "gpu", name: "GPU Fan", hw: "NVIDIA GeForce RTX 5080", base: 1150, gpu: true, pump: false, controllable: true, floor: 30, setting: { mode: "bios" }, pinned: false, hist: [] },
+  { id: "sys5", name: "System Fan #5", hw: board, base: 0, gpu: false, pump: false, controllable: true, floor: 0, setting: { mode: "bios" }, pinned: false, hist: [] },
+];
+const names = ["Silent", "Balanced", "Performance", "Night"];
+let active: string | null = "Balanced";
+let note: string | null = "Balanced was applied when PC Tuner started.";
+let newName = "";
+let tick = 0;
+let cpu = 58;
+let gpu = 52;
+const cpuHist: number[] = [];
+const gpuHist: number[] = [];
+let dismissed = 0;
+
+function step() {
+  tick += 1;
+  cpu = 58 + 6 * Math.sin(tick / 9) + 2 * Math.sin(tick / 2.3);
+  gpu = 52 + 8 * Math.sin(tick / 13 + 1);
+  cpuHist.push(cpu);
+  gpuHist.push(gpu);
+  if (cpuHist.length > 60) cpuHist.shift();
+  if (gpuHist.length > 60) gpuHist.shift();
+  for (const f of fans) {
+    f.hist.push(f.base ? f.base + 40 * Math.sin(tick / 5 + f.base) : 0);
+    if (f.hist.length > 60) f.hist.shift();
+  }
+}
+for (let i = 0; i < 60; i++) step();
+
+function duty(points: [number, number][], t: number): number {
+  if (t <= points[0][0]) return points[0][1];
+  for (let i = 1; i < points.length; i++) {
+    const [t0, d0] = points[i - 1];
+    const [t1, d1] = points[i];
+    if (t <= t1) return d0 + ((d1 - d0) * (t - t0)) / (t1 - t0);
+  }
+  return points[points.length - 1][1];
+}
+
+function card(f: MockFan): FanCardView {
+  const s = f.setting;
+  const src = s.mode === "curve" || s.mode === "trigger" ? s.source : null;
+  const live = src === "cpu" ? cpu : src === "gpu" ? gpu : src ? Math.max(cpu, gpu) : null;
+  const liveDuty = live === null ? null : s.mode === "curve" ? Math.max(duty(s.points, live), f.floor) : s.mode === "trigger" ? (live >= s.load_temp ? s.load : s.idle) : null;
+  const ours = s.mode !== "bios";
+  const text = !mockAdmin ? "BIOS" : s.mode === "curve" ? "Curve" : s.mode === "trigger" ? "Trigger" : ours ? "PC Tuner" : "BIOS";
+  return {
+    id: f.id,
+    name: f.name,
+    hw: f.hw,
+    rpm: f.hist[f.hist.length - 1] ?? 0,
+    percent: s.mode === "manual" ? s.percent : (liveDuty ?? (f.base ? 40 : 0)),
+    controllable: f.controllable,
+    pump: f.pump,
+    gpu: f.gpu,
+    pinned: f.pinned,
+    chip: { text, tone: text === "BIOS" ? "Off" : "Accent" },
+    hist: f.hist,
+    floor: f.floor,
+    setting: s,
+    notice: !mockAdmin && ours ? "Saved setting below - not applied (view-only)." : null,
+    follow: f.pinned ? `Use ${active ?? "the profile"}'s setting for this fan again.` : `${active ? `Follows ${active}.` : "Follows the profile."} Change it here to give this fan its own setting.`,
+    live,
+    liveDuty,
+    afterburner: f.gpu && ours,
+  };
+}
+
+const state = mockParams.get("state");
+
+export const fan: MockTab<FanView, FanAction> = {
+  view() {
+    const base: FanView = {
+      can: mockAdmin,
+      viewOnly: !mockAdmin,
+      error: null,
+      anyControlled: fans.some((f) => f.setting.mode !== "bios"),
+      profile: { names, active, modified: fans.some((f) => f.pinned) && false, builtin: active !== "Night", note, newName, newNameOk: newName.trim() !== "" && !names.includes(newName.trim()), newNameWhy: names.includes(newName.trim()) ? `A profile called ${newName.trim()} already exists - pick it and use Save changes, or choose another name.` : null },
+      sources: [
+        { key: "cpu", label: "CPU temperature" },
+        { key: "gpu", label: "GPU temperature" },
+        { key: "hottest", label: "Hotter of CPU and GPU" },
+      ],
+      graph: { tMin: 20, tMax: 100, minPoints: 2, maxPoints: 16 },
+    };
+    if (state === "reading") return { ...base, reading: true };
+    if (state === "stale") return { ...base, stale: { head: "The fan helper is not running", sub: "Fans are on BIOS control. Restart PC Tuner to try again." } };
+    const hottest = Math.max(cpu, gpu);
+    const live = fans.filter((f) => f.base > 0 || f.setting.mode !== "bios");
+    return {
+      ...base,
+      status: {
+        emergency: state === "hot",
+        blind: false,
+        msg: dismissed === 0 && state === "msg" ? { seq: 1, text: "System Fan #3: the controller refused 20 % and uses 30 %." } : null,
+        hottest: { value: hottest, which: gpu >= cpu ? "GPU" : "CPU", tone: tone(hottest) },
+        cpu: mockAdmin ? { value: cpu, tone: tone(cpu) } : null,
+        gpu: { value: gpu, tone: tone(gpu) },
+        fansFound: fans.length,
+        controllable: fans.filter((f) => f.controllable).length,
+        cpuHist: mockAdmin ? cpuHist : [],
+        gpuHist,
+        fans: live.map(card),
+        empty: fans.filter((f) => !live.includes(f)).map(card),
+        temps: [
+          { hw: "AMD Ryzen 7 9800X3D", name: "Core (Tctl/Tdie)", value: cpu, tone: tone(cpu) },
+          { hw: "NVIDIA GeForce RTX 5080", name: "GPU Core", value: gpu, tone: tone(gpu) },
+          { hw: board, name: "System", value: 38, tone: tone(38) },
+          { hw: board, name: "VRM MOS", value: 47, tone: tone(47) },
+        ],
+      },
+    };
+  },
+  act(a) {
+    if (a.kind === "dismiss") {
+      dismissed = a.seq;
+      return;
+    }
+    if (!mockAdmin) return;
+    const f = "id" in a ? fans.find((x) => x.id === a.id) : undefined;
+    const own = (s: FanSetting) => {
+      if (f) {
+        f.setting = s;
+        f.pinned = true;
+      }
+    };
+    switch (a.kind) {
+      case "give_back":
+        fans.forEach((x) => {
+          x.setting = { mode: "bios" };
+          x.pinned = false;
+        });
+        active = null;
+        note = "Every fan is back on BIOS control. Own settings were cleared and no profile is applied at startup until you pick one.";
+        break;
+      case "load_profile":
+        active = a.name;
+        note = `${a.name} is on. It will be applied again the next time PC Tuner starts.`;
+        break;
+      case "save_changes":
+        note = `${active} saved.`;
+        break;
+      case "new_name":
+        newName = a.name;
+        break;
+      case "save_as_new":
+        names.push(newName.trim());
+        active = newName.trim();
+        note = `${active} saved and will be applied when PC Tuner starts.`;
+        newName = "";
+        break;
+      case "delete_profile":
+        if (active) names.splice(names.indexOf(active), 1);
+        note = `${active} deleted. The fans stay as they are until you change them.`;
+        active = null;
+        break;
+      case "mode":
+        if (!f || f.setting.mode === a.mode) break;
+        if (a.mode === "bios") own({ mode: "bios" });
+        if (a.mode === "manual") own({ mode: "manual", percent: 50 });
+        if (a.mode === "curve") own(curve(f.gpu ? "gpu" : "hottest"));
+        if (a.mode === "trigger") own({ mode: "trigger", source: f.gpu ? "gpu" : "hottest", idle_temp: 55, load_temp: 65, idle: 30, load: 70 });
+        break;
+      case "manual":
+        own({ mode: "manual", percent: Math.max(f?.floor ?? 0, Math.round(a.percent)) });
+        break;
+      case "source":
+        if (f && (f.setting.mode === "curve" || f.setting.mode === "trigger")) own({ ...f.setting, source: a.source });
+        break;
+      case "curve_point":
+        if (f && f.setting.mode === "curve") {
+          const points = f.setting.points.map((p) => [p[0], p[1]] as [number, number]);
+          points[a.index] = [Math.round(a.t), Math.round(a.d)];
+          own({ ...f.setting, points });
+        }
+        break;
+      case "curve_add":
+        if (f && f.setting.mode === "curve") {
+          const t = Math.round(a.t);
+          if (f.setting.points.some((p) => Math.abs(p[0] - t) < 2)) break;
+          const points = [...f.setting.points, [t, Math.max(f.floor, Math.round(a.d))] as [number, number]].sort((p, q) => p[0] - q[0]);
+          own({ ...f.setting, points });
+        }
+        break;
+      case "curve_remove":
+        if (f && f.setting.mode === "curve" && f.setting.points.length > 2) own({ ...f.setting, points: f.setting.points.filter((_, i) => i !== a.index) });
+        break;
+      case "trigger":
+        if (f && f.setting.mode === "trigger") own({ ...f.setting, idle_temp: Math.min(a.idle_temp, a.load_temp - 2), load_temp: a.load_temp, idle: a.idle, load: a.load });
+        break;
+      case "follow":
+        if (f) f.pinned = false;
+        break;
+      case "pump":
+        if (f) f.pump = a.on;
+        break;
+      default:
+        break;
+    }
+  },
+  tick() {
+    if (tick % 2 === 0) step();
+    else tick += 1;
+    return tick % 2 === 1;
+  },
+};

@@ -40,6 +40,7 @@ pub fn op_event(op: &mut Option<OpWindow>, ev: OpEvent) -> OpEvent {
 }
 
 /// An operation window in its running stage counts as busy.
+#[allow(dead_code)]
 pub fn op_running(op: &Option<OpWindow>) -> bool {
     op.as_ref().is_some_and(|o| o.stage == Stage::Running)
 }
