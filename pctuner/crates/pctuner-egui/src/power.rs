@@ -1,97 +1,21 @@
-//! Power button: restart into the BIOS (UEFI setup), or shut down so the next start opens the BIOS.
-//! Uses Windows' own `shutdown /fw` (needs administrator and a UEFI PC).
+//! Power button window - drawing only. The choices and the shutdown call live in pctuner_core::power.
 
-use crate::common::{self, Job};
 use crate::theme;
 use eframe::egui::{self, RichText};
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Choice {
-    RestartToBios,
-    ShutdownToBios,
-}
-
-impl Choice {
-    fn title(self) -> &'static str {
-        match self {
-            Choice::RestartToBios => "Restart into BIOS",
-            Choice::ShutdownToBios => "Shut down, BIOS on next start",
-        }
-    }
-    fn text(self) -> &'static str {
-        match self {
-            Choice::RestartToBios => "Windows restarts and opens your motherboard's BIOS (UEFI) setup straight away.",
-            Choice::ShutdownToBios => "The PC turns off. The next time you press the power button it goes straight into the BIOS.",
-        }
-    }
-    /// Arguments for shutdown.exe. /fw = next boot goes to the firmware setup; /t 0 = no waiting.
-    pub fn args(self) -> [&'static str; 4] {
-        match self {
-            Choice::RestartToBios => ["/r", "/fw", "/t", "0"],
-            Choice::ShutdownToBios => ["/s", "/fw", "/t", "0"],
-        }
-    }
-}
-
-enum Stage {
-    Choose,
-    /// The choice and the UI time the command was sent.
-    Working(Choice, f64),
-}
-
-/// Seconds after which a restart / shut down that did not happen is reported (it was cancelled,
-/// for example on Windows' "apps are preventing restart" screen, or blocked by a program).
-const WORKING_TIMEOUT: f64 = 25.0;
-
-/// True when PC Tuner is still running `WORKING_TIMEOUT` seconds after the command was sent.
-fn working_timed_out(started: f64, now: f64) -> bool {
-    now - started >= WORKING_TIMEOUT
-}
+use pctuner_core::power::*;
 
 pub struct PowerDialog {
-    stage: Stage,
-    /// Some(true) when the PC boots in UEFI mode (needed for /fw); checked when the window opens.
-    uefi: Option<bool>,
-    uefi_job: Option<Job<bool>>,
-    job: Option<Job<Result<(i32, String), String>>>,
-    error: Option<String>,
-}
-
-fn is_uefi() -> bool {
-    common::run("cmd.exe", &["/c", "echo %firmware_type%"]).map(|(_, out)| out.trim().eq_ignore_ascii_case("UEFI")).unwrap_or(false)
+    p: Power,
 }
 
 impl PowerDialog {
     pub fn new() -> Self {
-        PowerDialog { stage: Stage::Choose, uefi: None, uefi_job: Some(Job::spawn(is_uefi)), job: None, error: None }
+        PowerDialog { p: Power::new() }
     }
 
     /// Draw the window. Returns false when it should close.
     pub fn show(&mut self, ctx: &egui::Context) -> bool {
-        if let Some(j) = &self.uefi_job {
-            if let Some(v) = j.poll() {
-                self.uefi = Some(v);
-                self.uefi_job = None;
-            }
-        }
-        if let Some(j) = &self.job {
-            if let Some(r) = j.poll() {
-                self.job = None;
-                match r {
-                    // shutdown.exe returns at once; Windows then closes everything
-                    Ok((0, _)) => {}
-                    Ok((code, out)) => {
-                        self.error = Some(format!("Windows refused (code {code}): {}", out.trim()));
-                        self.stage = Stage::Choose;
-                    }
-                    Err(e) => {
-                        self.error = Some(e);
-                        self.stage = Stage::Choose;
-                    }
-                }
-            }
-        }
-        let admin = common::is_admin();
+        self.p.pump();
         let mut keep = true;
         theme::dim_backdrop(ctx, "power");
         egui::Window::new("power-dialog")
@@ -104,38 +28,28 @@ impl PowerDialog {
             .show(ctx, |ui| {
                 ui.set_width(520.0);
                 theme::section(ui, "Power");
-                match self.stage {
+                match self.p.stage {
                     Stage::Choose => {
                         ui.label(RichText::new("Go into the BIOS").size(24.0).strong());
                         ui.label(RichText::new("No need to press Del at the right moment - Windows tells the motherboard to open its setup.").color(theme::TEXT_DIM));
                         ui.add_space(8.0);
-                        if let Some(e) = &self.error {
+                        if let Some(e) = &self.p.error {
                             theme::banner(ui, theme::LOCKED, e);
                             ui.add_space(4.0);
                         }
-                        let blocked = if !admin {
-                            Some("Run PC Tuner as administrator to use this.")
-                        } else if self.uefi == Some(false) {
-                            Some("This PC does not boot in UEFI mode, so Windows cannot open the BIOS for you. Press Del while the PC starts instead.")
-                        } else {
-                            None
-                        };
+                        let blocked = self.p.blocked();
                         if let Some(b) = blocked {
                             theme::banner(ui, theme::GAMING, b);
                             ui.add_space(4.0);
                         }
                         for c in [Choice::RestartToBios, Choice::ShutdownToBios] {
-                            let picked = choice_card(ui, c, blocked.is_none() && self.uefi.is_some());
-                            if picked {
-                                // no second window: the click is the confirmation
-                                self.error = None;
-                                self.stage = Stage::Working(c, ctx.input(|i| i.time));
-                                self.job = Some(Job::spawn(move || common::run("shutdown.exe", &c.args())));
+                            if choice_card(ui, c, self.p.can_pick()) {
+                                self.p.pick(c, ctx.input(|i| i.time));
                             }
                             ui.add_space(6.0);
                         }
                         ui.label(RichText::new("Clicking one acts at once: every open program closes without saving.").size(12.0).color(theme::GAMING));
-                        if self.uefi.is_none() {
+                        if self.p.uefi.is_none() {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label(RichText::new("Checking the firmware type...").color(theme::TEXT_DIM));
@@ -147,18 +61,14 @@ impl PowerDialog {
                         }
                     }
                     Stage::Working(c, started) if working_timed_out(started, ctx.input(|i| i.time)) => {
-                        let t = match c {
-                            Choice::RestartToBios => "Windows did not restart",
-                            Choice::ShutdownToBios => "Windows did not shut down",
-                        };
-                        ui.label(RichText::new(t).size(22.0).strong());
+                        ui.label(RichText::new(c.failed_title()).size(22.0).strong());
                         ui.label(RichText::new("The restart or shut down was cancelled or blocked (for example by a program that would not close).").color(theme::TEXT_DIM));
                         ui.add_space(8.0);
                         theme::banner(ui, theme::GAMING, "Windows may still remember the BIOS request: the next restart can open the BIOS.");
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             if ui.button("Back").clicked() {
-                                self.stage = Stage::Choose;
+                                self.p.back();
                             }
                             if ui.add(theme::primary_button("   Close   ")).clicked() {
                                 keep = false;
@@ -168,11 +78,7 @@ impl PowerDialog {
                     Stage::Working(c, _) => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            let t = match c {
-                                Choice::RestartToBios => "Restarting into the BIOS...",
-                                Choice::ShutdownToBios => "Shutting down...",
-                            };
-                            ui.label(RichText::new(t).size(22.0).strong());
+                            ui.label(RichText::new(c.working_title()).size(22.0).strong());
                         });
                         ui.label(RichText::new("Windows is closing your programs.").color(theme::TEXT_DIM));
                         ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -210,23 +116,4 @@ fn choice_card(ui: &mut egui::Ui, c: Choice, enabled: bool) -> bool {
         r.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
     }
     enabled && r.clicked()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn power_shutdown_args() {
-        assert_eq!(Choice::RestartToBios.args(), ["/r", "/fw", "/t", "0"]);
-        assert_eq!(Choice::ShutdownToBios.args(), ["/s", "/fw", "/t", "0"]);
-    }
-
-    #[test]
-    fn power_working_times_out() {
-        assert!(!working_timed_out(100.0, 100.0));
-        assert!(!working_timed_out(100.0, 124.9));
-        assert!(working_timed_out(100.0, 125.0));
-        assert!(working_timed_out(100.0, 500.0));
-    }
 }

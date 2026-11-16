@@ -3,7 +3,7 @@
 //! Menu clicks arrive through Windows' message loop, so they work while the window is hidden.
 
 use crate::common;
-use crate::power::Choice;
+use pctuner_core::power::Choice;
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};

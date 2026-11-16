@@ -10,6 +10,7 @@ pub mod gpu;
 pub mod network;
 pub mod opwin;
 pub mod perf;
+pub mod power;
 pub mod ramled;
 pub mod scheduler;
 pub mod services;
