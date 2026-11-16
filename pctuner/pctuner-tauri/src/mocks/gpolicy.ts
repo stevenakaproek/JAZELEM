@@ -100,7 +100,6 @@ function setTarget(pol: Policy, s: St) {
   pol.want = same(t, pol.cur) ? null : t;
 }
 
-const picked = new Set<number>();
 const op = new MockOp();
 let search = "";
 let lastAction = "";
@@ -123,16 +122,14 @@ function row(pol: Policy, index: number): PolicyRow {
     name: pol.name,
     advice: pol.advice,
     tip: `gpedit: ${pol.user ? "User Configuration" : "Computer Configuration"}\n${pol.path} > "${pol.title}"`,
-    picked: picked.has(index),
     changed,
+    state: tgt.kind,
     current: label(pol, pol.cur),
     currentColor: pol.cur.kind === "not_configured" ? "" : "green",
     target: label(pol, tgt),
     note,
     rec: pol.rec ? (same(pol.rec, tgt) ? { text: "recommended", color: "accent" } : { text: `recommended: ${label(pol, pol.rec)}`, color: "" }) : { text: "your choice", color: "" },
-    opts: tgt.kind === "enabled" ? pol.opts.map((o, k) => ({ label: o.label, value: vals[k], known: o.choices.some((c) => c[1] === vals[k]), choices: o.choices.map(([l, value]) => ({ label: l, value })) })) : [],
-    menuTitle: picked.has(index) && picked.size > 1 ? `${picked.size} selected policies` : pol.name,
-  };
+    opts: tgt.kind === "enabled" ? pol.opts.map((o, k) => ({ label: o.label, value: vals[k], known: o.choices.some((c) => c[1] === vals[k]), choices: o.choices.map(([l, value]) => ({ label: l, value })) })) : [],  };
 }
 
 export const gpolicy: MockTab<View, Action> = {
@@ -140,7 +137,6 @@ export const gpolicy: MockTab<View, Action> = {
     const loaded = state !== "loading";
     const busy = op.op?.stage === "Running";
     const can = mockAdmin && !busy;
-    const recs = policies.filter((x) => x.rec);
     const changes = policies.filter((x) => x.want).length;
     const q = state === "empty" ? "no such policy" : search.trim().toLowerCase();
     const groups = !loaded
@@ -157,17 +153,15 @@ export const gpolicy: MockTab<View, Action> = {
       gpo,
       edition: gpo ? "Professional" : "Core",
       loadError: state === "error" ? "Could not read the policy file C:\\Windows\\System32\\GroupPolicy\\Machine\\Registry.pol (Registry.pol is damaged). Showing the registry instead." : null,
-      atRec: recs.filter((x) => x.rec && same(x.rec, x.cur)).length,
-      recs: recs.length,
+      configured: policies.filter((x) => x.cur.kind !== "not_configured").length,
+      total: policies.length,
       changes,
       canEdit: !busy,
       canApply: can && changes > 0,
-      canSelect: loaded && !busy,
       canDiscard: changes > 0 && !busy,
       canUndo: can && lastBatch !== null,
       canRefresh: !busy && loaded,
       working: busy || !loaded,
-      picked: picked.size,
       lastAction,
       search: state === "empty" ? "no such policy" : search,
       groups,
@@ -177,17 +171,8 @@ export const gpolicy: MockTab<View, Action> = {
   },
   act(a) {
     switch (a.kind) {
-      case "toggle":
-        if (!picked.delete(a.index)) picked.add(a.index);
-        break;
-      case "set": {
-        const rows = picked.has(a.index) ? [...picked] : [a.index];
-        picked.add(a.index);
-        rows.forEach((i) => setTarget(policies[i], a.state === "enabled" ? on() : a.state === "disabled" ? off : nc));
-        break;
-      }
-      case "keep":
-        (picked.has(a.index) ? [...picked] : [a.index]).forEach((i) => (policies[i].want = null));
+      case "set":
+        setTarget(policies[a.index], a.state === "enabled" ? on() : a.state === "disabled" ? off : nc);
         break;
       case "reset":
         policies[a.index].want = null;
@@ -205,17 +190,6 @@ export const gpolicy: MockTab<View, Action> = {
       case "search":
         search = a.text;
         break;
-      case "select_recommended": {
-        let n = 0;
-        policies.forEach((pol) => {
-          if (pol.rec && !same(pol.rec, pol.cur)) {
-            pol.want = pol.rec;
-            n += 1;
-          }
-        });
-        lastAction = n === 0 ? "Everything recommended is already set." : `${n} recommended changes selected. Review them below (change or reset any row), then Apply.`;
-        break;
-      }
       case "apply": {
         const ch = policies.map((pol, index) => ({ pol, index })).filter(({ pol }) => pol.want);
         if (!mockAdmin || ch.length === 0) break;
@@ -243,7 +217,6 @@ export const gpolicy: MockTab<View, Action> = {
               pol.inReg = undefined;
               pol.notLive = false;
             });
-            picked.clear();
             lastAction = `${ch.length} policies changed.`;
             if (op.op) {
               op.op.can_undo = false;
@@ -255,7 +228,6 @@ export const gpolicy: MockTab<View, Action> = {
       }
       case "discard":
         policies.forEach((pol) => (pol.want = null));
-        picked.clear();
         lastAction = "";
         break;
       case "undo": {
@@ -280,9 +252,6 @@ export const gpolicy: MockTab<View, Action> = {
       }
       case "refresh":
       case "gpedit":
-        break;
-      case "clear_selection":
-        picked.clear();
         break;
       case "op":
         op.event(a.ev);

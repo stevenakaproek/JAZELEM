@@ -1,8 +1,8 @@
-// Group Policy: click policies to select them, right-click to enable or disable, then apply the changes.
-import { ArrowRight, RefreshCw, Search as SearchIcon } from "lucide-react";
+// Group Policy: every policy has its own Not configured / Enabled / Disabled control; Apply writes the changes.
+import { RefreshCw, Search as SearchIcon } from "lucide-react";
 import { useState } from "react";
 import { OpSheet } from "../components/OpSheet";
-import { Badge, Banner, Button, Check, ContextMenu, EmptyState, ErrorState, Group, Hero, LoadingState, Page, SearchField, Spinner, Stat, ViewOnlyBanner, cx, type BadgeColor, type MenuItem } from "../components/ui";
+import { Badge, Banner, Button, EmptyState, ErrorState, Group, Hero, LoadingState, Page, SearchField, Segmented, Spinner, Stat, ViewOnlyBanner, cx, type BadgeColor } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow } from "../lib/types";
 import { useTab } from "../lib/useTab";
@@ -27,15 +27,15 @@ export interface PolicyRow {
   name: string;
   advice: string;
   tip: string;
-  picked: boolean;
   changed: boolean;
+  /** What the policy will be after Apply ("other": set by something else, no segment lit). */
+  state: PolicyChoice | "other";
   current: string;
   currentColor: BadgeColor;
   target: string;
   note: Chip | null;
   rec: Chip;
   opts: PolicyOpt[];
-  menuTitle: string;
 }
 
 export interface View {
@@ -43,17 +43,16 @@ export interface View {
   gpo: boolean;
   edition: string;
   loadError: string | null;
-  atRec: number;
-  recs: number;
+  /** Policies that are Enabled or Disabled now, and how many there are. */
+  configured: number;
+  total: number;
   changes: number;
   canEdit: boolean;
   canApply: boolean;
-  canSelect: boolean;
   canDiscard: boolean;
   canUndo: boolean;
   canRefresh: boolean;
   working: boolean;
-  picked: number;
   lastAction: string;
   search: string;
   groups: { name: string; rows: PolicyRow[] }[];
@@ -64,44 +63,32 @@ export interface View {
 export type PolicyChoice = "enabled" | "disabled" | "not_configured";
 
 export type Action =
-  | { kind: "toggle" | "keep" | "reset"; index: number }
+  | { kind: "reset"; index: number }
   | { kind: "set"; index: number; state: PolicyChoice }
   | { kind: "opt"; index: number; opt: number; value: number }
   | { kind: "search"; text: string }
-  | { kind: "select_recommended" | "apply" | "discard" | "undo" | "refresh" | "gpedit" | "clear_selection" }
+  | { kind: "apply" | "discard" | "undo" | "refresh" | "gpedit" }
   | { kind: "op"; ev: OpEvent };
 
 type Act = (a: Action) => Promise<void>;
 
-/** One policy. A click selects it; a right-click opens Enable / Disable / Not configured. Its drop-downs and Reset keep their own clicks. */
-function PolicyLine({ r, canEdit, act, onMenu }: { r: PolicyRow; canEdit: boolean; act: Act; onMenu: (e: React.MouseEvent, r: PolicyRow) => void }) {
-  const toggle = () => act({ kind: "toggle", index: r.index });
+const CHOICES: { value: PolicyChoice; label: string }[] = [
+  { value: "not_configured", label: "Not configured" },
+  { value: "enabled", label: "Enabled" },
+  { value: "disabled", label: "Disabled" },
+];
+
+/** One policy with its own Not configured / Enabled / Disabled control. Nothing is written until Apply. */
+function PolicyLine({ r, canEdit, act }: { r: PolicyRow; canEdit: boolean; act: Act }) {
   return (
-    <div
-      className={cx("row", "gp-row", canEdit && "clickable", r.picked && "selected")}
-      role="button"
-      tabIndex={canEdit ? 0 : -1}
-      aria-pressed={r.picked}
-      onClick={canEdit ? toggle : undefined}
-      onKeyDown={(e) => {
-        if (canEdit && e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
-          e.preventDefault();
-          void toggle();
-        }
-      }}
-      onContextMenu={(e) => {
-        e.preventDefault();
-        if (canEdit) onMenu(e, r);
-      }}
-    >
-      <Check on={r.picked} />
+    <div className={cx("row", "gp-row", r.changed && "changed")}>
       <span className="row-main">
         <div className="row-title" title={r.tip}>
           {r.name}
         </div>
         <div className="row-sub">{r.advice}</div>
         {r.opts.length > 0 && (
-          <div className="gp-opts" onClick={(e) => e.stopPropagation()}>
+          <div className="gp-opts">
             {r.opts.map((o, k) => (
               <label key={k} className="hstack">
                 {o.label}
@@ -122,36 +109,29 @@ function PolicyLine({ r, canEdit, act, onMenu }: { r: PolicyRow; canEdit: boolea
           </div>
         )}
       </span>
-      <span className="row-accessory">
-        <Badge color={r.rec.color}>{r.rec.text}</Badge>
-        {r.changed ? (
-          <>
-            <span className="hstack secondary" style={{ gap: 4 }}>
-              {r.current}
-              <ArrowRight size={12} />
-            </span>
-            <Badge color="accent">{r.target}</Badge>
-            <Button
-              variant="plain"
-              title="Keep it as it is now."
-              onClick={(e) => {
-                e.stopPropagation();
-                void act({ kind: "reset", index: r.index });
-              }}
-            >
-              Reset
-            </Button>
-          </>
-        ) : (
-          <>
-            {r.note && (
-              <Badge color={r.note.color} title={r.note.tip}>
-                {r.note.text}
-              </Badge>
-            )}
-            <Badge color={r.currentColor}>{r.current}</Badge>
-          </>
-        )}
+      <span className="gp-side">
+        <Segmented value={r.state as PolicyChoice} options={CHOICES} disabled={!canEdit} onChange={(state) => void act({ kind: "set", index: r.index, state })} />
+        <span className="gp-status">
+          {r.changed ? (
+            <>
+              <span className="secondary">now: {r.current}</span>
+              <Badge color="accent">changes on Apply</Badge>
+              <Button variant="plain" title="Keep it as it is now." onClick={() => void act({ kind: "reset", index: r.index })}>
+                Reset
+              </Button>
+            </>
+          ) : (
+            <>
+              {r.note && (
+                <Badge color={r.note.color} title={r.note.tip}>
+                  {r.note.text}
+                </Badge>
+              )}
+              {r.state === "other" && <Badge color={r.currentColor}>{r.current}</Badge>}
+              <Badge color={r.rec.color}>{r.rec.text}</Badge>
+            </>
+          )}
+        </span>
       </span>
     </div>
   );
@@ -159,23 +139,10 @@ function PolicyLine({ r, canEdit, act, onMenu }: { r: PolicyRow; canEdit: boolea
 
 function Body({ view, admin, act }: { view: View; admin: boolean; act: Act }) {
   const [search, setSearch] = useState(view.search);
-  const [menu, setMenu] = useState<{ x: number; y: number; row: PolicyRow } | null>(null);
   // the backend keeps the search text (it filters the list); the field itself stays local so typing never lags
   const type = (text: string) => {
     setSearch(text);
     void act({ kind: "search", text });
-  };
-  const menuItems = (r: PolicyRow): (MenuItem | "separator")[] => {
-    const set = (state: PolicyChoice) => () => void act({ kind: "set", index: r.index, state });
-    return [
-      { label: r.menuTitle, disabled: true, onClick: () => {} },
-      "separator",
-      { label: "Enable", onClick: set("enabled") },
-      { label: "Disable", onClick: set("disabled") },
-      { label: "Not configured", onClick: set("not_configured") },
-      "separator",
-      { label: "Keep as it is (no change)", onClick: () => void act({ kind: "keep", index: r.index }) },
-    ];
   };
   return (
     <>
@@ -189,15 +156,12 @@ function Body({ view, admin, act }: { view: View; admin: boolean; act: Act }) {
       <Group padded>
         <div className="hstack hero-row">
           {view.loaded ? (
-            <Hero value={`${view.atRec} of ${view.recs}`} unit="recommended" caption="policies already set the recommended way" tone={view.atRec === view.recs ? "Ok" : "Accent"} />
+            <Hero value={`${view.configured} of ${view.total}`} unit="set" caption="policies are Enabled or Disabled now" tone="Accent" />
           ) : (
-            <Hero value="..." unit="recommended" caption="Reading the policies" tone="Faint" />
+            <Hero value="..." unit="set" caption="Reading the policies" tone="Faint" />
           )}
-          <Stat value={view.changes} label="changes selected" tone={view.changes > 0 ? "Accent" : "Text"} />
+          <Stat value={view.changes} label="changes to apply" tone={view.changes > 0 ? "Accent" : "Text"} />
           <div className="gp-hero-actions">
-            <Button disabled={!view.canSelect} title="Selects the recommended setting for every policy that has one. Review, change or reset rows, then Apply." onClick={() => act({ kind: "select_recommended" })}>
-              Select recommended
-            </Button>
             <Button variant="primary" disabled={!view.canApply} title="Shows every change first." onClick={() => act({ kind: "apply" })}>
               Apply changes ({view.changes})
             </Button>
@@ -220,8 +184,7 @@ function Body({ view, admin, act }: { view: View; admin: boolean; act: Act }) {
             Open gpedit
           </Button>
         )}
-        {view.picked > 0 && <Button onClick={() => act({ kind: "clear_selection" })}>Clear selection ({view.picked})</Button>}
-        {view.picked === 0 && view.lastAction === "" && <span className="tertiary">Click policies to select them, right-click to enable or disable.</span>}
+        {view.lastAction === "" && <span className="tertiary">Choose Enabled, Disabled or Not configured on any policy, then Apply changes.</span>}
         {view.lastAction !== "" && <span className="secondary">{view.lastAction}</span>}
       </div>
       {!view.loaded ? (
@@ -232,12 +195,11 @@ function Body({ view, admin, act }: { view: View; admin: boolean; act: Act }) {
         view.groups.map((g) => (
           <Group key={g.name} title={g.name}>
             {g.rows.map((r) => (
-              <PolicyLine key={r.index} r={r} canEdit={view.canEdit} act={act} onMenu={(e, row) => setMenu({ x: e.clientX, y: e.clientY, row })} />
+              <PolicyLine key={r.index} r={r} canEdit={view.canEdit} act={act} />
             ))}
           </Group>
         ))
       )}
-      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.row)} onClose={() => setMenu(null)} />}
       {view.op && <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} />}
     </>
   );

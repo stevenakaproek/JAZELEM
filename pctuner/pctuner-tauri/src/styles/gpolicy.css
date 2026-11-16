@@ -1,13 +1,27 @@
-/* Group Policy: a selectable row that also holds its own controls (drop-downs, Reset). */
+/* Group Policy: a row with its own Not configured / Enabled / Disabled control, drop-downs and Reset. */
 
 .gp-row {
   cursor: default;
+  align-items: flex-start;
 }
-.gp-row .row-accessory {
-  flex-shrink: 1;
+.gp-row.changed {
+  background: var(--accent-soft, rgba(10, 132, 255, 0.1));
+}
+.gp-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--s2);
+  flex-shrink: 0;
+}
+.gp-status {
+  display: flex;
+  align-items: center;
   flex-wrap: wrap;
   justify-content: flex-end;
-  max-width: 55%;
+  gap: var(--s2);
+  min-height: 22px;
+  font-size: var(--text-sm);
 }
 .gp-opts {
   display: flex;

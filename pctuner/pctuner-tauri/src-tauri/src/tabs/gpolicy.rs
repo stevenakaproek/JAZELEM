@@ -1,7 +1,7 @@
-//! Group Policy: the curated policy list, row selection, right-click choices, apply and undo.
+//! Group Policy: the curated policy list, each row's Not configured / Enabled / Disabled choice, apply and undo.
 
 use crate::backend::{json, op_event, parse, Backend};
-use pctuner_core::gpolicy::{Gpolicy, RowAct, Scope, St, GROUPS, POLICIES};
+use pctuner_core::gpolicy::{Gpolicy, Scope, St, GROUPS, POLICIES};
 use pctuner_core::opwin::OpEvent;
 use serde_json::{json, Value};
 
@@ -20,24 +20,18 @@ enum Choice {
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Action {
-    /// A click on a row: select / unselect it.
-    Toggle { index: usize },
-    /// A right-click choice (goes to every selected row when the clicked row is one of them).
+    /// The row's own Not configured / Enabled / Disabled control (that policy only).
     Set { index: usize, state: Choice },
-    /// Right-click "Keep as it is (no change)".
-    Keep { index: usize },
     /// The row's own "Reset" button.
     Reset { index: usize },
     /// A drop-down of an enabled policy.
     Opt { index: usize, opt: usize, value: u32 },
     Search { text: String },
-    SelectRecommended,
     Apply,
     Discard,
     Undo,
     Refresh,
     Gpedit,
-    ClearSelection,
     Op { ev: OpEvent },
 }
 
@@ -56,7 +50,6 @@ impl GpolicyTab {
         let cur = g.states.get(i).cloned().unwrap_or(St::NotConfigured);
         let tgt = g.target(i);
         let changed = g.want[i].is_some();
-        let picked = g.picked.contains(&i);
         // Enabled shows its drop-downs (the values it is enabled with)
         let opts: Vec<Value> = match &tgt {
             St::Enabled(vals) => {
@@ -100,8 +93,13 @@ impl GpolicyTab {
             "name": p.name,
             "advice": p.advice,
             "tip": format!("gpedit: {}\n{} > \"{}\"", if p.scope == Scope::User { "User Configuration" } else { "Computer Configuration" }, p.path, p.title),
-            "picked": picked,
             "changed": changed,
+            "state": match &tgt {
+                St::NotConfigured => "not_configured",
+                St::Enabled(_) => "enabled",
+                St::Disabled => "disabled",
+                St::Other => "other",
+            },
             "current": p.label(&cur),
             "currentColor": match cur {
                 St::NotConfigured => "",
@@ -112,7 +110,6 @@ impl GpolicyTab {
             "note": note,
             "rec": rec,
             "opts": opts,
-            "menuTitle": if picked && g.picked.len() > 1 { format!("{} selected policies", g.picked.len()) } else { p.name.to_string() },
         })
     }
 }
@@ -131,8 +128,7 @@ impl Backend for GpolicyTab {
         let busy = g.busy_job();
         let can = g.can_act();
         let loaded = self.loaded();
-        let recs: Vec<usize> = (0..POLICIES.len()).filter(|&i| POLICIES[i].rec_state().is_some()).collect();
-        let at_rec = recs.iter().filter(|&&i| g.states.get(i) == POLICIES[i].rec_state().as_ref()).count();
+        let configured = g.states.iter().filter(|s| **s != St::NotConfigured).count();
         let n_changes = g.changes().len();
         let has_undo = g.history.iter().any(|b| !b.undone);
         let q = g.search.trim().to_lowercase();
@@ -157,17 +153,15 @@ impl Backend for GpolicyTab {
             "gpo": g.gpo,
             "edition": g.edition,
             "loadError": g.load_error,
-            "atRec": at_rec,
-            "recs": recs.len(),
+            "configured": configured,
+            "total": POLICIES.len(),
             "changes": n_changes,
             "canEdit": !busy,
             "canApply": can && n_changes > 0,
-            "canSelect": loaded && !busy,
             "canDiscard": n_changes > 0 && !busy,
             "canUndo": can && has_undo,
             "canRefresh": !busy && g.loader.is_none(),
             "working": busy || g.loader.is_some(),
-            "picked": g.picked.len(),
             "lastAction": g.last_action,
             "search": g.search,
             "groups": groups,
@@ -182,11 +176,6 @@ impl Backend for GpolicyTab {
         let loaded = self.loaded();
         let n = POLICIES.len();
         match parse::<Action>(action)? {
-            Action::Toggle { index } => {
-                if loaded && !busy && index < n {
-                    self.g.row_action(index, RowAct::Toggle);
-                }
-            }
             Action::Set { index, state } => {
                 if loaded && !busy && index < n {
                     let s = match state {
@@ -194,12 +183,7 @@ impl Backend for GpolicyTab {
                         Choice::Disabled => St::Disabled,
                         Choice::NotConfigured => St::NotConfigured,
                     };
-                    self.g.row_action(index, RowAct::Set(s));
-                }
-            }
-            Action::Keep { index } => {
-                if loaded && !busy && index < n {
-                    self.g.row_action(index, RowAct::Reset);
+                    self.g.set_target(index, s);
                 }
             }
             Action::Reset { index } => {
@@ -223,11 +207,6 @@ impl Backend for GpolicyTab {
                 }
             }
             Action::Search { text } => self.g.search = text,
-            Action::SelectRecommended => {
-                if loaded && !busy {
-                    self.g.select_recommended();
-                }
-            }
             Action::Apply => {
                 if can && loaded && !self.g.changes().is_empty() && self.g.op.is_none() {
                     self.g.open_apply();
@@ -253,7 +232,6 @@ impl Backend for GpolicyTab {
                     let _ = std::process::Command::new("mmc.exe").arg("gpedit.msc").spawn();
                 }
             }
-            Action::ClearSelection => self.g.picked.clear(),
             Action::Op { ev } => {
                 // the page disables these without `can`; never act on a stale click
                 if !can && matches!(ev, OpEvent::Go | OpEvent::Undo | OpEvent::Extra(_)) {
