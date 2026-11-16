@@ -109,7 +109,7 @@ function PolicyLine({ r, canEdit, act }: { r: PolicyRow; canEdit: boolean; act: 
           </div>
         )}
       </span>
-      <span className="gp-side">
+      <span className="gp-side" data-state={r.state}>
         <Segmented value={r.state as PolicyChoice} options={CHOICES} disabled={!canEdit} onChange={(state) => void act({ kind: "set", index: r.index, state })} />
         <span className="gp-status">
           {r.changed ? (

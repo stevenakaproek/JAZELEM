@@ -14,6 +14,26 @@
   gap: var(--s2);
   flex-shrink: 0;
 }
+/* the chosen state is coloured: Enabled green, Disabled red, Not configured stays grey */
+.gp-side[data-state="enabled"] .segmented .thumb {
+  background: var(--green);
+  box-shadow: var(--shadow-control);
+}
+.gp-side[data-state="disabled"] .segmented .thumb {
+  background: var(--red);
+  box-shadow: var(--shadow-control);
+}
+.gp-side[data-state="enabled"] .segmented button[aria-selected="true"] {
+  color: #000;
+  font-weight: 600;
+}
+.gp-side[data-state="disabled"] .segmented button[aria-selected="true"] {
+  color: #fff;
+  font-weight: 600;
+}
+.gp-side .segmented button[aria-selected="true"]:disabled {
+  opacity: 1;
+}
 .gp-status {
   display: flex;
   align-items: center;
