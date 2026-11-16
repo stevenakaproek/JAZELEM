@@ -38,6 +38,20 @@ pub fn tint(c: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
 }
 
+/// The colour of a status tone coming from the core.
+pub fn tone(t: pctuner_core::common::Tone) -> Color32 {
+    use pctuner_core::common::Tone;
+    match t {
+        Tone::Ok => OK,
+        Tone::Accent => ACCENT,
+        Tone::Text => TEXT,
+        Tone::Dim => TEXT_DIM,
+        Tone::Faint => TEXT_FAINT,
+        Tone::Warn => GAMING,
+        Tone::Error => LOCKED,
+    }
+}
+
 // ------------------------------------------------------------------ global style
 
 /// Call once at start-up.

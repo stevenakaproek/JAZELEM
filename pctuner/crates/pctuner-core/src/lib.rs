@@ -2,6 +2,7 @@
 //! The egui app (pctuner-egui) and the Tauri app are thin layers on top of this crate.
 
 pub mod common;
+pub mod scheduler;
 
 /// The PowerShell scripts built into the app.
 pub mod scripts {

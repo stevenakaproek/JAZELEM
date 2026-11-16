@@ -735,6 +735,18 @@ fn write_verified(p: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+/// How a status line should be coloured. The UI maps each tone to its own colour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Tone {
+    Ok,
+    Accent,
+    Text,
+    Dim,
+    Faint,
+    Warn,
+    Error,
+}
+
 /// Set by the sidebar's "Reset GPU to stock" button; the GPU tab picks it up and opens its reset window.
 pub static GPU_RESET_REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
