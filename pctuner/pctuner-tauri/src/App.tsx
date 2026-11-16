@@ -1,7 +1,8 @@
 import { Power, RotateCcw, ShieldCheck, ShieldOff } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Badge, Button, Sheet, Spinner, cx } from "./components/ui";
 import { shellAction } from "./lib/api";
+import { runSelftest } from "./lib/selftest";
 import { ShellProvider, useShell } from "./lib/shell";
 import { TABS } from "./tabs";
 import { PowerSheet } from "./tabs/Power";
@@ -33,6 +34,15 @@ function Frame() {
     setActive(id);
     history.replaceState(null, "", `#${id}`);
   };
+
+  // self-test: visit every tab, log what was rendered, quit
+  const selftest = shell.selftest ?? null;
+  const started = useRef(false);
+  useEffect(() => {
+    if (selftest === null || started.current) return;
+    started.current = true;
+    void runSelftest(selftest, TABS.map((t) => t.id), go);
+  }, [selftest]);
   const Page = tab.page;
 
   return (

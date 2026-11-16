@@ -95,6 +95,7 @@ impl Shell {
             "version": env!("CARGO_PKG_VERSION"),
             "closePending": self.close_pending.load(Ordering::Relaxed),
             "notice": lock(&self.notice).clone(),
+            "selftest": selftest_secs(),
         })
     }
 
@@ -159,7 +160,11 @@ impl Shell {
 /// The view of one tab (the page asks when it opens a tab; later views arrive as `tab:<name>` events).
 #[tauri::command(async)]
 pub fn tab_state(shell: State<'_, Shell>, tab: String) -> Result<Value, String> {
-    Ok(lock(shell.tab(&tab)?).view())
+    let view = lock(shell.tab(&tab)?).view();
+    if selftest_secs().is_some() {
+        selftest_log(&format!("state {tab}: {} bytes{}", view.to_string().len(), if view.is_null() { " (null view)" } else { "" }));
+    }
+    Ok(view)
 }
 
 /// Something the user did on a tab. Returns the tab's view after the action.
@@ -187,6 +192,10 @@ pub enum ShellAction {
     KeepOpen,
     /// Close guard: "Close anyway (the change may not be recorded)".
     CloseAnyway,
+    /// Self-test: a line for the log (what the page rendered, script errors).
+    Log { text: String },
+    /// Self-test: every tab was visited.
+    SelftestDone,
 }
 
 #[tauri::command]
@@ -196,6 +205,15 @@ pub fn shell_action(app: AppHandle, shell: State<'_, Shell>, action: ShellAction
         ShellAction::ResetGpu => common::GPU_RESET_REQUEST.store(true, Ordering::Relaxed),
         ShellAction::DismissNotice => *lock(&shell.notice) = None,
         ShellAction::KeepOpen => shell.close_pending.store(false, Ordering::Relaxed),
+        ShellAction::Log { text } => {
+            selftest_log(&format!("page: {text}"));
+            return Ok(());
+        }
+        ShellAction::SelftestDone => {
+            selftest_log("selftest finished");
+            shell.quit(&app);
+            return Ok(());
+        }
         ShellAction::CloseAnyway => {
             shell.close_pending.store(false, Ordering::Relaxed);
             shell.quit(&app);
@@ -228,14 +246,19 @@ pub fn open_window(app: &AppHandle) -> tauri::Result<()> {
     }
     // PCTUNER_HEIGHT=<px>: taller window for screenshots of long pages
     let height = std::env::var("PCTUNER_HEIGHT").ok().and_then(|v| v.parse::<f64>().ok()).filter(|h| (520.0..=4000.0).contains(h)).unwrap_or(780.0);
-    WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+    let mut b = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("PC Tuner")
         .inner_size(1250.0, height)
         .min_inner_size(950.0, 520.0)
         .theme(Some(tauri::Theme::Dark))
         .transparent(true)
-        .effects(EffectsBuilder::new().effect(Effect::Mica).build())
-        .build()?;
+        .effects(EffectsBuilder::new().effect(Effect::Mica).build());
+    // PCTUNER_SELFTEST_HIDDEN=1 (with PCTUNER_SELFTEST): the self-test window opens far off-screen, without
+    // taking the focus or a taskbar button, so it does not interrupt work on this PC.
+    if selftest_secs().is_some() && std::env::var_os("PCTUNER_SELFTEST_HIDDEN").is_some() {
+        b = b.position(-30000.0, -30000.0).focused(false).skip_taskbar(true);
+    }
+    b.build()?;
     Ok(())
 }
 
@@ -286,4 +309,20 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     })
     .build(app)?;
     Ok(())
+}
+
+/// PCTUNER_SELFTEST=<seconds per tab>: the page visits every tab, the results go to
+/// %LOCALAPPDATA%\PCTuner\selftest\next.log, then the app quits. Used to check builds.
+pub fn selftest_secs() -> Option<f64> {
+    let v = std::env::var("PCTUNER_SELFTEST").ok()?;
+    Some(v.parse::<f64>().ok().filter(|s| *s >= 0.5).unwrap_or(3.0))
+}
+
+pub fn selftest_log(line: &str) {
+    let dir = common::data_dir().join("selftest");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("next.log")).and_then(|mut f| {
+        use std::io::Write;
+        writeln!(f, "{} {line}", common::now())
+    });
 }

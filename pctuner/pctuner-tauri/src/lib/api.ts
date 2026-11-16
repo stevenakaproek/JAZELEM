@@ -9,6 +9,8 @@ export interface ShellInfo {
   version: string;
   closePending: boolean;
   notice: string | null;
+  /** Self-test: seconds per tab (the page visits every tab, then the app quits). */
+  selftest?: number | null;
 }
 
 export type ShellAction =
@@ -16,7 +18,9 @@ export type ShellAction =
   | { kind: "reset_gpu" }
   | { kind: "dismiss_notice" }
   | { kind: "keep_open" }
-  | { kind: "close_anyway" };
+  | { kind: "close_anyway" }
+  | { kind: "log"; text: string }
+  | { kind: "selftest_done" };
 
 type Unlisten = () => void;
 

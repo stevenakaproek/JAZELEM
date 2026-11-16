@@ -33,7 +33,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![shell::tab_state, shell::tab_action, shell::shell_info, shell::shell_action])
         .setup(|app| {
             let handle = app.handle().clone();
-            shell::create_tray(&handle)?;
+            // no tray icon during self-tests
+            if shell::selftest_secs().is_none() {
+                shell::create_tray(&handle)?;
+            }
             shell::open_window(&handle)?;
             shell::start_pump(handle);
             Ok(())
