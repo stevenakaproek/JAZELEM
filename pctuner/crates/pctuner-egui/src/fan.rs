@@ -10,12 +10,10 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pctuner_core::fan_files as embedded;
 
 const HISTORY: usize = 60;
 
@@ -583,28 +581,7 @@ impl Shared {
     }
 }
 
-/// Unpack the embedded helper to %LOCALAPPDATA%\PCTuner\fan and return the exe path.
-pub(crate) fn extract_helper() -> Result<PathBuf, String> {
-    if embedded::FILES.is_empty() {
-        return Err("The fan helper was not built into this copy of PC Tuner (run fanhelper\\build.ps1, then rebuild).".into());
-    }
-    let dir = common::data_dir().join("fan");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    for (name, bytes) in embedded::FILES {
-        let p = dir.join(name);
-        let same = std::fs::read(&p).map(|old| old == *bytes).unwrap_or(false);
-        if !same {
-            // a file can be locked by a helper that is still shutting down; the exe check below catches real problems
-            let _ = std::fs::write(&p, bytes);
-        }
-    }
-    let exe = dir.join("PCTunerFan.exe");
-    if exe.exists() {
-        Ok(exe)
-    } else {
-        Err(format!("could not unpack the fan helper to {}", dir.display()))
-    }
-}
+use pctuner_core::fan_files::extract_helper;
 
 /// The running helper process.
 struct Helper {

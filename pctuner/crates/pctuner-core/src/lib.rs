@@ -2,6 +2,7 @@
 //! The egui app (pctuner-egui) and the Tauri app are thin layers on top of this crate.
 
 pub mod common;
+pub mod ramled;
 pub mod scheduler;
 
 /// The PowerShell scripts built into the app.
@@ -13,4 +14,27 @@ pub mod scripts {
 /// The fan / RAM LED helper (fanhelper/out), embedded at build time. Empty when it has not been built.
 pub mod fan_files {
     include!(concat!(env!("OUT_DIR"), "/fan_files.rs"));
+
+    /// Unpack the embedded helper to %LOCALAPPDATA%\PCTuner\fan and return the exe path.
+    pub fn extract_helper() -> Result<std::path::PathBuf, String> {
+        if FILES.is_empty() {
+            return Err("The fan helper was not built into this copy of PC Tuner (run fanhelper\\build.ps1, then rebuild).".into());
+        }
+        let dir = crate::common::data_dir().join("fan");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        for (name, bytes) in FILES {
+            let p = dir.join(name);
+            let same = std::fs::read(&p).map(|old| old == *bytes).unwrap_or(false);
+            if !same {
+                // a file can be locked by a helper that is still shutting down; the exe check below catches real problems
+                let _ = std::fs::write(&p, bytes);
+            }
+        }
+        let exe = dir.join("PCTunerFan.exe");
+        if exe.exists() {
+            Ok(exe)
+        } else {
+            Err(format!("could not unpack the fan helper to {}", dir.display()))
+        }
+    }
 }
