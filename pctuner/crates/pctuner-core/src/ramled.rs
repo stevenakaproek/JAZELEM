@@ -221,12 +221,12 @@ impl RamLed {
 mod tests {
     use super::*;
 
-    pub fn stick(mode: u8, colors: &str) -> Stick {
+    fn stick(mode: u8, colors: &str) -> Stick {
         Stick { id: "0-71".into(), name: "AUDA0-E6K5-0101".into(), addr: 0x71, leds: 2, color_ok: true, mode, colors: colors.into(), ..Default::default() }
     }
 
     #[test]
-    pub fn ramled_parse_reply() {
+    fn ramled_parse_reply() {
         let ok = r#"{"ok":true,"error":"","sticks":[{"id":"0-71","bus":"SMBusPawnIO PIIX4 port 0","addr":113,"name":"AUDA0-E6K5-0101","leds":8,"color_ok":true,"mode":5,"speed":0,"dir":0,"colors":"00FF"}]}"#;
         let s = parse_reply(&format!("noise\n{ok}\n")).unwrap();
         assert_eq!(s.len(), 1);
@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    pub fn ramled_state() {
+    fn ramled_state() {
         assert!(!is_lit(&stick(MODE_OFF, "FF0000FF0000")));
         assert!(!is_lit(&stick(MODE_STATIC, "000000000000")));
         assert!(is_lit(&stick(MODE_STATIC, "000000000100")));
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    pub fn ramled_turn_on_uses_last_lit_state() {
+    fn ramled_turn_on_uses_last_lit_state() {
         let mut t = RamLed { sticks: vec![], error: None, status: String::new(), job: None, scanned: true, saved: Saved::default(), color: [0; 3] };
         t.finish(Ok(vec![stick(MODE_OFF, "000000000000")]), false);
         assert_eq!(t.on_args(), vec!["rainbow".to_string()], "never seen lit: rainbow");
@@ -263,7 +263,7 @@ mod tests {
     /// Run elevated: cargo test ramled_live_detect -- --ignored   (RAMLED_LIVE_LOG=<file> gets the result)
     #[test]
     #[ignore]
-    pub fn ramled_live_detect() {
+    fn ramled_live_detect() {
         assert!(common::is_admin(), "run elevated");
         let r = run_helper(vec!["detect".into()]);
         if let Ok(p) = std::env::var("RAMLED_LIVE_LOG") {
@@ -278,7 +278,7 @@ mod tests {
     /// Run elevated: cargo test ramled_live_toggle -- --ignored
     #[test]
     #[ignore]
-    pub fn ramled_live_toggle() {
+    fn ramled_live_toggle() {
         assert!(common::is_admin(), "run elevated");
         let before = run_helper(vec!["detect".into()]).expect("detect");
         let off = run_helper(vec!["off".into()]).expect("off");

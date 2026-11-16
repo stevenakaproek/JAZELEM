@@ -3,6 +3,7 @@
 
 pub mod common;
 pub mod opwin;
+pub mod perf;
 pub mod ramled;
 pub mod scheduler;
 
@@ -10,6 +11,8 @@ pub mod scheduler;
 pub mod scripts {
     pub const REMOVE_BLOAT: &str = include_str!("../assets/Remove-Bloat.ps1");
     pub const POST_INSTALL_TWEAKS: &str = include_str!("../assets/PostInstall-Tweaks.ps1");
+    /// Restarts Windows Explorer (used by the Startup Cleaner and the Performance page).
+    pub const EXPLORER_RESTART: &str = "Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force\nStart-Sleep -Seconds 2\nif (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }";
 }
 
 /// The fan / RAM LED helper (fanhelper/out), embedded at build time. Empty when it has not been built.

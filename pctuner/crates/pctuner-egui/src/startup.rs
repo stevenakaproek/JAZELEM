@@ -741,7 +741,7 @@ foreach ($l in $__lines) {
 }
 "#;
 
-pub const EXPLORER_SCRIPT: &str ="Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force\nStart-Sleep -Seconds 2\nif (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }";
+pub const EXPLORER_SCRIPT: &str = pctuner_core::scripts::EXPLORER_RESTART;
 
 // ------------------------------------------------------------------ scanners
 

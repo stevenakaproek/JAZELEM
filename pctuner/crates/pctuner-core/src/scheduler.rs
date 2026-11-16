@@ -402,7 +402,7 @@ mod tests {
     use super::*;
 
     #[test]
-    pub fn mmcss_defaults_and_display() {
+    fn mmcss_defaults_and_display() {
         assert_eq!(default_of("", "SystemResponsiveness"), Some(RegVal::D(20)));
         assert_eq!(default_of("Games", "Priority"), Some(RegVal::D(2)));
         assert_eq!(default_of("Games", "Background Only"), Some(RegVal::S("False".into())));
@@ -418,7 +418,7 @@ mod tests {
 
     /// The two tabs are saved apart: each one's pending list holds only its own settings.
     #[test]
-    pub fn sched_sections_apply_separately() {
+    fn sched_sections_apply_separately() {
         assert_eq!(section_of(PRIO), Section::Processor);
         assert_eq!(section_of(FG), Section::Processor);
         assert_eq!(section_of(""), Section::Multimedia);
@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    pub fn mmcss_priority_separation() {
+    fn mmcss_priority_separation() {
         // 0x2 = Windows default: OS chooses interval and length, 3:1 boost
         assert_eq!(prio_parts(0x2), (0, 0, 2));
         assert_eq!(prio_parts(0x26), (2, 1, 2), "short, variable, 3:1");
@@ -456,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    pub fn mmcss_diff_lists_only_edits() {
+    fn mmcss_diff_lists_only_edits() {
         let mut cur = BTreeMap::new();
         cur.insert(("Games".to_string(), "Priority"), Some(RegVal::D(2)));
         cur.insert(("Games".to_string(), "Scheduling Category"), Some(RegVal::S("Medium".into())));
@@ -475,7 +475,7 @@ mod tests {
     /// Read-only: the registry on this PC can be read and every known task is found.
     #[test]
     #[ignore]
-    pub fn mmcss_live_read() {
+    fn mmcss_live_read() {
         let (m, tasks) = read_all();
         println!("{tasks:?}");
         assert!(tasks.iter().any(|t| t == "Games"));
