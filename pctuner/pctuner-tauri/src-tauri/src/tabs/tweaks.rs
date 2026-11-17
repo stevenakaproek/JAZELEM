@@ -17,6 +17,8 @@ pub struct TweaksTab {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Action {
     Toggle { index: usize },
+    /// The row's on / off switch: apply just this tweak, or undo just this tweak.
+    Switch { index: usize, on: bool },
     Clear,
     Apply,
     Undo,
@@ -122,6 +124,8 @@ impl Backend for TweaksTab {
                     "applied": applied,
                     "selectable": selectable,
                     "selected": t.selected[i] && selectable,
+                    // the switch: OneDrive can be removed but not brought back by the script
+                    "canSwitch": can && t.op.is_none() && applied.is_some() && !(*group == G_ONEDRIVE && applied == Some(true)),
                     "now": t.status.as_ref().map(|s| s.now(group)),
                 })
             })
@@ -150,6 +154,17 @@ impl Backend for TweaksTab {
             return Ok(Value::Null);
         }
         match parse::<Action>(action)? {
+            Action::Switch { index, on } => {
+                if self.can() && self.t.op.is_none() && index < 4 && self.applied(index) == Some(!on) {
+                    let g = GROUPS[index];
+                    if on {
+                        self.t.ask(Mode::Only(g));
+                    } else if g != G_ONEDRIVE {
+                        self.t.ask(Mode::UndoOnly(g));
+                    }
+                    self.t.selected[index] = false;
+                }
+            }
             Action::Toggle { index } => {
                 if index < 4 && self.can() && self.applied(index) == Some(false) {
                     self.t.selected[index] = !self.t.selected[index];
@@ -187,4 +202,4 @@ impl Backend for TweaksTab {
     }
 }
 
-const ABOUT: &str = "A backup saves which of these tweaks are in place. Restore applies the ones the backup had. The script can only undo all its tweaks at once, so to take one back use Undo tweaks; OneDrive is never reinstalled.";
+const ABOUT: &str = "A backup saves which of these tweaks are in place. Restore applies the ones the backup had; a tweak the backup did not have is named, so you can switch it off on its row. OneDrive is never reinstalled.";

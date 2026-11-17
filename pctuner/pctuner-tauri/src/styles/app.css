@@ -1592,3 +1592,10 @@ html.tauri .sidebar {
   border-radius: 2px;
   transition: width var(--t-base) var(--ease-out);
 }
+
+/* The on / off switch at the end of an Optimization row. */
+.opt-switch {
+  gap: 8px;
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}

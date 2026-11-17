@@ -19,6 +19,8 @@ pub struct PerfTab {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Action {
     Toggle { index: usize },
+    /// The row's on / off switch (opens the preview for that one setting).
+    Switch { index: usize, on: bool },
     Clear,
     Apply,
     Undo,
@@ -83,6 +85,8 @@ impl PerfTab {
                 "set": set,
                 "selectable": selectable,
                 "selected": self.p.selected[i] && selectable,
+                // the switch: on = the tweak is in place
+                "canSwitch": applicable && common::is_admin() && self.p.run.is_none() && self.p.op.is_none() && self.p.loading.is_none(),
                 "now": fmt(t.kind, state.value(t.kind).as_deref()),
                 "target": fmt(t.kind, Some(t.target)),
                 "extra": extra,
@@ -166,6 +170,11 @@ impl Backend for PerfTab {
             return Ok(Value::Null);
         }
         match parse::<Action>(action)? {
+            Action::Switch { index, on } => {
+                if common::is_admin() && self.p.loading.is_none() {
+                    self.p.open_switch(index, on);
+                }
+            }
             Action::Toggle { index } => {
                 if let Some(s) = self.p.selected.get_mut(index) {
                     *s = !*s;

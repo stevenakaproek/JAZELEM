@@ -2,7 +2,7 @@
 import { ArrowRight, RefreshCw } from "lucide-react";
 import { OpSheet } from "../components/OpSheet";
 import { BackupsButton, TabBackupsSheet, type BackupAction, type TabBackupsView } from "../components/TabBackups";
-import { Badge, Button, ErrorState, Group, LoadingState, Row, Spinner } from "../components/ui";
+import { Badge, Button, ErrorState, Group, LoadingState, Row, Spinner, Switch } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow } from "../lib/types";
 import { useTab } from "../lib/useTab";
@@ -19,6 +19,8 @@ export interface NetworkRow {
   selected: boolean;
   now: string;
   target: string;
+  /** the on / off switch can be used now */
+  canSwitch: boolean;
 }
 
 export interface NetworkView {
@@ -36,9 +38,9 @@ export interface NetworkView {
   backups: TabBackupsView | null;
 }
 
-export type NetworkAction = { kind: "toggle"; index: number } | { kind: "clear" | "apply" | "undo" | "refresh" } | { kind: "op"; ev: OpEvent } | BackupAction;
+export type NetworkAction = { kind: "toggle"; index: number } | { kind: "switch"; index: number; on: boolean } | { kind: "clear" | "apply" | "undo" | "refresh" } | { kind: "op"; ev: OpEvent } | BackupAction;
 
-function SettingRow({ r, onToggle }: { r: NetworkRow; onToggle: () => void }) {
+function SettingRow({ r, onToggle, onSwitch }: { r: NetworkRow; onToggle: () => void; onSwitch: (on: boolean) => void }) {
   return (
     <Row
       checked={r.applicable && !r.set ? r.selected : "none"}
@@ -62,7 +64,16 @@ function SettingRow({ r, onToggle }: { r: NetworkRow; onToggle: () => void }) {
           r.now
         ) : undefined
       }
-      accessory={!r.applicable ? <Badge>Not on this adapter</Badge> : r.set ? <Badge color="green">Applied</Badge> : <Badge>Not applied</Badge>}
+      accessory={
+        !r.applicable ? (
+          <Badge>Not on this adapter</Badge>
+        ) : (
+          <span className="hstack opt-switch">
+            <span className={r.set ? "tone-ok" : "tertiary"}>{r.set ? "Applied" : "Not applied"}</span>
+            <Switch on={r.set} disabled={!r.canSwitch} label={r.set ? "Switch this setting off" : "Switch this setting on"} onChange={onSwitch} />
+          </span>
+        )
+      }
     />
   );
 }
@@ -107,7 +118,7 @@ export function Network() {
       {(view.groups ?? []).map((g) => (
         <Group key={g.name} title={g.name} count={`${g.rows.filter((r) => r.set).length} of ${g.rows.length} applied`}>
           {g.rows.map((r) => (
-            <SettingRow key={r.index} r={r} onToggle={() => act({ kind: "toggle", index: r.index })} />
+            <SettingRow key={r.index} r={r} onToggle={() => act({ kind: "toggle", index: r.index })} onSwitch={(on) => act({ kind: "switch", index: r.index, on })} />
           ))}
         </Group>
       ))}

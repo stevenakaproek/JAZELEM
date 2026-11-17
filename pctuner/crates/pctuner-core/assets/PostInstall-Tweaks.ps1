@@ -24,7 +24,8 @@
       powershell -ExecutionPolicy Bypass -File .\PostInstall-Tweaks.ps1 -Undo
       powershell -ExecutionPolicy Bypass -File .\PostInstall-Tweaks.ps1 -Only Edge        (one tweak: Tasks, Edge, Teredo or OneDrive)
 
-  -Only applies just the named tweaks (the state before is still saved first). -Undo always undoes all of them.
+  -Only applies just the named tweaks (the state before is still saved first). With -Undo it undoes just the named
+  tweaks (OneDrive cannot be undone); the saved state is only deleted when everything was undone.
 #>
 [CmdletBinding()]
 param(
@@ -88,8 +89,9 @@ $PolicyValues = @(
     @($v6Key, 'Teredo_State'), @($v6Key, 'Teredo_ServerName')
 )
 
-# Which tweaks this run touches: all of them, or only those named in -Only (Undo always does all).
-function Test-Do([string]$Name) { $Undo -or -not $Only -or ($Only -contains $Name) }
+# Which tweaks this run touches: all of them, or only those named in -Only (for Apply and Undo alike).
+function Test-Do([string]$Name) { -not $Only -or ($Only -contains $Name) }
+if ($Undo -and ($Only -contains 'OneDrive')) { throw 'OneDrive cannot be undone by this script - reinstall it from the Microsoft Store.' }
 if ($Only -contains 'OneDrive') { $RemoveOneDrive = $true }
 
 $script:Failed = 0
@@ -327,7 +329,8 @@ if ($Undo -and $State) {
 }
 }
 
-if ($Undo -and $HadStateFile -and -not $StateBad) {
+# a partial undo (-Only) keeps the saved state: the other tweaks still need it
+if ($Undo -and -not $Only -and $HadStateFile -and -not $StateBad) {
     if ($script:Failed -eq 0) { Remove-Item -Path $StatePath -ErrorAction SilentlyContinue }
     else { Write-Host '  Some changes could not be undone - the saved state is kept, so "Undo tweaks" can try again.' -ForegroundColor Yellow }
 }

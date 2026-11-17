@@ -36,7 +36,10 @@ const rows: PerfRow[] = seeds.map(([name, , why, optional, now, target, set, app
   now,
   target,
   extra: name.startsWith("Hibernation") ? "hiberfil.sys is 12.7 GB now" : null,
+  canSwitch: false,
 }));
+/** what a switched-off row shows (the stand-in's "value from before") */
+const offText = seeds.map(([, , , , now, target, set]) => (set ? (now === "On" ? "Off" : now === "Off" ? "On" : now) : now === target ? "Off" : now));
 
 const op = new MockOp();
 const defenderOp = new MockOp();
@@ -70,7 +73,7 @@ export const perf: MockTab<PerfView, PerfAction> = {
       loading: state === "loading",
       refreshing: false,
       error: state === "error" ? "The settings could not be read: PowerShell returned no data (exit code 1)." : null,
-      groups: [GAMES, DESKTOP, POWER].map((name) => ({ name, rows: rows.filter((r) => seeds[r.index][1] === name) })),
+      groups: [GAMES, DESKTOP, POWER].map((name) => ({ name, rows: rows.filter((r) => seeds[r.index][1] === name).map((r) => ({ ...r, canSwitch: mockAdmin && r.applicable && !op.op })) })),
       pending,
       canApply: mockAdmin && pending > 0,
       canUndo: mockAdmin,
@@ -98,8 +101,28 @@ export const perf: MockTab<PerfView, PerfAction> = {
   act(a) {
     if (bk.act(a)) return;
     switch (a.kind) {
-      case "toggle":
-        if (rows[a.index].selectable) rows[a.index].selected = !rows[a.index].selected;
+      case "switch": {
+        const r = rows[a.index];
+        if (!mockAdmin || op.op || !r.applicable || r.set === a.on) break;
+        const from = r.now;
+        const to = a.on ? r.target : offText[a.index];
+        op.open(
+          makeOp(a.on ? "PERFORMANCE" : "SWITCH OFF", "change", "changed", [opItem(String(r.index), r.name, "Setting", `${from} -> ${to}`)], {
+            noun: ["setting", "settings"],
+            go_label: a.on ? "Apply" : "Switch off",
+            preview_text: a.on ? "Each change is saved so it can be undone." : "Puts back the value from before PC Tuner changed it (or the Windows default). Saved, so \"Undo last change\" switches it on again.",
+            running_text: "Applying...",
+          }),
+          () => {
+            r.set = a.on;
+            r.now = to;
+            r.selected = false;
+            r.selectable = r.applicable && !r.set;
+          },
+        );
+        break;
+      }
+      case "toggle":        if (rows[a.index].selectable) rows[a.index].selected = !rows[a.index].selected;
         break;
       case "clear":
         rows.forEach((r) => (r.selected = false));

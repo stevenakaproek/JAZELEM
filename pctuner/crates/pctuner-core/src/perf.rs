@@ -268,13 +268,17 @@ impl State {
     }
 
     pub fn is_set(&self, t: &Tweak) -> bool {
-        let v = self.value(t.kind);
-        match t.kind {
-            // pointer precision is off whenever the speed (third number) is 0
-            Kind::Mouse => v.map(|m| m.rsplit(',').next().map(|s| s.trim() == "0").unwrap_or(false)).unwrap_or(false),
-            Kind::Epp => v.as_deref().map(epp_number) == Some(t.target),
-            _ => v.as_deref() == Some(t.target),
-        }
+        is_target(t, self.value(t.kind).as_deref())
+    }
+}
+
+/// Does this value count as the tweak being applied?
+pub fn is_target(t: &Tweak, v: Option<&str>) -> bool {
+    match t.kind {
+        // pointer precision is off whenever the speed (third number) is 0
+        Kind::Mouse => v.map(|m| m.rsplit(',').next().map(|s| s.trim() == "0").unwrap_or(false)).unwrap_or(false),
+        Kind::Epp => v.map(epp_number) == Some(t.target),
+        _ => v == Some(t.target),
     }
 }
 
@@ -786,6 +790,43 @@ impl Perf {
         Ok(())
     }
 
+    /// The value a setting goes back to when it is switched off: what it was before PC Tuner's newest
+    /// change that switched it on, or the Windows default (None) when PC Tuner never did.
+    pub fn off_value(&self, id: &str) -> Option<String> {
+        let t = tweak(id)?;
+        self.history
+            .iter()
+            .rev()
+            .filter(|h| !h.undone)
+            .flat_map(|h| h.changes.iter())
+            .find(|c| c.id == id && is_target(t, c.new.as_deref()))
+            .and_then(|c| c.prev.clone())
+            .filter(|p| !is_target(t, Some(p)))
+    }
+
+    /// The switch on a row: one change (on = the tweak's value, off = `off_value`) through the usual
+    /// preview. Recorded like any change, so "Undo last change" reverts it too.
+    pub fn open_switch(&mut self, i: usize, on: bool) {
+        if self.run.is_some() || self.op.is_some() {
+            return;
+        }
+        let (Some(state), Some(t)) = (self.state.as_ref().filter(|s| s.error.is_none()), TWEAKS.get(i)) else { return };
+        if !state.applicable(t.kind) || state.is_set(t) == on {
+            return;
+        }
+        let new = if on { Some(t.target.to_string()) } else { self.off_value(t.id) };
+        let changes = vec![Change { id: t.id.into(), prev: state.value(t.kind), new }];
+        let mut w = Self::op_window(&changes, false);
+        if !on {
+            w.kicker = "SWITCH OFF".into();
+            w.go_label = "Switch off".into();
+            w.preview_text = "Puts back the value from before PC Tuner changed it (or the Windows default). Saved, so \"Undo last change\" switches it on again.".into();
+        }
+        self.selected[i] = false;
+        self.op = Some(w);
+        self.pending = Some((changes, None));
+    }
+
     pub fn undo_changes(&self) -> Option<(Vec<Change>, usize)> {
         let i = self.history.iter().rposition(|h| !h.undone)?;
         let changes = self.history[i].changes.iter().rev().map(|c| Change { id: c.id.clone(), prev: c.new.clone(), new: c.prev.clone() }).collect();
@@ -941,6 +982,30 @@ impl Perf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perf_switch_off_puts_back_the_value_from_before() {
+        let st = State { menu: Some("100".into()), taskanim: Some(0), ..Default::default() };
+        let hist = vec![
+            HistEntry { time: "a".into(), changes: vec![Change { id: "menu".into(), prev: Some("250".into()), new: Some("100".into()) }], undone: false },
+            HistEntry { time: "b".into(), changes: vec![Change { id: "taskanim".into(), prev: None, new: Some("0".into()) }], undone: true },
+        ];
+        let mut p = Perf { state: Some(st), loading: None, selected: vec![false; TWEAKS.len()], history: hist, op: None, pending: None, run: None, explorer: None, explorer_preview: false, demo: false, note: None };
+        assert_eq!(p.off_value("menu").as_deref(), Some("250"), "the value PC Tuner replaced");
+        assert_eq!(p.off_value("taskanim"), None, "an undone change does not count: the Windows default");
+        let menu = TWEAKS.iter().position(|t| t.id == "menu").unwrap();
+        p.open_switch(menu, true);
+        assert!(p.op.is_none(), "already on: nothing to do");
+        p.open_switch(menu, false);
+        let (c, undo_of) = p.pending.clone().unwrap();
+        assert_eq!((c[0].prev.as_deref(), c[0].new.as_deref(), undo_of), (Some("100"), Some("250"), None));
+        assert_eq!(p.op.as_ref().unwrap().go_label, "Switch off");
+        let mut on = Perf { state: Some(State::default()), op: None, pending: None, ..p };
+        let hover = TWEAKS.iter().position(|t| t.id == "hover").unwrap();
+        on.open_switch(hover, true);
+        assert_eq!(on.pending.unwrap().0[0].new.as_deref(), Some("200"));
+        assert!(is_target(tweak("mouseaccel").unwrap(), Some("0,0,0")) && !is_target(tweak("mouseaccel").unwrap(), Some("6,10,1")));
+    }
 
     #[test]
     fn perf_backup_restore_opens_the_preview() {

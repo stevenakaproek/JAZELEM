@@ -550,6 +550,44 @@ impl Network {
         Ok(())
     }
 
+    /// The value a setting goes back to when it is switched off: what it was before PC Tuner's newest
+    /// change that switched it on (for adapter settings: on this adapter), or the default (None).
+    pub fn off_value(&self, id: &str) -> Option<String> {
+        let t = tweak(id)?;
+        let adapter = self.state.as_ref().map(|s| s.adapter().to_string()).unwrap_or_default();
+        self.history
+            .iter()
+            .rev()
+            .filter(|h| !h.undone && (!matches!(t.kind, Kind::Adv(_)) || h.adapter.is_empty() || h.adapter == adapter))
+            .flat_map(|h| h.changes.iter())
+            .find(|c| c.id == id && c.new.as_deref() == Some(t.target))
+            .and_then(|c| c.prev.clone())
+            .filter(|p| p != t.target)
+    }
+
+    /// The switch on a row: one change (on = the tweak's value, off = `off_value`) through the usual
+    /// preview. Recorded like any change, so "Undo last change" reverts it too.
+    pub fn open_switch(&mut self, i: usize, on: bool) {
+        if self.run.is_some() || self.op.is_some() {
+            return;
+        }
+        let (Some(state), Some(t)) = (self.state.as_ref().filter(|s| s.error.is_none() && s.info.is_some()), TWEAKS.get(i)) else { return };
+        if !state.applicable(t.kind) || state.is_set(t) == on {
+            return;
+        }
+        let new = if on { Some(t.target.to_string()) } else { self.off_value(t.id) };
+        let changes = vec![Change { id: t.id.into(), prev: state.value(t.kind), new }];
+        let mut w = Self::op_window(&changes, false, state.adapter());
+        if !on {
+            w.kicker = "SWITCH OFF".into();
+            w.go_label = "Switch off".into();
+            w.preview_text = format!("Adapter: {}. Puts back the value from before PC Tuner changed it (or the driver / Windows default). Saved, so \"Undo last change\" switches it on again.", state.adapter());
+        }
+        self.selected[i] = false;
+        self.op = Some(w);
+        self.pending = Some((changes, None));
+    }
+
     /// Changes that put back the last change that has not been undone.
     pub fn undo_changes(&self) -> Option<(Vec<Change>, usize)> {
         let i = self.history.iter().rposition(|h| !h.undone)?;
@@ -683,6 +721,22 @@ impl Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_switch_off_uses_this_adapters_value() {
+        let st = State {
+            info: Some(AdapterInfo { name: "Ethernet".into(), guid: "g".into(), adv: [("*EEE".to_string(), "0".to_string())].into_iter().collect(), ..Default::default() }),
+            throttle: Some(4294967295),
+            ..Default::default()
+        };
+        let h = |adapter: &str, id: &str, prev: Option<&str>, new: &str| HistEntry { time: "t".into(), adapter: adapter.into(), guid: String::new(), changes: vec![Change { id: id.into(), prev: prev.map(Into::into), new: Some(new.into()) }], undone: false };
+        let mut n = Network { state: Some(st), loading: None, selected: vec![false; TWEAKS.len()], history: vec![h("Ethernet", "eee", Some("1"), "0"), h("Wi-Fi", "eee", Some("3"), "0"), h("Ethernet", "throttle", None, "4294967295")], op: None, pending: None, run: None, demo: false };
+        assert_eq!(n.off_value("eee").as_deref(), Some("1"), "the Wi-Fi adapter's old value is not used on Ethernet");
+        assert_eq!(n.off_value("throttle"), None, "absent before: back to the Windows default");
+        n.open_switch(TWEAKS.iter().position(|t| t.id == "throttle").unwrap(), false);
+        let c = &n.pending.as_ref().unwrap().0[0];
+        assert_eq!((c.id.as_str(), c.new.as_deref()), ("throttle", None));
+    }
 
     #[test]
     fn network_backup_keeps_adapter_settings_on_their_adapter() {

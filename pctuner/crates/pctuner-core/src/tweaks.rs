@@ -25,6 +25,8 @@ pub enum Mode {
     Apply,
     ApplyOneDrive,
     Undo,
+    /// Undo just one tweak (G_TASKS, G_EDGE or G_XBOX; OneDrive cannot be undone).
+    UndoOnly(&'static str),
     /// Apply just one tweak (a group: G_TASKS, G_EDGE, G_XBOX or G_ONEDRIVE).
     Only(&'static str),
     /// Apply several tweaks picked by hand: a bit per entry of GROUPS.
@@ -62,6 +64,7 @@ impl Mode {
             Mode::Apply => vec![],
             Mode::ApplyOneDrive => vec!["-RemoveOneDrive".into()],
             Mode::Undo => vec!["-Undo".into()],
+            Mode::UndoOnly(g) => vec!["-Undo".into(), "-Only".into(), only_name(g).into()],
             Mode::Only(g) => vec!["-Only".into(), only_name(g).into()],
             Mode::Pick(_) => vec!["-Only".into(), self.groups().into_iter().map(only_name).collect::<Vec<_>>().join(",")],
         };
@@ -73,6 +76,9 @@ impl Mode {
             Mode::Apply => "Apply tweaks",
             Mode::ApplyOneDrive => "Apply + remove OneDrive",
             Mode::Undo => "Undo tweaks",
+            Mode::UndoOnly(G_TASKS) => "Switch the tasks back on",
+            Mode::UndoOnly(G_EDGE) => "Let Edge preload again",
+            Mode::UndoOnly(_) => "Put Teredo back",
             Mode::Only(G_TASKS) => "Disable the scheduled tasks",
             Mode::Only(G_EDGE) => "Stop Edge preloading",
             Mode::Only(G_XBOX) => "Turn on Teredo",
@@ -80,10 +86,14 @@ impl Mode {
             Mode::Pick(_) => "Apply selected tweaks",
         }
     }
+    /// Undo all, or undo one tweak.
+    pub fn is_undo(self) -> bool {
+        matches!(self, Mode::Undo | Mode::UndoOnly(_))
+    }
     pub fn groups(self) -> Vec<&'static str> {
         match self {
             Mode::ApplyOneDrive => vec![G_TASKS, G_EDGE, G_XBOX, G_ONEDRIVE],
-            Mode::Only(g) => vec![g],
+            Mode::Only(g) | Mode::UndoOnly(g) => vec![g],
             Mode::Pick(m) => GROUPS.iter().enumerate().filter(|(i, _)| m & (1 << i) != 0).map(|(_, g)| *g).collect(),
             _ => vec![G_TASKS, G_EDGE, G_XBOX],
         }
@@ -306,7 +316,7 @@ pub fn undo_left_off(s: &Saved, kept_off: &std::collections::HashSet<String>) ->
 /// The items shown in the preview: one per thing the script will touch.
 /// For Undo with a saved state, only what will actually change is listed.
 pub fn preview_items(mode: Mode, saved: Option<&Saved>, kept_off: &std::collections::HashSet<String>) -> Vec<OpItem> {
-    let undo = mode == Mode::Undo;
+    let undo = mode.is_undo();
     let task_item = |p: &String| {
         let (name, folder) = task_parts(p);
         OpItem::new(p.clone(), name, G_TASKS).detail(folder)
@@ -337,7 +347,7 @@ pub fn preview_items(mode: Mode, saved: Option<&Saved>, kept_off: &std::collecti
     if matches!(mode, Mode::ApplyOneDrive | Mode::Only(_) | Mode::Pick(_)) {
         v.push(OpItem::new("onedrive", "OneDrive", G_ONEDRIVE).detail("uninstalled, its tasks disabled"));
     }
-    if matches!(mode, Mode::Only(_) | Mode::Pick(_)) {
+    if matches!(mode, Mode::Only(_) | Mode::Pick(_) | Mode::UndoOnly(_)) {
         let groups = mode.groups();
         v.retain(|i| groups.iter().any(|g| i.group == *g));
     }
@@ -345,7 +355,7 @@ pub fn preview_items(mode: Mode, saved: Option<&Saved>, kept_off: &std::collecti
 }
 
 pub fn preview_window(mode: Mode) -> OpWindow {
-    if mode == Mode::Undo {
+    if mode.is_undo() {
         preview_window_with(mode, load_saved().as_ref(), &load_kept_off())
     } else {
         preview_window_with(mode, None, &Default::default())
@@ -353,7 +363,7 @@ pub fn preview_window(mode: Mode) -> OpWindow {
 }
 
 pub fn preview_window_with(mode: Mode, saved: Option<&Saved>, kept_off: &std::collections::HashSet<String>) -> OpWindow {
-    let (verb, done_word) = if mode == Mode::Undo { ("undo", "undone") } else { ("apply", "applied") };
+    let (verb, done_word) = if mode.is_undo() { ("undo", "undone") } else { ("apply", "applied") };
     let mut w = OpWindow::new("POST-INSTALL TWEAKS", verb, done_word, preview_items(mode, saved, kept_off)).noun("tweak", "tweaks");
     w.go_label = mode.title().into();
     match mode {
@@ -388,6 +398,24 @@ pub fn preview_window_with(mode: Mode, saved: Option<&Saved>, kept_off: &std::co
                 w.warning = Some("OneDrive will be uninstalled. \"Undo tweaks\" does not bring it back - reinstall it from the Microsoft Store if you want it again.".into());
             }
             w.reassure = "The state before is saved first. \"Undo tweaks\" puts back every tweak applied so far.".into();
+        }
+        Mode::UndoOnly(g) => {
+            let exact = saved.is_some_and(|s| !s.inexact && !s.unreadable);
+            w.preview_text = match (g, exact) {
+                (G_TASKS, true) => "Switches the tasks back on that were on before the tweaks. Edge and Teredo are left as they are.",
+                (G_TASKS, false) => "Switches every listed task back on (no exact record from before the tweaks). Edge and Teredo are left as they are.",
+                (G_EDGE, true) => "Puts Edge's Startup Boost and background mode policies back to what they were before the tweaks. The other tweaks are left as they are.",
+                (G_EDGE, false) => "Removes the Edge policies, so Edge is back to its defaults. The other tweaks are left as they are.",
+                (_, true) => "Puts Teredo back to how it was before the tweaks. The other tweaks are left as they are.",
+                (_, false) => "Removes the Teredo policy and sets Teredo back to the Windows default. The other tweaks are left as they are.",
+            }
+            .into();
+            if g == G_XBOX {
+                w.warning = Some("Xbox party chat and multiplayer may stop connecting until Teredo is switched on again.".into());
+            }
+            if g == G_TASKS {
+                w.reassure = "Tasks that were already off before, or that the Startup Cleaner switched off, stay off.".into();
+            }
         }
         Mode::Undo => match saved {
             Some(s) if !s.inexact => {
@@ -713,7 +741,7 @@ impl Tweaks {
     pub fn to_running(w: &mut OpWindow, mode: Mode) {
         w.items = step_items(mode);
         w.show_steps = true;
-        w.running_text = if mode == Mode::Undo { "Undoing the tweaks...".into() } else { "Applying the tweaks...".into() };
+        w.running_text = if mode.is_undo() { "Undoing the tweaks...".into() } else { "Applying the tweaks...".into() };
         w.stage = Stage::Running;
     }
 
@@ -749,9 +777,9 @@ impl Tweaks {
                 self.status = None; // refresh after a run
                 self.selected = [false; 4];
                 op.items = result_items(&s.lines, code);
-                op.can_undo = self.mode != Some(Mode::Undo);
+                op.can_undo = !self.mode.is_some_and(|m| m.is_undo());
                 op.undo_label = "Undo tweaks".into();
-                if self.mode == Some(Mode::Undo) {
+                if self.mode.is_some_and(|m| m.is_undo()) {
                     (op.verb, op.done_word) = ("undo".into(), "undone".into());
                 }
                 op.done();
@@ -793,7 +821,7 @@ impl Tweaks {
     }
 
     /// Restore a backup. Tweaks the backup had in place and the PC does not get applied again (normal
-    /// preview). The script can only undo all its tweaks at once, so a tweak in place now that the backup
+    /// preview). A tweak in place now that the backup
     /// did not have is named in the result instead of being undone; OneDrive is never reinstalled.
     /// Ok(None) = a preview opened; Ok(Some(text)) = a preview opened, plus what it cannot do.
     pub fn open_restore(&mut self, b: &tabbackup::Backup) -> Result<Option<String>, String> {
@@ -811,7 +839,7 @@ impl Tweaks {
             } else if GROUPS[i] == G_ONEDRIVE {
                 left.push("OneDrive was removed after this backup - reinstall it from onedrive.com if you want it back".into());
             } else {
-                left.push(format!("{} is applied now but was not in this backup - \"Undo tweaks\" puts all tweaks back", d.backup.title));
+                left.push(format!("{} is applied now but was not in this backup - switch it off on its row to take it back", d.backup.title));
             }
         }
         let left = (!left.is_empty()).then(|| format!("{}.", left.join("; ")));
@@ -836,6 +864,22 @@ impl Tweaks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tweaks_undo_one_tweak() {
+        let a = Mode::UndoOnly(G_EDGE).args(std::path::Path::new(r"C:\x\s.json"));
+        assert_eq!(&a[..3], &["-Undo".to_string(), "-Only".into(), "Edge".into()]);
+        assert!(Mode::UndoOnly(G_EDGE).is_undo() && Mode::Undo.is_undo() && !Mode::Only(G_EDGE).is_undo());
+        assert_eq!(Mode::UndoOnly(G_XBOX).groups(), vec![G_XBOX]);
+        let w = preview_window_with(Mode::UndoOnly(G_XBOX), None, &Default::default());
+        assert!(w.items.iter().all(|i| i.group == G_XBOX) && !w.items.is_empty(), "only Teredo is listed");
+        assert!(w.warning.is_some() && w.verb == "undo");
+        assert_eq!(step_items(Mode::UndoOnly(G_TASKS)).len(), 1);
+        // the script itself: -Undo honours -Only, keeps the saved state on a partial undo, refuses OneDrive
+        assert!(SCRIPT.contains("function Test-Do([string]$Name) { -not $Only -or ($Only -contains $Name) }"));
+        assert!(SCRIPT.contains("if ($Undo -and -not $Only -and $HadStateFile -and -not $StateBad)"));
+        assert!(SCRIPT.contains("if ($Undo -and ($Only -contains 'OneDrive')) { throw"));
+    }
 
     #[test]
     fn tweaks_restore_applies_what_the_backup_had() {

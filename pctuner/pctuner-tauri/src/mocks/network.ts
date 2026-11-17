@@ -46,7 +46,10 @@ const rows: NetworkRow[] = seeds.map(([name, , why, optional, now, target, set, 
   selected: false,
   now,
   target,
+  canSwitch: false,
 }));
+/** what a switched-off row shows (the stand-in's "value from before") */
+const offText = seeds.map(([, , , , now, , set]) => (set ? (now === "Off" ? "On" : "Driver default") : now));
 
 const op = new MockOp();
 const state = mockParams.get("state");
@@ -105,7 +108,7 @@ export const network: MockTab<NetworkView, NetworkAction> = {
       loading: state === "loading",
       refreshing: false,
       error: state === "error" ? "Could not read the network settings: PowerShell returned no data (exit code 1)." : state === "empty" ? "No connected network adapter was found." : null,
-      groups: failed ? null : [POWER, LAT, WIN, OPT].map((name) => ({ name, rows: rows.filter((r) => seeds[r.index][1] === name) })),
+      groups: failed ? null : [POWER, LAT, WIN, OPT].map((name) => ({ name, rows: rows.filter((r) => seeds[r.index][1] === name).map((r) => ({ ...r, canSwitch: mockAdmin && r.applicable && !op.op })) })),
       pending: failed ? 0 : pending,
       canApply: mockAdmin && !failed && pending > 0 && op.op?.stage !== "Running",
       canUndo: mockAdmin && last.length > 0 && op.op?.stage !== "Running",
@@ -117,8 +120,28 @@ export const network: MockTab<NetworkView, NetworkAction> = {
   act(a) {
     if (bk.act(a)) return;
     switch (a.kind) {
-      case "toggle":
-        if (rows[a.index]?.selectable) rows[a.index].selected = !rows[a.index].selected;
+      case "switch": {
+        const r = rows[a.index];
+        if (!mockAdmin || op.op || !r.applicable || r.set === a.on) break;
+        const from = r.now;
+        const to = a.on ? r.target : offText[a.index];
+        op.open(
+          makeOp(a.on ? "NETWORK" : "SWITCH OFF", "change", "changed", [opItem(String(r.index), r.name, "Setting", `${from} -> ${to}`)], {
+            noun: ["setting", "settings"],
+            go_label: a.on ? "Apply" : "Switch off",
+            preview_text: a.on ? "Each change is saved so it can be undone." : "Puts back the value from before PC Tuner changed it (or the Windows default). Saved, so \"Undo last change\" switches it on again.",
+            running_text: "Applying...",
+          }),
+          () => {
+            r.set = a.on;
+            r.now = to;
+            r.selected = false;
+            r.selectable = r.applicable && !r.set;
+          },
+        );
+        break;
+      }
+      case "toggle":        if (rows[a.index]?.selectable) rows[a.index].selected = !rows[a.index].selected;
         break;
       case "clear":
         rows.forEach((r) => (r.selected = false));

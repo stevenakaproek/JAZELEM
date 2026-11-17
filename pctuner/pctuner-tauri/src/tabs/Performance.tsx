@@ -3,7 +3,7 @@ import { ArrowRight, FolderPlus, RefreshCw } from "lucide-react";
 import { useState } from "react";
 import { OpSheet } from "../components/OpSheet";
 import { BackupsButton, TabBackupsSheet, type BackupAction, type TabBackupsView } from "../components/TabBackups";
-import { Badge, Banner, Button, ErrorState, Group, LoadingState, Row, Spinner } from "../components/ui";
+import { Badge, Banner, Button, ErrorState, Group, LoadingState, Row, Spinner, Switch } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow } from "../lib/types";
 import { useTab } from "../lib/useTab";
@@ -21,6 +21,8 @@ export interface PerfRow {
   now: string;
   target: string;
   extra: string | null;
+  /** the on / off switch can be used now */
+  canSwitch: boolean;
 }
 
 export interface DefenderView {
@@ -56,6 +58,7 @@ export interface PerfView {
 
 export type PerfAction =
   | { kind: "toggle"; index: number }
+  | { kind: "switch"; index: number; on: boolean }
   | { kind: "clear" | "apply" | "undo" | "explorer" | "refresh" }
   | { kind: "op"; ev: OpEvent }
   | { kind: "defender_tick"; path: string; on: boolean }
@@ -64,7 +67,9 @@ export type PerfAction =
   | { kind: "defender_op"; ev: OpEvent }
   | BackupAction;
 
-function SettingRow({ r, onToggle }: { r: PerfRow; onToggle: () => void }) {
+function SettingRow({ r, onToggle, onSwitch }: { r: PerfRow; onToggle: () => void; onSwitch: (on: boolean) => void }) {
+  const on = r.set;
+  const canSwitch = r.canSwitch;
   return (
     <Row
       checked={r.applicable && !r.set ? r.selected : "none"}
@@ -96,11 +101,11 @@ function SettingRow({ r, onToggle }: { r: PerfRow; onToggle: () => void }) {
       accessory={
         !r.applicable ? (
           <Badge title={r.blocked}>Not available</Badge>
-        ) : r.set ? (
-          <Badge color="green">Applied</Badge>
         ) : (
-          <Badge>Not applied</Badge>
-        )
+          <span className="hstack opt-switch">
+            <span className={on ? "tone-ok" : "tertiary"}>{on ? "Applied" : "Not applied"}</span>
+            <Switch on={on} disabled={!canSwitch} label={on ? "Switch this setting off" : "Switch this setting on"} onChange={onSwitch} />
+          </span>        )
       }
     />
   );
@@ -212,7 +217,7 @@ export function Performance() {
       {(view.groups ?? []).map((g) => (
         <Group key={g.name} title={g.name} count={`${g.rows.filter((r) => r.set).length} of ${g.rows.length} applied`}>
           {g.rows.map((r) => (
-            <SettingRow key={r.index} r={r} onToggle={() => act({ kind: "toggle", index: r.index })} />
+            <SettingRow key={r.index} r={r} onToggle={() => act({ kind: "toggle", index: r.index })} onSwitch={(on) => act({ kind: "switch", index: r.index, on })} />
           ))}
         </Group>
       ))}

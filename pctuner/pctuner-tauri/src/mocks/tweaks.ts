@@ -86,6 +86,34 @@ function chips(lines: string[]): { text: string; ok: boolean }[] {
     .map((s) => ({ text: `${s.g}  ${s.total - s.failed}/${s.total}`, ok: s.failed === 0 }));
 }
 
+/** Undo just one tweak (the row's switch), worded like the app's Mode::UndoOnly preview. */
+function askUndoOne(g: number) {
+  const go = ["Switch the tasks back on", "Let Edge preload again", "Put Teredo back"][g];
+  op.open(
+    makeOp("POST-INSTALL TWEAKS", "undo", "undone", [opItem(GROUPS[g], ["Scheduled tasks", "Edge background launching", "Xbox networking (Teredo)"][g], GROUPS[g])], {
+      noun: ["tweak", "tweaks"],
+      go_label: go,
+      preview_text: [
+        "Switches the tasks back on that were on before the tweaks. Edge and Teredo are left as they are.",
+        "Puts Edge's Startup Boost and background mode policies back to what they were before the tweaks. The other tweaks are left as they are.",
+        "Puts Teredo back to how it was before the tweaks. The other tweaks are left as they are.",
+      ][g],
+      running_text: "Undoing the tweaks...",
+      warning: g === 2 ? "Xbox party chat and multiplayer may stop connecting until Teredo is switched on again." : null,
+      reassure: g === 0 ? "Tasks that were already off before, or that the Startup Cleaner switched off, stay off." : "",
+    }),
+    () => {
+      lastTitle = go;
+      log = logFor([g], true);
+      exit = 0;
+      applied[g] = false;
+      selected[g] = false;
+      checking = 2;
+      if (op.op) op.op.can_undo = false;
+    },
+  );
+}
+
 function ask(groups: number[], undo: boolean) {
   const go = undo ? "Undo tweaks" : title(groups);
   const items = groups.map((g) => opItem(GROUPS[g], ["Scheduled tasks", "Edge background launching", "Xbox networking (Teredo)", "OneDrive"][g], GROUPS[g]));
@@ -121,12 +149,12 @@ function ask(groups: number[], undo: boolean) {
 }
 
 const bk = mockBackups(
-  "A backup saves which of these tweaks are in place. Restore applies the ones the backup had. The script can only undo all its tweaks at once, so to take one back use Undo tweaks; OneDrive is never reinstalled.",
+  "A backup saves which of these tweaks are in place. Restore applies the ones the backup had; a tweak the backup did not have is named, so you can switch it off on its row. OneDrive is never reinstalled.",
   () => seeds.map((s, i) => ({ id: String(i), title: s[0], value: applied[i] ? "on" : "off", shown: applied[i] ? `Applied (${s[4]})` : `Not applied (${s[3]})` })),
   (diffs) => {
     if (op.op) return "Another change is still open - finish it first.";
     const groups = diffs.filter((d) => d.backup.value === "on").map((d) => Number(d.backup.id));
-    const left = diffs.filter((d) => d.backup.value !== "on").map((d) => `"${d.backup.title}" is applied now but was not in this backup - "Undo tweaks" puts all tweaks back`);
+    const left = diffs.filter((d) => d.backup.value !== "on").map((d) => `"${d.backup.title}" is applied now but was not in this backup - switch it off on its row to take it back`);
     if (!groups.length) return left.join("; ") || "Nothing to restore - every tweak already matches this backup.";
     ask(groups, false);
     const w = op.op as { notes: string[] } | null; // opened by ask()
@@ -154,6 +182,8 @@ export const tweaks: MockTab<TweaksView, TweaksAction> = {
         selectable,
         selected: selected[index] && selectable,
         now: known ? (applied[index] ? on : off) : null,
+        // OneDrive can be removed, never brought back
+        canSwitch: can && known && !op.op && !(index === 3 && applied[index]),
       };
     });
     const pending = rows.filter((r) => r.selected).length;
@@ -184,6 +214,12 @@ export const tweaks: MockTab<TweaksView, TweaksAction> = {
     if (bk.act(a)) return;
     const can = mockAdmin && !running();
     switch (a.kind) {
+      case "switch": {
+        if (!can || op.op || checking !== 0 || applied[a.index] === a.on) break;
+        if (a.on) ask([a.index], false);
+        else if (a.index !== 3) askUndoOne(a.index);
+        break;
+      }
       case "toggle":
         if (can && checking === 0 && !applied[a.index]) selected[a.index] = !selected[a.index];
         break;

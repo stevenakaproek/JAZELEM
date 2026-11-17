@@ -60,14 +60,29 @@ export interface RowProps {
 }
 
 export function Row({ title, subtitle, icon, checked, value, accessory, selected, disabled, onClick, onContextMenu, title2 }: RowProps) {
-  const Tag = onClick ? "button" : "div";
+  // a clickable row is a div with the button role (not a <button>), so an accessory can hold its own
+  // controls (a Switch, a Button); clicks on those do not also click the row
+  const click = disabled ? undefined : onClick;
   return (
-    <Tag
+    <div
       className={cx("row", onClick && !disabled && "clickable", (selected || checked === true) && "selected", disabled && "disabled")}
-      onClick={disabled ? undefined : onClick}
+      onClick={click}
       onContextMenu={onContextMenu}
       title={title2}
-      {...(onClick ? { type: "button" as const, "aria-pressed": checked === true } : {})}
+      {...(onClick
+        ? {
+            role: "button",
+            tabIndex: disabled ? -1 : 0,
+            "aria-pressed": checked === true,
+            "aria-disabled": disabled || undefined,
+            onKeyDown: (e: React.KeyboardEvent) => {
+              if (click && e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+                e.preventDefault();
+                click();
+              }
+            },
+          }
+        : {})}
     >
       {checked === "none" ? <span className="check-space" /> : checked !== undefined && <Check on={checked} />}
       {icon && <span className="row-icon">{icon}</span>}
@@ -76,8 +91,18 @@ export function Row({ title, subtitle, icon, checked, value, accessory, selected
         {subtitle && <div className="row-sub">{subtitle}</div>}
       </span>
       {value !== undefined && <span className="row-value">{value}</span>}
-      {accessory && <span className="row-accessory">{accessory}</span>}
-    </Tag>
+      {accessory && (
+        <span
+          className="row-accessory"
+          onClick={(e) => {
+            // its own buttons and switches act alone (a plain badge still clicks the row)
+            if ((e.target as HTMLElement).closest("button, a, input, select, [role=switch]")) e.stopPropagation();
+          }}
+        >
+          {accessory}
+        </span>
+      )}
+    </div>
   );
 }
 

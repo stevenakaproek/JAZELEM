@@ -17,6 +17,8 @@ pub struct NetworkTab {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Action {
     Toggle { index: usize },
+    /// The row's on / off switch (opens the preview for that one setting).
+    Switch { index: usize, on: bool },
     Clear,
     Apply,
     Undo,
@@ -92,6 +94,8 @@ impl NetworkTab {
                 "set": set,
                 "selectable": selectable,
                 "selected": self.n.selected[i] && selectable,
+                // the switch: on = the tweak is in place
+                "canSwitch": applicable && self.can() && self.n.op.is_none(),
                 "now": fmt(t.kind, state.value(t.kind).as_deref()),
                 "target": fmt(t.kind, Some(t.target)),
             }));
@@ -141,6 +145,11 @@ impl Backend for NetworkTab {
             return Ok(Value::Null);
         }
         match parse::<Action>(action)? {
+            Action::Switch { index, on } => {
+                if self.can() {
+                    self.n.open_switch(index, on);
+                }
+            }
             Action::Toggle { index } => {
                 if self.selectable(index) {
                     self.n.selected[index] = !self.n.selected[index];

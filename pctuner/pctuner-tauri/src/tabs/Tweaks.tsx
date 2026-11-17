@@ -21,6 +21,8 @@ export interface TweakRow {
   selected: boolean;
   /** The current value; null while the status is being read. */
   now: string | null;
+  /** the on / off switch can be used now (OneDrive cannot be brought back) */
+  canSwitch: boolean;
 }
 
 export interface TweaksLastRun {
@@ -46,9 +48,9 @@ export interface TweaksView {
   backups: TabBackupsView | null;
 }
 
-export type TweaksAction = { kind: "toggle"; index: number } | { kind: "clear" | "apply" | "undo" | "refresh" } | { kind: "details"; on: boolean } | { kind: "op"; ev: OpEvent } | BackupAction;
+export type TweaksAction = { kind: "toggle"; index: number } | { kind: "switch"; index: number; on: boolean } | { kind: "clear" | "apply" | "undo" | "refresh" } | { kind: "details"; on: boolean } | { kind: "op"; ev: OpEvent } | BackupAction;
 
-function TweakRowView({ r, onToggle }: { r: TweakRow; onToggle: () => void }) {
+function TweakRowView({ r, onToggle, onSwitch }: { r: TweakRow; onToggle: () => void; onSwitch: (on: boolean) => void }) {
   return (
     <Row
       checked={r.applied === false ? r.selected : "none"}
@@ -56,7 +58,21 @@ function TweakRowView({ r, onToggle }: { r: TweakRow; onToggle: () => void }) {
       title={<span className={r.danger ? "tone-error" : undefined}>{r.name}</span>}
       subtitle={r.text}
       value={r.now !== null ? <span className={r.selected ? "tone-accent" : undefined}>{r.now}</span> : undefined}
-      accessory={r.applied === null ? <Badge>Checking...</Badge> : r.applied ? <Badge color="green">Applied</Badge> : <Badge>Not applied</Badge>}
+      accessory={
+        r.applied === null ? (
+          <Badge>Checking...</Badge>
+        ) : (
+          <span className="hstack opt-switch">
+            <span className={r.applied ? "tone-ok" : "tertiary"}>{r.applied ? "Applied" : "Not applied"}</span>
+            <Switch
+              on={r.applied}
+              disabled={!r.canSwitch}
+              label={r.applied ? "Undo this tweak" : "Apply this tweak"}
+              onChange={onSwitch}
+            />
+          </span>
+        )
+      }
     />
   );
 }
@@ -144,7 +160,7 @@ export function Tweaks() {
       </div>
       <Group title="Tweaks" count={`${view.rows.filter((r) => r.applied).length} of ${view.rows.length} applied`}>
         {view.rows.map((r) => (
-          <TweakRowView key={r.index} r={r} onToggle={() => act({ kind: "toggle", index: r.index })} />
+          <TweakRowView key={r.index} r={r} onToggle={() => act({ kind: "toggle", index: r.index })} onSwitch={(on) => act({ kind: "switch", index: r.index, on })} />
         ))}
       </Group>
       <LastRun run={view.lastRun} onDetails={(on) => act({ kind: "details", on })} />
