@@ -1,0 +1,23 @@
+[package]
+name = "pctuner-tauri"
+version.workspace = true
+edition.workspace = true
+description = "PC Tuner - the Tauri app (Apple-style interface on top of pctuner-core)"
+
+# built beside the egui app until the switch-over: target\release\PCTunerNext.exe
+[[bin]]
+name = "PCTunerNext"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+pctuner-core = { path = "../../crates/pctuner-core" }
+tauri = { version = "2", features = ["tray-icon"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+# set by `tauri build`: serve the built frontend from the exe instead of the dev server
+custom-protocol = ["tauri/custom-protocol"]

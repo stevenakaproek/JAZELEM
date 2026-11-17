@@ -1,0 +1,270 @@
+# Windows 11 default service startup types (clean install of Windows 11 Pro 23H2).
+# Source: winhelponline.com "Windows 11 Default Services Configuration and Permissions" (display names mapped
+# to service names; per-user services listed by their template name). Columns: service name, startup type.
+# Used by Services > Backups > "Windows default". Services not listed here are never changed by it.
+# Left out on purpose: WlanSvc and WwanSvc - Windows sets them to Automatic when the PC has Wi-Fi / mobile
+# broadband hardware (the source PC had none), so the table value would stop wireless connecting at startup.
+AarSvc	Manual
+AJRouter	Manual (Trigger Start)
+ALG	Manual
+AppIDSvc	Manual (Trigger Start)
+Appinfo	Manual (Trigger Start)
+AppMgmt	Manual
+AppReadiness	Manual
+AppVClient	Disabled
+AppXSVC	Manual (Trigger Start)
+AssignedAccessManagerSvc	Manual (Trigger Start)
+AudioEndpointBuilder	Automatic
+Audiosrv	Automatic
+autotimesvc	Manual (Trigger Start)
+AxInstSV	Manual
+BcastDVRUserService	Manual
+BDESVC	Manual (Trigger Start)
+BFE	Automatic
+BITS	Automatic (Delayed Start)
+BluetoothUserService	Manual (Trigger Start)
+BrokerInfrastructure	Automatic
+BTAGService	Manual (Trigger Start)
+BthAvctpSvc	Manual (Trigger Start)
+bthserv	Manual (Trigger Start)
+camsvc	Manual (Trigger Start)
+CaptureService	Manual
+cbdhsvc	Automatic (Delayed Start)
+CDPSvc	Automatic (Delayed Start, Trigger Start)
+CDPUserSvc	Automatic
+CertPropSvc	Manual (Trigger Start)
+ClipSVC	Manual (Trigger Start)
+CloudBackupRestoreSvc	Manual
+cloudidsvc	Manual
+COMSysApp	Manual
+ConsentUxUserSvc	Manual
+CoreMessagingRegistrar	Automatic
+CredentialEnrollmentManagerUserSvc	Manual
+CryptSvc	Automatic (Trigger Start)
+CscService	Manual (Trigger Start)
+DcomLaunch	Automatic
+dcsvc	Manual (Trigger Start)
+defragsvc	Manual
+DeviceAssociationBrokerSvc	Manual
+DeviceAssociationService	Manual (Trigger Start)
+DeviceInstall	Manual (Trigger Start)
+DevicePickerUserSvc	Manual
+DevicesFlowUserSvc	Manual
+DevQueryBroker	Manual (Trigger Start)
+Dhcp	Automatic
+diagnosticshub.standardcollector.service	Manual
+diagsvc	Manual (Trigger Start)
+DiagTrack	Automatic
+DialogBlockingService	Disabled
+DispBrokerDesktopSvc	Automatic
+DisplayEnhancementService	Manual (Trigger Start)
+DmEnrollmentSvc	Manual
+dmwappushservice	Manual (Trigger Start)
+Dnscache	Automatic (Trigger Start)
+DoSvc	Automatic (Delayed Start, Trigger Start)
+dot3svc	Manual
+DPS	Automatic
+DsmSvc	Manual (Trigger Start)
+DsSvc	Manual (Trigger Start)
+DusmSvc	Automatic
+EapHost	Manual
+edgeupdate	Automatic (Delayed Start, Trigger Start)
+edgeupdatem	Manual (Trigger Start)
+EFS	Manual (Trigger Start)
+embeddedmode	Manual (Trigger Start)
+EntAppSvc	Manual
+EventLog	Automatic
+EventSystem	Automatic
+fdPHost	Manual
+FDResPub	Manual (Trigger Start)
+fhsvc	Manual (Trigger Start)
+FontCache	Automatic
+FrameServer	Manual (Trigger Start)
+FrameServerMonitor	Manual (Trigger Start)
+GameInputSvc	Manual (Trigger Start)
+gpsvc	Automatic (Trigger Start)
+GraphicsPerfSvc	Manual (Trigger Start)
+hidserv	Manual (Trigger Start)
+HvHost	Manual (Trigger Start)
+icssvc	Manual (Trigger Start)
+IKEEXT	Manual (Trigger Start)
+InstallService	Manual
+InventorySvc	Manual
+iphlpsvc	Automatic
+IpxlatCfgSvc	Manual (Trigger Start)
+KeyIso	Manual (Trigger Start)
+KtmRm	Manual (Trigger Start)
+LanmanServer	Automatic (Trigger Start)
+LanmanWorkstation	Automatic
+lfsvc	Manual (Trigger Start)
+LicenseManager	Manual (Trigger Start)
+lltdsvc	Manual
+lmhosts	Manual (Trigger Start)
+LSM	Automatic
+LxpSvc	Manual
+MapsBroker	Automatic (Delayed Start)
+McpManagementService	Manual
+MDCoreSvc	Automatic
+MessagingService	Manual (Trigger Start)
+MicrosoftEdgeElevationService	Manual
+MixedRealityOpenXRSvc	Manual
+mpssvc	Automatic
+MSDTC	Manual
+MSiSCSI	Manual
+msiserver	Manual
+MsKeyboardFilter	Disabled
+NaturalAuthentication	Manual (Trigger Start)
+NcaSvc	Manual (Trigger Start)
+NcbService	Manual (Trigger Start)
+NcdAutoSetup	Manual (Trigger Start)
+Netlogon	Manual
+Netman	Manual
+netprofm	Manual
+NetSetupSvc	Manual (Trigger Start)
+NetTcpPortSharing	Disabled
+NgcCtnrSvc	Manual (Trigger Start)
+NgcSvc	Manual (Trigger Start)
+NlaSvc	Manual
+NPSMSvc	Manual
+nsi	Automatic
+OneSyncSvc	Automatic (Delayed Start)
+p2pimsvc	Manual
+p2psvc	Manual
+P9RdrService	Manual (Trigger Start)
+PcaSvc	Automatic (Delayed Start, Trigger Start)
+PeerDistSvc	Manual
+PenService	Manual (Trigger Start)
+perceptionsimulation	Manual
+PerfHost	Manual
+PhoneSvc	Manual (Trigger Start)
+PimIndexMaintenanceSvc	Manual
+pla	Manual
+PlugPlay	Manual
+PNRPAutoReg	Manual
+PNRPsvc	Manual
+PolicyAgent	Manual (Trigger Start)
+Power	Automatic
+PrintNotify	Manual
+PrintWorkflowUserSvc	Manual (Trigger Start)
+ProfSvc	Automatic
+PushToInstall	Manual (Trigger Start)
+QWAVE	Manual
+RasAuto	Manual
+RasMan	Manual
+RemoteAccess	Disabled
+RemoteRegistry	Disabled
+RetailDemo	Manual
+RmSvc	Manual
+RpcEptMapper	Automatic
+RpcLocator	Manual
+RpcSs	Automatic
+SamSs	Automatic
+SCardSvr	Manual (Trigger Start)
+ScDeviceEnum	Manual (Trigger Start)
+Schedule	Automatic
+SCPolicySvc	Manual
+SDRSVC	Manual
+seclogon	Manual
+SecurityHealthService	Manual
+SEMgrSvc	Manual (Trigger Start)
+SENS	Automatic
+Sense	Manual
+SensorDataService	Manual (Trigger Start)
+SensorService	Manual (Trigger Start)
+SensrSvc	Manual (Trigger Start)
+SessionEnv	Manual
+SgrmBroker	Disabled
+SharedAccess	Manual (Trigger Start)
+SharedRealitySvc	Manual
+ShellHWDetection	Automatic
+shpamsvc	Disabled
+smphost	Manual
+SmsRouter	Manual (Trigger Start)
+SNMPTrap	Manual
+spectrum	Manual (Trigger Start)
+Spooler	Automatic
+sppsvc	Automatic (Delayed Start, Trigger Start)
+SSDPSRV	Manual
+ssh-agent	Disabled
+SstpSvc	Manual
+StateRepository	Automatic
+StiSvc	Manual (Trigger Start)
+StorSvc	Automatic (Delayed Start, Trigger Start)
+svsvc	Manual (Trigger Start)
+swprv	Manual
+SysMain	Automatic
+SystemEventsBroker	Automatic (Trigger Start)
+TapiSrv	Manual
+TermService	Manual
+TextInputManagementService	Automatic (Trigger Start)
+Themes	Automatic
+TieringEngineService	Manual
+TimeBrokerSvc	Manual (Trigger Start)
+TokenBroker	Manual
+TrkWks	Automatic
+TroubleshootingSvc	Manual
+TrustedInstaller	Automatic
+tzautoupdate	Disabled
+UdkUserSvc	Manual
+UevAgentService	Disabled
+uhssvc	Disabled
+UmRdpService	Manual
+UnistoreSvc	Manual
+upnphost	Manual
+UserDataSvc	Manual
+UserManager	Automatic (Trigger Start)
+UsoSvc	Automatic (Delayed Start)
+VacSvc	Manual
+VaultSvc	Manual
+vds	Manual
+vmicguestinterface	Manual (Trigger Start)
+vmicheartbeat	Manual (Trigger Start)
+vmickvpexchange	Manual (Trigger Start)
+vmicrdv	Manual (Trigger Start)
+vmicshutdown	Manual (Trigger Start)
+vmictimesync	Manual (Trigger Start)
+vmicvmsession	Manual (Trigger Start)
+vmicvss	Manual (Trigger Start)
+VSS	Manual
+W32Time	Manual (Trigger Start)
+WaaSMedicSvc	Manual
+WalletService	Manual
+WarpJITSvc	Manual (Trigger Start)
+wbengine	Manual
+WbioSrvc	Manual (Trigger Start)
+Wcmsvc	Automatic (Trigger Start)
+wcncsvc	Manual
+WdiServiceHost	Manual
+WdiSystemHost	Manual
+WdNisSvc	Manual
+WebClient	Manual (Trigger Start)
+webthreatdefsvc	Manual (Trigger Start)
+webthreatdefusersvc	Automatic
+Wecsvc	Manual
+WEPHOSTSVC	Manual (Trigger Start)
+wercplsupport	Manual
+WerSvc	Manual (Trigger Start)
+WFDSConMgrSvc	Manual (Trigger Start)
+WiaRpc	Manual
+WinDefend	Automatic
+WinHttpAutoProxySvc	Manual
+Winmgmt	Automatic
+WinRM	Manual
+wisvc	Manual (Trigger Start)
+wlidsvc	Manual (Trigger Start)
+wlpasvc	Manual (Trigger Start)
+WManSvc	Manual
+wmiApSrv	Manual
+WMPNetworkSvc	Manual
+workfolderssvc	Manual
+WpcMonSvc	Manual
+WPDBusEnum	Manual (Trigger Start)
+WpnService	Automatic
+WpnUserService	Automatic
+wscsvc	Automatic (Delayed Start)
+WSearch	Automatic (Delayed Start)
+wuauserv	Manual (Trigger Start)
+XblAuthManager	Manual
+XblGameSave	Manual (Trigger Start)
+XboxGipSvc	Manual (Trigger Start)
+XboxNetApiSvc	Manual

@@ -1,0 +1,46 @@
+/* USB Port Finder: the plug-in test hits and the tier column. */
+
+.usb-tier {
+  flex-shrink: 0;
+  width: 74px;
+}
+.usb-tier.wide {
+  width: 150px;
+}
+.usb-small {
+  font-size: var(--text-sm);
+}
+.usb-hit {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--s2) var(--s3);
+  border-radius: var(--r-md);
+  background: var(--fill-hover);
+  box-shadow: inset 0 0 0 0.5px var(--hairline-strong);
+  transition: background var(--t-slow) var(--ease-out), box-shadow var(--t-slow) var(--ease-out);
+}
+.usb-hit.fresh.green {
+  background: var(--green-soft);
+  box-shadow: inset 0 0 0 1px var(--green);
+}
+.usb-hit.fresh.accent {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.usb-hit.fresh.yellow {
+  background: var(--yellow-soft);
+  box-shadow: inset 0 0 0 1px var(--yellow);
+}
+.usb-hit.fresh.orange {
+  background: var(--orange-soft);
+  box-shadow: inset 0 0 0 1px var(--orange);
+}
+.usb-hit.fresh {
+  box-shadow: inset 0 0 0 1px var(--hairline-strong);
+}
+.usb-row-main {
+  flex-wrap: wrap;
+  row-gap: var(--s1);
+}
+.usb-off .usb-tier { opacity: 0.5; }

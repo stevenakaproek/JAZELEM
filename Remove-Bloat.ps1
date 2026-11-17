@@ -301,6 +301,14 @@ function Invoke-Hook([string]$hook, [string]$phase, $t) {
                     if (-not ($script:State.Frameworks | Where-Object { $_.Pfn -eq $fw.PackageFamilyName })) { [void]$script:State.Frameworks.Add([pscustomobject]@{ Name = $fw.Name; Pfn = $fw.PackageFamilyName; Time = $Stamp }) }
                 } catch { Write-Log "  framework not removed: $($_.Exception.Message)" 'Yellow' }
             }
+            # Windows re-registers the app from the handwriting language feature (Language.Handwriting~~~<lang>),
+            # so the app keeps coming back while that feature is installed: remove it with the app.
+            # Skipped when it is already tracked (the re-check task handles tracked capabilities itself).
+            $tracked = @($script:State.Removed | Where-Object { $_.Kind -eq 'capability' -and $_.Name -like 'Language.Handwriting~*' -and -not $_.Restored })
+            if (-not $tracked) {
+                $hw = $Targets | Where-Object { $_.Name -eq 'Language.Handwriting~' } | Select-Object -First 1
+                if ($hw) { Remove-CapabilityTarget $hw }
+            }
         }
         'Teams/after' {
             Remove-UschedEntry 'TFLUpdate'
@@ -431,6 +439,8 @@ function Remove-CapabilityTarget($t) {
         try {
             Remove-WindowsCapability -Online -Name $c.Name | Out-Null
             Write-Log "  done: $($c.Name)" 'Green'
+            # removed now: a later target with the same prefix (pen handwriting removes it first) sees it gone
+            $script:CapCache = @($script:CapCache | Where-Object { $_.Name -ne $c.Name })
             [void]$script:State.Removed.Add([pscustomobject]@{ Name = $c.Name; Kind = 'capability'; Pfn = ''; Store = ''; Time = $Stamp; Restored = $false })
         } catch { Write-Log "  failed: $($_.Exception.Message)" 'Red' }
     }

@@ -1,0 +1,25 @@
+[package]
+name = "pctuner-egui"
+version.workspace = true
+edition.workspace = true
+description = "PC Tuner - services, startup, scheduler, bloat removal, network, fan control, USB port finder and RTX 5080 profiles in one app"
+
+# same exe name as before the workspace split: target\release\pctuner.exe
+[[bin]]
+name = "pctuner"
+path = "src/main.rs"
+
+[dependencies]
+pctuner-core = { path = "../pctuner-core" }
+eframe = "0.29"
+egui_extras = "0.29"
+serde.workspace = true
+serde_json.workspace = true
+winreg.workspace = true
+base64.workspace = true
+chrono.workspace = true
+windows-sys.workspace = true
+tray-icon = "0.19"
+
+[build-dependencies]
+embed-manifest = "1.4"

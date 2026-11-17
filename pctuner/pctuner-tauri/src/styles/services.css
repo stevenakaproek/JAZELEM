@@ -1,0 +1,82 @@
+/* Services: the dense service list and the tables in its sheets. */
+
+.svc-scroll {
+  max-height: calc(100vh - 300px);
+  min-height: 260px;
+  overflow-y: auto;
+}
+.svc-sheet-scroll {
+  max-height: 340px;
+  overflow-y: auto;
+  border-radius: var(--r-lg);
+  background: var(--bg-elevated);
+  box-shadow: inset 0 0 0 0.5px var(--hairline);
+}
+.svc-table {
+  table-layout: fixed;
+}
+.svc-table td {
+  max-width: none;
+}
+.svc-table tbody tr.clickable {
+  cursor: pointer;
+}
+.svc-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+.svc-table th.sortable.active {
+  color: var(--accent);
+}
+.svc-table th svg {
+  width: var(--s3);
+  height: var(--s3);
+  margin-left: var(--s1);
+  vertical-align: -2px;
+}
+.svc-table td svg.svc-done {
+  width: var(--s3);
+  height: var(--s3);
+  margin-left: var(--s1);
+  vertical-align: -1px;
+}
+.svc-table .col-check {
+  width: 44px;
+}
+.svc-table .svc-name {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 0;
+}
+.svc-table .svc-name > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.svc-table .svc-name .dot {
+  flex-shrink: 0;
+}
+.svc-table .dot.hidden {
+  visibility: hidden;
+}
+.svc-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s2) var(--s4);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+.svc-legend > span,
+.svc-legend > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.svc-status {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+}

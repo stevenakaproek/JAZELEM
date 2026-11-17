@@ -4,10 +4,12 @@
 // and drives fan headers on request. PC Tuner starts it hidden and talks over stdin/stdout:
 //   helper -> app : one JSON status line per second
 //   app -> helper : ping | set <id> <percent> | curve <id> <cpu|gpu|hottest> t:d,... | auto <id> | autoall
+//                   | trigger <id> <cpu|gpu|hottest> <idle temp> <load temp> <idle %> <load %>
 //                   | pump <id> 0|1 | quit
+//   (trigger: idle speed until the load temperature, then the load speed until it falls to the idle temperature)
 //
 // Safety rules live here, so they hold even if the PC Tuner window freezes or crashes:
-//   - fans never below 20 %, pumps never below 50 %
+//   - no speed floor of its own: fans and pumps go as low as PC Tuner asks (the controller's minimum still holds)
 //   - any CPU or GPU temperature >= 90 C: every controlled fan to 100 % until both are below 80 C
 //   - if temperatures cannot be read for 5 s while fans are controlled: fans go back to the BIOS until
 //     they can be read again (the settings are kept and come back by themselves; status "blind":true)
@@ -44,8 +46,11 @@ namespace PCTunerFan
     /// <summary>Pure safety rules (unit-tested by --selftest).</summary>
     public static class Safety
     {
-        public const float FanFloor = 20f;
-        public const float PumpFloor = 50f;
+        // No software floor: the user sets fan and pump speeds as low as they like (0 % allowed). The
+        // controller's own minimum still applies (SetSoftware clamps to MinSoftwareValue), and so does the
+        // 90 C override below.
+        public const float FanFloor = 0f;
+        public const float PumpFloor = 0f;
         public const float HotOn = 90f;
         public const float HotOff = 80f;
         public const double WatchdogSeconds = 10.0;
@@ -119,6 +124,8 @@ namespace PCTunerFan
         public string Hw;
         public string Name;
         public ISensor Rpm;
+        /// <summary>The sensor the built-in rule paired (same name, else same index) - what "auto" goes back to.</summary>
+        public ISensor DefaultRpm;
         public ISensor Control;
         public bool Pump;
         public bool IsGpu;
@@ -137,6 +144,32 @@ namespace PCTunerFan
         /// <summary>SetDefault works without an earlier SetSoftware in this process (graphics-card fans: the
         /// driver takes them back). A motherboard header is only restored to what this process saved.</summary>
         bool DriverReset(string id);
+        /// <summary>RPM of the speed sensor paired with this fan (null: none, or unreadable).</summary>
+        float? FanRpm(string id);
+        /// <summary>Every speed sensor's RPM right now, by sensor id (for pairing).</summary>
+        IDictionary<string, float?> AllRpms();
+        /// <summary>Pair a fan control with a speed sensor: a sensor id, "auto" (the built-in rule) or "none".
+        /// False when the control or the sensor is unknown.</summary>
+        bool Pair(string id, string sensor);
+    }
+
+    /// <summary>A test PC Tuner asked for on one fan, run step by step inside the safety loop:
+    /// "calibrate" (duty sweep, RPM per step) or "pair" (which speed sensor follows this control).</summary>
+    public class FanJob
+    {
+        public string Kind, Id;
+        public int Seq;
+        public List<(float duty, int hold)> Steps = new List<(float, int)>();
+        public int Step, Held;
+        /// <summary>calibrate: (duty, rpm) per finished step</summary>
+        public List<(float duty, float rpm)> Points = new List<(float, float)>();
+        /// <summary>pair: every sensor's RPM at the end of the low and the high step</summary>
+        public IDictionary<string, float?> Low, High;
+        public bool Done;
+        public string Error = "", Paired = "";
+        public float? StartDuty, StopDuty, MaxRpm;
+        public bool Up; // calibrate: in the upward start-duty search
+        public float Duty => Step < Steps.Count ? Steps[Step].duty : 0;
     }
 
     public class QuitException : Exception { public QuitException(string m) : base(m) { } }
@@ -153,13 +186,30 @@ namespace PCTunerFan
         readonly HashSet<string> pumpOverride = new HashSet<string>();
         readonly HashSet<string> notPump = new HashSet<string>();
 
-        /// <summary>A fan that follows a temperature curve.</summary>
+        /// <summary>A fan that follows a temperature: a graph curve, or a trigger (two steady speeds).</summary>
         class Curve
         {
             public string Source = "hottest"; // cpu | gpu | hottest
             public List<(float t, float d)> Points = new List<(float t, float d)>();
             public float? LastTemp;
+            // trigger: idle speed until LoadTemp is reached, then the load speed until it falls to IdleTemp
+            public bool Trigger;
+            public float IdleTemp, LoadTemp, IdleDuty, LoadDuty;
+            public bool Loaded;
         }
+
+        /// <summary>Trigger latch: on at the load temperature, off at the idle temperature, unchanged between.</summary>
+        public static bool TriggerLoaded(bool loaded, float temp, float idleTemp, float loadTemp)
+        {
+            if (temp >= loadTemp) return true;
+            if (temp <= idleTemp) return false;
+            return loaded;
+        }
+
+        static string Src(string s) => s == "cpu" || s == "gpu" ? s : "hottest";
+
+        static bool Num(string s, out float v) =>
+            float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v) && !float.IsNaN(v) && !float.IsInfinity(v);
         readonly Dictionary<string, Curve> curves = new Dictionary<string, Curve>();
 
         DateTime lastFromApp;
@@ -201,6 +251,112 @@ namespace PCTunerFan
         }
 
         public float? Requested(string id) => requested.TryGetValue(id, out var r) ? r : (float?)null;
+
+        /// <summary>The running or last finished test (null: none since the helper started).</summary>
+        public FanJob Job { get; private set; }
+        int jobSeq;
+        public bool JobRunning => Job != null && !Job.Done;
+
+        /// <summary>Calibration: settle at 100 %, then 90 % down to 0 % (RPM per step; where it stops),
+        /// then 5 % upward until it spins again (start duty). Seconds held per step.</summary>
+        public static List<(float, int)> CalibrationSteps()
+        {
+            var s = new List<(float, int)> { (100f, 6) };
+            for (int d = 90; d >= 0; d -= 10) s.Add((d, 4));
+            for (int d = 5; d <= 60; d += 5) s.Add((d, 4));
+            return s;
+        }
+
+        /// <summary>Pairing: 30 % then 100 %; the sensor that rises the most follows this control.</summary>
+        public static List<(float, int)> PairSteps() => new List<(float, int)> { (30f, 6), (100f, 6) };
+
+        /// <summary>Which sensor rose clearly between the two readings (null: none did).</summary>
+        public static string PairWinner(IDictionary<string, float?> low, IDictionary<string, float?> high)
+        {
+            string best = null;
+            float bestRise = 0;
+            foreach (var kv in high)
+            {
+                if (!kv.Value.HasValue || !low.TryGetValue(kv.Key, out var lo) || !lo.HasValue) continue;
+                float rise = kv.Value.Value - lo.Value;
+                if (rise > Math.Max(150f, 0.25f * lo.Value) && rise > bestRise) { best = kv.Key; bestRise = rise; }
+            }
+            return best;
+        }
+
+        bool StartJob(string kind, string id)
+        {
+            if (JobRunning) { Say("A fan test is already running."); return false; }
+            if (!io.Controllable(id)) { Say("not controllable: " + id); return false; }
+            if (IsPump(id)) { Say("Pumps are never stopped or swept - this is a pump: " + id); return false; }
+            if (Emergency || Blind) { Say("Not now: the fans are in safety mode."); return false; }
+            Job = new FanJob { Kind = kind, Id = id, Seq = ++jobSeq, Steps = kind == "calibrate" ? CalibrationSteps() : PairSteps() };
+            return true;
+        }
+
+        /// <summary>End the test: the fan goes back to what PC Tuner asked for before (or to the BIOS).</summary>
+        void EndJob(string error)
+        {
+            var j = Job;
+            j.Done = true;
+            j.Error = error ?? "";
+            if (!requested.ContainsKey(j.Id) && !curves.ContainsKey(j.Id))
+            {
+                SafeDefault(j.Id);
+                touched.Remove(j.Id);
+            }
+        }
+
+        /// <summary>One second of the running test: hold the step, then record and move on.</summary>
+        void RunJob()
+        {
+            var j = Job;
+            if (j == null || j.Done) return;
+            if (Emergency) { EndJob("Stopped: a temperature reached 90 °C."); return; }
+            if (Blind) { EndJob("Stopped: temperatures could not be read."); return; }
+            if (++j.Held < j.Steps[j.Step].hold) return;
+            j.Held = 0;
+            if (j.Kind == "pair")
+            {
+                if (j.Step == 0) j.Low = io.AllRpms();
+                else
+                {
+                    j.High = io.AllRpms();
+                    j.Paired = PairWinner(j.Low, j.High) ?? "";
+                    if (j.Paired != "") io.Pair(j.Id, j.Paired);
+                    EndJob(j.Paired == "" ? "No speed sensor followed this fan (no tachometer wire, or a header without RPM reading)." : null);
+                    return;
+                }
+            }
+            else
+            {
+                float rpm = io.FanRpm(j.Id) ?? 0;
+                float duty = j.Steps[j.Step].duty;
+                if (!j.Up)
+                {
+                    j.Points.Add((duty, rpm));
+                    if (rpm > 0) j.MaxRpm = Math.Max(j.MaxRpm ?? 0, rpm);
+                    if (rpm > 0) j.StopDuty = duty; // lowest duty that still spins (the sweep goes down)
+                    if (duty == 0)
+                    {
+                        if (rpm > 0) { EndJob(null); return; } // never stops: no start duty to find
+                        j.Up = true;
+                    }
+                }
+                else if (rpm > 0)
+                {
+                    j.StartDuty = duty;
+                    EndJob(null);
+                    return;
+                }
+                if (j.Step + 1 >= j.Steps.Count)
+                {
+                    EndJob(j.Points.All(p => p.rpm <= 0) ? "No RPM reading from this fan's speed sensor - pair it first." : "Did not start again up to 60 %.");
+                    return;
+                }
+            }
+            j.Step++;
+        }
         public bool HasCurve(string id) => curves.ContainsKey(id);
         public bool IsPump(string id) => !notPump.Contains(id) && (io.NamedPump(id) || pumpOverride.Contains(id));
         public IEnumerable<string> Touched => touched;
@@ -236,6 +392,7 @@ namespace PCTunerFan
 
         void GiveBack(string id)
         {
+            if (JobRunning && Job.Id == id) EndJob("Cancelled: the fan was given back to the BIOS.");
             requested.Remove(id);
             curves.Remove(id);
             bool stale = CannotHandBack(id);
@@ -267,10 +424,25 @@ namespace PCTunerFan
                     if (!io.Controllable(parts[1])) { Say("not controllable: " + parts[1]); break; }
                     var pts = ParsePoints(parts[3]);
                     if (pts == null) { Say("bad curve: " + parts[3]); break; }
-                    string src = parts[2] == "cpu" || parts[2] == "gpu" ? parts[2] : "hottest";
                     if (!curves.TryGetValue(parts[1], out var cur)) curves[parts[1]] = cur = new Curve();
-                    cur.Source = src;
+                    cur.Source = Src(parts[2]);
                     cur.Points = pts;
+                    cur.Trigger = false;
+                    break;
+                case "trigger" when parts.Length >= 7:
+                    // trigger <id> <cpu|gpu|hottest> <idle temp> <load temp> <idle %> <load %>
+                    if (!io.Controllable(parts[1])) { Say("not controllable: " + parts[1]); break; }
+                    if (!Num(parts[3], out var it) || !Num(parts[4], out var lt) || !Num(parts[5], out var idl) || !Num(parts[6], out var ld) || lt <= it)
+                    { Say("bad trigger: " + string.Join(" ", parts.Skip(3))); break; }
+                    bool same = curves.TryGetValue(parts[1], out var trg) && trg.Trigger;
+                    if (trg == null) curves[parts[1]] = trg = new Curve();
+                    trg.Source = Src(parts[2]);
+                    trg.Trigger = true;
+                    trg.IdleTemp = it;
+                    trg.LoadTemp = lt;
+                    trg.IdleDuty = Math.Max(0, Math.Min(100, idl));
+                    trg.LoadDuty = Math.Max(0, Math.Min(100, ld));
+                    if (!same) trg.Loaded = false; // a new trigger starts idle; an edited one keeps its state
                     break;
                 case "auto" when parts.Length >= 2:
                     GiveBack(parts[1]);
@@ -281,6 +453,20 @@ namespace PCTunerFan
                 case "pump" when parts.Length >= 3:
                     if (parts[2] == "1") { pumpOverride.Add(parts[1]); notPump.Remove(parts[1]); }
                     else { pumpOverride.Remove(parts[1]); if (io.NamedPump(parts[1])) notPump.Add(parts[1]); }
+                    break;
+                case "calibrate" when parts.Length >= 2:
+                    StartJob("calibrate", parts[1]);
+                    break;
+                case "pairdetect" when parts.Length >= 2:
+                    StartJob("pair", parts[1]);
+                    break;
+                case "pair" when parts.Length >= 3:
+                    // pair <control id> <sensor id | auto | none>
+                    if (JobRunning && Job.Id == parts[1]) break;
+                    if (!io.Pair(parts[1], parts[2])) Say("unknown fan or speed sensor: " + parts[1] + " " + parts[2]);
+                    break;
+                case "jobcancel":
+                    if (JobRunning) EndJob("Cancelled.");
                     break;
                 case "quit":
                     throw new QuitException("PC Tuner closed");
@@ -299,6 +485,14 @@ namespace PCTunerFan
                 // the chosen sensor is missing: follow whichever temperature is known
                 if (!src.HasValue && (cpu.HasValue || gpu.HasValue)) src = Math.Max(cpu ?? 0, gpu ?? 0);
                 if (!src.HasValue) continue; // no temperature at all: the "blind" rule hands the fan back
+                if (kv.Value.Trigger)
+                {
+                    // the gap between the two temperatures is the hysteresis: raw temperature here
+                    var c = kv.Value;
+                    c.Loaded = TriggerLoaded(c.Loaded, src.Value, c.IdleTemp, c.LoadTemp);
+                    requested[kv.Key] = c.Loaded ? c.LoadDuty : c.IdleDuty;
+                    continue;
+                }
                 float t = Safety.Hysteresis(kv.Value.LastTemp, src.Value);
                 kv.Value.LastTemp = t;
                 requested[kv.Key] = Safety.CurveDuty(kv.Value.Points, t);
@@ -311,10 +505,17 @@ namespace PCTunerFan
             foreach (var kv in requested)
             {
                 if (!io.Controllable(kv.Key)) continue;
+                if (JobRunning && Job.Id == kv.Key) continue; // the test drives this fan
                 float duty = Emergency ? 100f : Safety.Clamp(kv.Value, IsPump(kv.Key));
                 io.SetSoftware(kv.Key, duty);
                 if (CannotHandBack(kv.Key)) Stranded = true;
                 touched.Add(kv.Key);
+            }
+            if (JobRunning && io.Controllable(Job.Id))
+            {
+                io.SetSoftware(Job.Id, Emergency ? 100f : Job.Duty);
+                if (CannotHandBack(Job.Id)) Stranded = true;
+                touched.Add(Job.Id);
             }
         }
 
@@ -339,6 +540,8 @@ namespace PCTunerFan
                 Blind = false;
                 if (requested.Count > 0 || curves.Count > 0) Say("Temperatures can be read again - PC Tuner controls the fans again.");
             }
+            // the test reads what the last second's duty did, then sets the next step
+            try { RunJob(); } catch (Exception e) { if (JobRunning) EndJob("Stopped: " + e.Message); }
             try { ApplyAll(); } catch (Exception e) { Say("control failed: " + e.Message); }
             return null;
         }
@@ -395,6 +598,8 @@ namespace PCTunerFan
             try
             {
                 if (args.Contains("--selftest")) return SelfTest();
+                if (args.Contains("--ramled")) return RamLed.Run(args); // RAM LED tab: one-shot, never touches the fans
+                if (args.Contains("--gpuled")) return GpuLed.Run(args); // RAM LED tab, graphics card section: one-shot
                 if (args.Contains("--dump"))
                 {
                     int i = Array.IndexOf(args, "--dump");
@@ -445,7 +650,7 @@ namespace PCTunerFan
             {
                 var h = stack.Pop();
                 yield return h;
-                foreach (var s in h.SubHardware.Reverse()) stack.Push(s);
+                foreach (var s in Enumerable.Reverse(h.SubHardware)) stack.Push(s);
             }
         }
 
@@ -466,7 +671,7 @@ namespace PCTunerFan
                     var r = rpms.FirstOrDefault(x => !usedRpm.Contains(x) && x.Name == c.Name)
                          ?? rpms.FirstOrDefault(x => !usedRpm.Contains(x) && x.Index == c.Index);
                     if (r != null) usedRpm.Add(r);
-                    var f = new Fan { Id = c.Identifier.ToString(), Hw = h.Name, Name = c.Name, Rpm = r, Control = c, IsGpu = IsGpu(h) };
+                    var f = new Fan { Id = c.Identifier.ToString(), Hw = h.Name, Name = c.Name, Rpm = r, DefaultRpm = r, Control = c, IsGpu = IsGpu(h) };
                     f.Pump = Safety.IsPumpName(c.Name) || (r != null && Safety.IsPumpName(r.Name));
                     fans[f.Id] = f;
                 }
@@ -493,7 +698,22 @@ namespace PCTunerFan
             }
             public void SetDefault(string id) => Ctl(id)?.SetDefault();
             public bool DriverReset(string id) => fans.TryGetValue(id, out var f) && f.IsGpu;
+            public float? FanRpm(string id) => fans.TryGetValue(id, out var f) ? f.Rpm?.Value : null;
+            public IDictionary<string, float?> AllRpms() => RpmSensors().ToDictionary(s => s.Identifier.ToString(), s => s.Value);
+            public bool Pair(string id, string sensor)
+            {
+                if (!fans.TryGetValue(id, out var f) || f.Control == null) return false;
+                if (sensor == "auto") { f.Rpm = f.DefaultRpm; return true; }
+                if (sensor == "none") { f.Rpm = null; return true; }
+                var s = RpmSensors().FirstOrDefault(x => x.Identifier.ToString() == sensor);
+                if (s == null) return false;
+                f.Rpm = s;
+                return true;
+            }
         }
+
+        /// <summary>Every fan speed sensor, on every piece of hardware.</summary>
+        static IEnumerable<ISensor> RpmSensors() => AllHardware().SelectMany(h => h.Sensors.Where(s => s.SensorType == SensorType.Fan));
 
         static (float? cpu, float? gpu) KeyTemps()
         {
@@ -647,6 +867,44 @@ namespace PCTunerFan
             return b.Append('"').ToString();
         }
 
+        /// <summary>The running or last fan test, for PC Tuner (null when none).</summary>
+        public static string JobJson(FanJob j)
+        {
+            if (j == null) return "null";
+            var b = new StringBuilder();
+            b.Append("{\"seq\":").Append(j.Seq.ToString(CultureInfo.InvariantCulture))
+             .Append(",\"kind\":").Append(Str(j.Kind))
+             .Append(",\"id\":").Append(Str(j.Id))
+             .Append(",\"step\":").Append((j.Done ? j.Steps.Count : j.Step).ToString(CultureInfo.InvariantCulture))
+             .Append(",\"steps\":").Append(j.Steps.Count.ToString(CultureInfo.InvariantCulture))
+             .Append(",\"duty\":").Append(Num(j.Done ? (float?)null : j.Duty))
+             .Append(",\"done\":").Append(j.Done ? "true" : "false")
+             .Append(",\"error\":").Append(Str(j.Error))
+             .Append(",\"paired\":").Append(Str(j.Paired))
+             .Append(",\"start\":").Append(Num(j.StartDuty))
+             .Append(",\"stop\":").Append(Num(j.StopDuty))
+             .Append(",\"max\":").Append(Num(j.MaxRpm))
+             .Append(",\"points\":[").Append(string.Join(",", j.Points.Select(p => "[" + Num(p.duty) + "," + Num(p.rpm) + "]"))).Append("]}");
+            return b.ToString();
+        }
+
+        /// <summary>The processor's name, core voltage, package power, total load and highest core clock, for PC Tuner's
+        /// telemetry band (read-only; null values when a sensor is missing).</summary>
+        static string CpuJson()
+        {
+            var h = AllHardware().FirstOrDefault(x => x.HardwareType == HardwareType.Cpu);
+            if (h == null) return "null";
+            float? One(SensorType t, Func<ISensor, bool> pick) => h.Sensors.Where(s => s.SensorType == t && s.Value.HasValue && pick(s)).Select(s => s.Value).FirstOrDefault();
+            float? volt = One(SensorType.Voltage, s => s.Name.Contains("Core") && !s.Name.Contains("#")) ?? One(SensorType.Voltage, s => s.Name.Contains("Core") || s.Name.Contains("VID"));
+            float? power = One(SensorType.Power, s => s.Name.Contains("Package"));
+            float? load = One(SensorType.Load, s => s.Name == "CPU Total");
+            var clocks = h.Sensors.Where(s => s.SensorType == SensorType.Clock && s.Value.HasValue && !s.Name.Contains("Bus")).Select(s => s.Value.Value).ToList();
+            float? clock = clocks.Count > 0 ? clocks.Max() : (float?)null;
+            return "{\"name\":" + Str(h.Name) + ",\"volt\":" + Num3(volt) + ",\"power\":" + Num(power) + ",\"load\":" + Num(load) + ",\"clock\":" + Num(clock) + "}";
+        }
+
+        static string Num3(float? v) => v.HasValue && !float.IsNaN(v.Value) && !float.IsInfinity(v.Value) ? v.Value.ToString("0.###", CultureInfo.InvariantCulture) : "null";
+
         static string Status(float? cpu, float? gpu)
         {
             var b = new StringBuilder();
@@ -667,6 +925,7 @@ namespace PCTunerFan
                  .Append(",\"hw\":").Append(Str(f.Hw))
                  .Append(",\"name\":").Append(Str(f.Name))
                  .Append(",\"rpm\":").Append(Num(f.Rpm?.Value))
+                 .Append(",\"rpmId\":").Append(Str(f.Rpm?.Identifier.ToString() ?? ""))
                  .Append(",\"percent\":").Append(Num(f.Control?.Value))
                  .Append(",\"controllable\":").Append(fc != null ? "true" : "false")
                  .Append(",\"min\":").Append(fc != null ? Num(fc.MinSoftwareValue) : "null")
@@ -677,7 +936,18 @@ namespace PCTunerFan
                  .Append(",\"curve\":").Append(ctl.HasCurve(f.Id) ? "true" : "false")
                  .Append('}');
             }
-            b.Append("],\"temps\":[");
+            b.Append("],\"cpuInfo\":").Append(CpuJson());
+            b.Append(",\"rpms\":[");
+            first = true;
+            foreach (var h in AllHardware())
+                foreach (var s in h.Sensors.Where(x => x.SensorType == SensorType.Fan))
+                {
+                    if (!first) b.Append(',');
+                    first = false;
+                    b.Append("{\"id\":").Append(Str(s.Identifier.ToString())).Append(",\"hw\":").Append(Str(h.Name)).Append(",\"name\":").Append(Str(s.Name)).Append(",\"rpm\":").Append(Num(s.Value)).Append('}');
+                }
+            b.Append("],\"job\":").Append(JobJson(ctl.Job));
+            b.Append(",\"temps\":[");
             first = true;
             foreach (var h in AllHardware())
             {
@@ -739,8 +1009,9 @@ namespace PCTunerFan
         {
             int fails = 0;
             void Check(bool ok, string what) { Console.Out.WriteLine((ok ? "ok    " : "FAIL  ") + what); if (!ok) fails++; }
-            Check(Safety.Clamp(5, false) == 20, "fan floor 20 %");
-            Check(Safety.Clamp(5, true) == 50, "pump floor 50 %");
+            Check(Safety.Clamp(5, false) == 5, "fan: low speed allowed");
+            Check(Safety.Clamp(5, true) == 5, "pump: low speed allowed");
+            Check(Safety.Clamp(0, false) == 0 && Safety.Clamp(-10, true) == 0, "never below 0 %");
             Check(Safety.Clamp(150, false) == 100, "max 100 %");
             Check(Safety.Clamp(float.NaN, false) == 100, "NaN -> 100 %");
             Check(Safety.Clamp(65, false) == 65, "normal value kept");
@@ -767,6 +1038,9 @@ namespace PCTunerFan
             Check(Safety.Hysteresis(65, 63) == 65, "hysteresis ignores a 2 C drop");
             Check(Safety.Hysteresis(65, 62) == 62, "hysteresis follows a 3 C drop");
             ControllerTests(Check);
+            JobTests(Check);
+            RamLed.SelfTest(Check);
+            GpuLed.SelfTest(Check);
             Console.Out.WriteLine(fails == 0 ? "selftest passed" : $"selftest FAILED ({fails})");
             return fails == 0 ? 0 : 1;
         }
@@ -785,6 +1059,28 @@ namespace PCTunerFan
             public bool Controllable(string id) => Ctl.Contains(id);
             public bool NamedPump(string id) => Pumps.Contains(id);
             public bool DriverReset(string id) => Gpu.Contains(id);
+
+            // speed sensors: "s_fan" follows "fan" (stops below 20 %, starts again at 30 %), "s_case" stays at 900
+            public readonly Dictionary<string, string> Paired = new Dictionary<string, string>();
+            bool spinning = true;
+            float? SFan()
+            {
+                if (!Duty.TryGetValue("fan", out var d)) return 800; // on the BIOS
+                if (spinning && d < 20) spinning = false;
+                if (!spinning && d >= 30) spinning = true;
+                return spinning ? 400 + 10 * d : 0;
+            }
+            public IDictionary<string, float?> AllRpms() => new Dictionary<string, float?> { ["s_fan"] = SFan(), ["s_case"] = 900 };
+            public float? FanRpm(string id) => Paired.TryGetValue(id, out var s) && AllRpms().TryGetValue(s, out var v) ? v : null;
+            public bool Pair(string id, string sensor)
+            {
+                if (!Ctl.Contains(id)) return false;
+                if (sensor == "none" || sensor == "auto") { Paired.Remove(id); return true; }
+                if (!AllRpms().ContainsKey(sensor)) return false;
+                Paired[id] = sensor;
+                return true;
+            }
+
             public void SetSoftware(string id, float duty)
             {
                 if (!saved.ContainsKey(id)) saved[id] = Duty.TryGetValue(id, out var was) ? was : (float?)null;
@@ -805,7 +1101,94 @@ namespace PCTunerFan
             }
         }
 
+        /// <summary>Trigger curves: idle speed, latch on at the load temperature, off at the idle temperature.</summary>
+        static void TriggerTests(Action<bool, string> Check, DateTime t0)
+        {
+            DateTime At(double s) => t0.AddSeconds(s);
+            Check(Controller.TriggerLoaded(false, 64.9f, 55, 65) == false, "trigger: below the load temperature stays idle");
+            Check(Controller.TriggerLoaded(false, 65f, 55, 65) == true, "trigger: on at the load temperature");
+            Check(Controller.TriggerLoaded(true, 56f, 55, 65) == true, "trigger: stays on between the two temperatures");
+            Check(Controller.TriggerLoaded(true, 55f, 55, 65) == false, "trigger: off at the idle temperature");
+
+            var io = new FakeIO();
+            io.Ctl.Add("case");
+            var c = new Controller(io, t0);
+            c.Handle("trigger case hottest 55 65 30 70", At(0));
+            c.Tick(At(1), 50, 45);
+            Check(io.Duty["case"] == 30 && c.HasCurve("case"), "trigger: idle speed at the desktop");
+            c.Tick(At(2), 50, 66);
+            Check(io.Duty["case"] == 70, "trigger: gaming speed once the hotter chip reaches 65 C");
+            c.Tick(At(3), 58, 60);
+            Check(io.Duty["case"] == 70, "trigger: no dip while the temperature wobbles between 55 and 65 C");
+            c.Handle("trigger case hottest 55 65 30 75", At(3));
+            c.Tick(At(4), 58, 60);
+            Check(io.Duty["case"] == 75, "trigger: an edited trigger keeps its gaming state");
+            c.Tick(At(5), 50, 54);
+            Check(io.Duty["case"] == 30, "trigger: back to idle at 55 C");
+            c.Tick(At(6), 91, 50);
+            Check(io.Duty["case"] == 100, "trigger: the 90 C override still wins");
+            int seq = c.MessageSeq;
+            c.Handle("trigger case cpu 65 55 30 70", At(7));
+            Check(c.MessageSeq == seq + 1 && c.Message.StartsWith("bad trigger"), "trigger: load below idle is refused");
+            c.Handle("trigger case cpu 55 65 x 70", At(7));
+            Check(c.Message.StartsWith("bad trigger"), "trigger: a bad number is refused");
+            c.Handle("curve case cpu 30:20,80:100", At(8));
+            c.Tick(At(9), 30, 30);
+            Check(io.Duty["case"] == 20, "trigger: a curve command turns the fan back into a graph curve");
+        }
+
         /// <summary>The safety loop with fake fans and a fake clock: floors, 90 C override, blind rule, watchdog, reset.</summary>
+        /// <summary>Pairing detect and calibration, on the fake fan and its speed sensor.</summary>
+        static void JobTests(Action<bool, string> Check)
+        {
+            var t0 = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            int s = 0;
+            DateTime Next() => t0.AddSeconds(++s);
+            var io = new FakeIO();
+            io.Ctl.UnionWith(new[] { "fan", "pump" });
+            io.Pumps.Add("pump");
+            var c = new Controller(io, t0);
+
+            // pairing: 30 % then 100 %; "s_fan" rises, "s_case" does not
+            c.Handle("pairdetect fan", t0);
+            Check(c.JobRunning && c.Job.Kind == "pair", "fan test: pairing started");
+            for (int i = 0; i < 20 && c.JobRunning; i++) { c.Handle("ping", Next()); c.Tick(Next(), 50, 50); }
+            Check(!c.JobRunning && c.Job.Paired == "s_fan" && c.Job.Error == "" && io.Paired["fan"] == "s_fan", "fan test: the sensor that follows the control is paired");
+            Check(!io.Duty.ContainsKey("fan") && io.Defaulted.Contains("fan"), "fan test: a fan PC Tuner was not driving goes back to the BIOS afterwards");
+            Check(Controller.PairWinner(new Dictionary<string, float?> { ["a"] = 900 }, new Dictionary<string, float?> { ["a"] = 950 }) == null, "fan test: a small rise is not a pairing");
+
+            // calibration: down from 100 %, stops below 20 %, starts again at 30 %
+            c.Handle("set fan 40", Next());
+            c.Handle("calibrate fan", Next());
+            var seen = new List<float>();
+            for (int i = 0; i < 120 && c.JobRunning; i++)
+            {
+                c.Handle("ping", Next());
+                c.Tick(Next(), 50, 50);
+                if (io.Duty.TryGetValue("fan", out var d)) seen.Add(d);
+            }
+            var j = c.Job;
+            Check(j.Done && j.Error == "" && j.StopDuty == 20 && j.StartDuty == 30, "fan test: calibration finds stop (20 %) and start (30 %) duty");
+            Check(j.MaxRpm == 1400 && j.Points.First().duty == 100 && j.Points.First().rpm == 1400 && j.Points.Last().duty == 0 && j.Points.Last().rpm == 0, "fan test: RPM per step recorded, 100 % down to 0 %");
+            Check(seen.Contains(0) && io.Duty["fan"] == 40, "fan test: the sweep drives the fan, then it is back on its 40 %");
+            Check(Program.JobJson(j).Contains("\"start\":30") && Program.JobJson(j).Contains("[100,1400]"), "fan test: JSON for PC Tuner");
+
+            // safety: pumps refused, a hot PC stops the test, cancel works
+            c.Handle("calibrate pump", Next());
+            Check(!c.JobRunning && c.Message.Contains("Pumps are never"), "fan test: a pump is never calibrated");
+            c.Handle("calibrate fan", Next());
+            c.Tick(Next(), 95, 50);
+            Check(!c.JobRunning && c.Job.Error.Contains("90") && io.Duty["fan"] == 100, "fan test: 90 °C stops the test (fans to 100 %)");
+            c.Tick(Next(), 50, 50);
+            c.Handle("pairdetect fan", Next());
+            c.Handle("jobcancel", Next());
+            Check(!c.JobRunning && c.Job.Error == "Cancelled.", "fan test: cancel");
+            c.Handle("pair fan s_case", Next());
+            Check(io.Paired["fan"] == "s_case", "fan test: manual pairing");
+            c.Handle("pair fan nosuch", Next());
+            Check(c.Message.StartsWith("unknown fan or speed sensor"), "fan test: unknown sensor refused");
+        }
+
         static void ControllerTests(Action<bool, string> Check)
         {
             var t0 = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -820,14 +1203,14 @@ namespace PCTunerFan
             c.Handle("set pump 5", At(0));
             c.Handle("set nope 50", At(0));
             Check(c.Tick(At(1), 50, 50) == null, "controller: a normal tick keeps running");
-            Check(D(io, "fan") == 20, "controller: requested 5 % -> 20 % on a fan");
-            Check(D(io, "pump") == 50, "controller: requested 5 % -> 50 % on a pump");
+            Check(D(io, "fan") == 5, "controller: requested 5 % -> 5 % on a fan");
+            Check(D(io, "pump") == 5, "controller: requested 5 % -> 5 % on a pump");
             Check(c.Message == "not controllable: nope" && c.MessageSeq == 1, "controller: an unknown fan is refused with a notice");
             Check(c.Tick(At(2), 50, 50) == null && c.MessageSeq == 1 && c.Message != "", "controller: the notice stays (not cleared every tick)");
             c.Handle("pump fan 1", At(2));
             c.Handle("pump pump 0", At(2));
             c.Tick(At(3), 50, 50);
-            Check(D(io, "fan") == 50 && D(io, "pump") == 20, "controller: pump ticks move the floor both ways");
+            Check(D(io, "fan") == 5 && D(io, "pump") == 5, "controller: marking a fan as a pump does not raise its speed");
             c.Handle("pump fan 0", At(3));
             c.Handle("pump pump 1", At(3));
             c.Handle("set fan 40", At(3));
@@ -841,6 +1224,7 @@ namespace PCTunerFan
             c.Handle("curve other cpu 28:82,28:54", At(6));
             c.Tick(At(7), 20, 50);
             Check(D(io, "other") == 82 && c.HasCurve("other"), "controller: a curve drives its fan");
+            TriggerTests(Check, t0);
 
             // blind: no temperature for more than 5 s -> BIOS, settings kept, back when temperatures return
             c.Handle("ping", At(8));

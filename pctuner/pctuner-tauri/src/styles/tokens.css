@@ -1,0 +1,175 @@
+/* PC Tuner design tokens. Every colour, radius, shadow, spacing and motion value lives here.
+   Components only use these variables; the theme is picked by data-theme on <html> (src/lib/theme.ts). */
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* accent: the only brand colour */
+  --accent: #0a84ff;
+  --accent-hover: #2b95ff;
+  --accent-pressed: #0070e0;
+  --accent-soft: rgba(10, 132, 255, 0.16);
+  --accent-softer: rgba(10, 132, 255, 0.1);
+  --on-accent: #ffffff;
+
+  /* backgrounds, from the window to raised controls */
+  --bg-window: #000000;
+  --bg-elevated: #1c1c1e;
+  --bg-elevated-2: #2c2c2e;
+  --bg-elevated-3: #3a3a3c;
+  --bg-sidebar: rgba(28, 28, 30, 0.72);
+  --bg-sidebar-solid: #161617;
+  --bg-overlay: rgba(0, 0, 0, 0.48);
+  --bg-sheet: rgba(36, 36, 38, 0.86);
+  --fill-hover: rgba(255, 255, 255, 0.06);
+  --fill-pressed: rgba(255, 255, 255, 0.1);
+  --fill-control: rgba(120, 120, 128, 0.24);
+  --fill-control-strong: rgba(120, 120, 128, 0.36);
+
+  /* lines */
+  --separator: #38383a;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --hairline-strong: rgba(255, 255, 255, 0.14);
+
+  /* text */
+  --text: #ffffff;
+  --text-secondary: rgba(235, 235, 245, 0.6);
+  --text-tertiary: rgba(235, 235, 245, 0.3);
+
+  /* status: used sparingly, for state only */
+  --green: #30d158;
+  --orange: #ff9f0a;
+  --yellow: #ffd60a;
+  --red: #ff453a;
+  --green-soft: rgba(48, 209, 88, 0.16);
+  --orange-soft: rgba(255, 159, 10, 0.16);
+  --yellow-soft: rgba(255, 214, 10, 0.14);
+  --red-soft: rgba(255, 69, 58, 0.16);
+  --neutral-soft: rgba(120, 120, 128, 0.24);
+
+  /* shadows */
+  --shadow-control: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-knob: 0 2px 4px rgba(0, 0, 0, 0.28), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
+  --shadow-popover: 0 12px 32px rgba(0, 0, 0, 0.45), 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  --shadow-sheet: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 0.5px rgba(255, 255, 255, 0.1);
+
+  /* small surfaces */
+  --thumb: #3a3a3c; /*the selected segment of a segmented control */
+  --scroll-thumb: rgba(255, 255, 255, 0.16);
+  --scroll-thumb-hover: rgba(255, 255, 255, 0.28);
+  --well: rgba(0, 0, 0, 0.22); /* sunken boxes such as the output log */
+  --graph-bg: rgba(255, 255, 255, 0.04);
+  --graph-grid: rgba(255, 255, 255, 0.07);
+}
+
+/* Light: the same roles, on white. Status colours are a step darker so they read as text on white. */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --accent: #007aff;
+  --accent-hover: #1a88ff;
+  --accent-pressed: #0062cc;
+  --accent-soft: rgba(0, 122, 255, 0.14);
+  --accent-softer: rgba(0, 122, 255, 0.08);
+  --on-accent: #ffffff;
+
+  --bg-window: #f2f2f7;
+  --bg-elevated: #ffffff;
+  --bg-elevated-2: #f2f2f7;
+  --bg-elevated-3: #e5e5ea;
+  --bg-sidebar: rgba(246, 246, 248, 0.82);
+  --bg-sidebar-solid: #ececf0;
+  --bg-overlay: rgba(0, 0, 0, 0.24);
+  --bg-sheet: rgba(255, 255, 255, 0.94);
+  --fill-hover: rgba(0, 0, 0, 0.045);
+  --fill-pressed: rgba(0, 0, 0, 0.08);
+  --fill-control: rgba(120, 120, 128, 0.16);
+  --fill-control-strong: rgba(120, 120, 128, 0.26);
+
+  --separator: #c6c6c8;
+  --hairline: rgba(0, 0, 0, 0.08);
+  --hairline-strong: rgba(0, 0, 0, 0.14);
+
+  --text: #000000;
+  --text-secondary: rgba(60, 60, 67, 0.68);
+  --text-tertiary: rgba(60, 60, 67, 0.48);
+
+  --green: #1f9d45;
+  --orange: #e07800;
+  --yellow: #b88a00;
+  --red: #e0352b;
+  --green-soft: rgba(52, 199, 89, 0.16);
+  --orange-soft: rgba(255, 149, 0, 0.16);
+  --yellow-soft: rgba(255, 204, 0, 0.2);
+  --red-soft: rgba(255, 59, 48, 0.13);
+  --neutral-soft: rgba(120, 120, 128, 0.14);
+
+  --shadow-control: 0 1px 2px rgba(0, 0, 0, 0.1);
+  --shadow-knob: 0 2px 4px rgba(0, 0, 0, 0.16), 0 0 0 0.5px rgba(0, 0, 0, 0.1);
+  --shadow-popover: 0 12px 32px rgba(0, 0, 0, 0.14), 0 0 0 0.5px rgba(0, 0, 0, 0.1);
+  --shadow-sheet: 0 24px 64px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.1);
+
+  --thumb: #ffffff;
+  --scroll-thumb: rgba(0, 0, 0, 0.2);
+  --scroll-thumb-hover: rgba(0, 0, 0, 0.34);
+  --well: rgba(0, 0, 0, 0.035);
+  --graph-bg: rgba(0, 0, 0, 0.025);
+  --graph-grid: rgba(0, 0, 0, 0.08);
+}
+
+:root {
+  /* type */
+  --font: "Inter Variable", "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 22px;
+  --text-2xl: 28px;
+  --text-hero: 44px;
+
+  /* spacing (4 px grid) */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s8: 32px;
+  --s10: 40px;
+
+  /* radii */
+  --r-xs: 5px;
+  --r-sm: 7px;
+  --r-md: 10px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-pill: 999px;
+
+  /* layout */
+  --sidebar-width: 232px;
+  --content-max: 1040px;
+  --row-min: 44px;
+  --control-h: 28px;
+  --control-h-lg: 34px;
+
+  /* motion: spring-like curves, short durations */
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --t-fast: 120ms;
+  --t-base: 220ms;
+  --t-slow: 380ms;
+  --blur-overlay: 24px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t-fast: 0ms;
+    --t-base: 0ms;
+    --t-slow: 0ms;
+  }
+}
