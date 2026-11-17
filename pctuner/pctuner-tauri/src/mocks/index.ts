@@ -5,6 +5,7 @@ import { mockAdmin, mockParams } from "./env";
 import { fan } from "./fan";
 import { gpolicy } from "./gpolicy";
 import { gpu } from "./gpu";
+import { health } from "./health";
 import { network } from "./network";
 import { perf } from "./perf";
 import { power } from "./power";
@@ -24,6 +25,7 @@ export const tabs: Record<string, MockTab> = {
   fan: fan as MockTab,
   gpolicy: gpolicy as MockTab,
   gpu: gpu as MockTab,
+  health: health as MockTab,
   network: network as MockTab,
   perf: perf as MockTab,
   power: power as MockTab,

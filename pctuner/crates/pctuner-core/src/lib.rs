@@ -8,6 +8,7 @@ pub mod explain;
 pub mod fan;
 pub mod gpolicy;
 pub mod gpu;
+pub mod health;
 pub mod network;
 pub mod nvapi;
 pub mod nvml;

@@ -265,6 +265,7 @@ pub fn ps_stream_readonly(script: &str) -> Stream {
         "powershell.exe",
         vec!["-NoProfile".into(), "-NonInteractive".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-EncodedCommand".into(), encode(script)],
         false,
+        false,
     )
 }
 
@@ -349,6 +350,51 @@ fn for_each_line<R: Read>(r: R, codepage: u32, mut f: impl FnMut(String)) {
             }
         }
     }
+}
+
+/// One piece of a progress stream as text. Tools such as sfc.exe write UTF-16 LE when piped: after
+/// splitting at '\r' / '\n' a piece starts with the NUL half of the line end and has a NUL after
+/// every letter. Those are decoded as UTF-16; anything else as `decode_bytes`.
+fn decode_piece(b: &[u8], codepage: u32) -> String {
+    let b = b.strip_prefix(&[0u8]).unwrap_or(b);
+    let pairs = b.len() / 2;
+    let nul_odd = b.iter().skip(1).step_by(2).filter(|x| **x == 0).count();
+    if pairs >= 2 && nul_odd * 10 >= pairs * 9 {
+        let u: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        return clean_line(&String::from_utf16_lossy(&u));
+    }
+    clean_line(&decode_bytes(b, codepage))
+}
+
+/// Like `for_each_line`, but a line also ends at a lone '\r': DISM, SFC and CHKDSK redraw their
+/// percentage with '\r', which `for_each_line` would only deliver when the tool ends (so the
+/// progress looked frozen). Empty pieces are skipped.
+fn for_each_piece<R: Read>(r: R, codepage: u32, mut f: impl FnMut(String)) {
+    let mut r = BufReader::new(r);
+    let mut piece: Vec<u8> = Vec::new();
+    let mut emit = |piece: &mut Vec<u8>| {
+        let s = decode_piece(piece, codepage);
+        if !s.trim().is_empty() {
+            f(s);
+        }
+        piece.clear();
+    };
+    let mut chunk = [0u8; 4096];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                for &c in &chunk[..n] {
+                    if c == b'\r' || c == b'\n' {
+                        emit(&mut piece);
+                    } else {
+                        piece.push(c);
+                    }
+                }
+            }
+        }
+    }
+    emit(&mut piece);
 }
 
 /// Turns PowerShell's CLIXML error stream ("#< CLIXML" followed by one XML line) back into
@@ -555,6 +601,8 @@ pub struct Stream {
     rx: mpsc::Receiver<StreamMsg>,
     pub lines: Vec<String>,
     pub exit: Option<i32>,
+    /// The program's process id once it started (0 before / when it could not start).
+    pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Stream {
@@ -573,20 +621,40 @@ impl Stream {
         let (tx, rx) = mpsc::channel();
         let _ = tx.send(StreamMsg::Line(why));
         let _ = tx.send(StreamMsg::Exit(-1));
-        Stream { rx, lines: vec![], exit: None }
+        Stream { rx, lines: vec![], exit: None, pid: Default::default() }
     }
 
     /// Run a program, streaming its output. A PowerShell process counts as a running change
     /// (`scripts_running`); other programs (ping.exe, ...) do not.
     pub fn run(exe: &str, args: Vec<String>) -> Self {
         let counted = exe.to_ascii_lowercase().contains("powershell");
-        Self::spawn(exe, args, counted)
+        Self::spawn(exe, args, counted, false)
     }
 
-    fn spawn(exe: &str, args: Vec<String>, counted: bool) -> Self {
+    /// Run a tool that redraws a percentage with '\r' (DISM, SFC, CHKDSK): every redraw arrives as
+    /// its own line, so the progress is live. Counts as a running change (closing waits for it).
+    pub fn run_progress(exe: &str, args: Vec<String>) -> Self {
+        Self::spawn(exe, args, true, true)
+    }
+
+    /// The program's process id (None until it started).
+    pub fn pid(&self) -> Option<u32> {
+        Some(self.pid.load(Ordering::SeqCst)).filter(|p| *p != 0)
+    }
+
+    /// End the program and everything it started (taskkill /T /F).
+    pub fn kill(&self) -> Result<(), String> {
+        let pid = self.pid().ok_or("the program has not started")?;
+        let (code, out) = run("taskkill.exe", &["/PID", &pid.to_string(), "/T", "/F"])?;
+        if code == 0 { Ok(()) } else { Err(out.trim().to_string()) }
+    }
+
+    fn spawn(exe: &str, args: Vec<String>, counted: bool, pieces: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let exe = exe.to_string();
         let guard = if counted { Some(RunningScript::start()) } else { None };
+        let pid: std::sync::Arc<std::sync::atomic::AtomicU32> = Default::default();
+        let pid2 = pid.clone();
         thread::spawn(move || {
             let _guard = guard;
             let child = Command::new(&exe)
@@ -604,29 +672,32 @@ impl Stream {
                     return;
                 }
             };
+            pid2.store(child.id(), Ordering::SeqCst);
             let cp = oem_cp();
             let err = child.stderr.take();
             let tx2 = tx.clone();
             let errt = thread::spawn(move || {
                 if let Some(e) = err {
                     let mut cx = ClixmlLines::default();
-                    for_each_line(e, cp, |l| {
+                    let mut send = |l: String| {
                         for d in cx.feed(l) {
                             let _ = tx2.send(StreamMsg::Line(d));
                         }
-                    });
+                    };
+                    if pieces { for_each_piece(e, cp, &mut send) } else { for_each_line(e, cp, &mut send) }
                 }
             });
             if let Some(o) = child.stdout.take() {
-                for_each_line(o, cp, |l| {
+                let send = |l: String| {
                     let _ = tx.send(StreamMsg::Line(l));
-                });
+                };
+                if pieces { for_each_piece(o, cp, send) } else { for_each_line(o, cp, send) }
             }
             let _ = errt.join();
             let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
             let _ = tx.send(StreamMsg::Exit(code));
         });
-        Stream { rx, lines: vec![], exit: None }
+        Stream { rx, lines: vec![], exit: None, pid }
     }
 
     /// Pull new output; returns true while still running.
@@ -773,6 +844,22 @@ pub static GPU_RESET_REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_progress_pieces_split_at_carriage_returns() {
+        // DISM: the bar is redrawn with '\r'; every redraw must arrive at once, not when DISM ends
+        let mut got = vec![];
+        for_each_piece(&b"Deployment Image Servicing\r\n[==        10.0%         ]\r[=====    62.3%    ]\r\nThe operation completed successfully.\r\n"[..], 437, |l| got.push(l));
+        assert_eq!(got, vec!["Deployment Image Servicing", "[==        10.0%         ]", "[=====    62.3%    ]", "The operation completed successfully."]);
+        // SFC writes UTF-16 LE when piped
+        let utf16 = |s: &str| s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>();
+        let mut bytes = utf16("Beginning verification phase.\r\n");
+        bytes.extend(utf16("Verification 45% complete.\rVerification 46% complete.\r"));
+        let mut got = vec![];
+        for_each_piece(&bytes[..], 437, |l| got.push(l));
+        assert_eq!(got, vec!["Beginning verification phase.", "Verification 45% complete.", "Verification 46% complete."]);
+        assert_eq!(decode_piece("Ünicode".encode_utf16().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>().as_slice(), 437), "Ünicode");
+    }
 
     fn temp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("pctuner-test-{}-{name}", std::process::id()));
