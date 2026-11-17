@@ -51,6 +51,8 @@ export interface HistoryView {
 }
 
 export interface BackupsView {
+  /** the built-in "Windows default" row: startup types of a clean Windows 11 install */
+  windowsDefault: { detail: string; matches: boolean; diff: string; canRestore: boolean };
   msg: { text: string; ok: boolean } | null;
   canCreate: boolean;
   creating: boolean;
@@ -89,7 +91,7 @@ export type Action =
   | { kind: "running_only" | "hide_locked" | "stop_on_disable"; on: boolean }
   | { kind: "sort"; col: SortCol }
   | { kind: "change"; ty: "Disabled" | "Manual" | "Automatic" }
-  | { kind: "clear" | "undo_last" | "refresh" | "history" | "history_close" | "hist_undo" | "hist_clear" | "backups" | "backups_close" | "backup_create" | "backup_folder" }
+  | { kind: "clear" | "undo_last" | "refresh" | "history" | "history_close" | "hist_undo" | "hist_clear" | "backups" | "backups_close" | "backup_create" | "backup_folder" | "backup_restore_default" }
   | { kind: "hist_toggle"; index: number }
   | { kind: "backup_restore" | "backup_delete"; index: number }
   | { kind: "op" | "backup_op"; ev: OpEvent };
@@ -279,6 +281,27 @@ function BackupsSheet({ b, admin, act }: { b: BackupsView; admin: boolean; act: 
         </Button>
       </div>
       {!admin && <div className="tone-error">Run PC Tuner as administrator to create or restore backups.</div>}
+      <div className="svc-sheet-scroll">
+        <Row
+          title="Windows default"
+          subtitle={
+            <>
+              {b.windowsDefault.detail}
+              <div className={b.windowsDefault.matches ? "tone-ok" : "tone-junk"}>{b.windowsDefault.diff}</div>
+            </>
+          }
+          accessory={
+            <Button
+              variant="default"
+              disabled={!b.windowsDefault.canRestore}
+              title="Puts every Windows service back to its startup type on a fresh install (a preview comes first). Wi-Fi and mobile-broadband services are left alone: their default depends on your hardware."
+              onClick={() => act({ kind: "backup_restore_default" })}
+            >
+              Restore defaults
+            </Button>
+          }
+        />
+      </div>
       {b.list.length === 0 ? (
         <p className="secondary">No backups yet. PC Tuner also makes one by itself before the first service change.</p>
       ) : (

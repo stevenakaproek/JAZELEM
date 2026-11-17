@@ -4,7 +4,7 @@ use crate::backend::{json, op_event, parse, Backend};
 use pctuner_core::common;
 use pctuner_core::opwin::{OpEvent, Stage};
 use pctuner_core::services::{Services, SortCol, NOTE_GAMING, NOTE_LOCKED};
-use pctuner_core::svcbackup::{backup_dir, differences, Backups};
+use pctuner_core::svcbackup::{backup_dir, differences, windows_default, Backups};
 use serde_json::{json, Value};
 
 pub struct ServicesTab {
@@ -56,6 +56,7 @@ enum Action {
     BackupFolder,
     BackupRestore { index: usize },
     BackupDelete { index: usize },
+    BackupRestoreDefault,
     BackupOp { ev: OpEvent },
 }
 
@@ -174,7 +175,17 @@ impl ServicesTab {
                 })
             })
             .collect();
+        // the built-in "Windows default" row (clean-install startup types)
+        let def = windows_default();
+        let def_diffs = differences(&def.services, &b.current).len();
+        let windows_default = json!({
+            "detail": format!("Startup types of a clean Windows 11 install ({} Windows services; drivers, apps and games are left alone)", def.services.len()),
+            "matches": def_diffs == 0,
+            "diff": if def_diffs == 0 { "matches the PC now".to_string() } else { format!("{def_diffs} differ from now") },
+            "canRestore": admin && b.run.is_none(),
+        });
         json!({
+            "windowsDefault": windows_default,
             "msg": b.msg.as_ref().map(|(text, ok)| json!({ "text": text, "ok": ok })),
             "canCreate": admin && b.job.is_none(),
             "creating": b.job.is_some(),
@@ -383,6 +394,15 @@ impl Backend for ServicesTab {
                             let diffs = differences(&bk.services, &b.current);
                             b.open_restore(&bk, &diffs);
                         }
+                    }
+                }
+            }
+            Action::BackupRestoreDefault => {
+                if let Some(b) = &mut self.backups {
+                    if common::is_admin() && b.run.is_none() && b.op.is_none() {
+                        let def = windows_default();
+                        let diffs = differences(&def.services, &b.current);
+                        b.open_restore(&def, &diffs);
                     }
                 }
             }

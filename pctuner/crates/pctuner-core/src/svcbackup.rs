@@ -158,6 +158,39 @@ pub fn list() -> Vec<(PathBuf, Backup)> {
     v
 }
 
+/// The startup types of a clean Windows 11 install (see the header of the file).
+pub const DEFAULTS_TSV: &str = include_str!("../assets/services-default-win11.tsv");
+/// `Backup::time` of the built-in Windows default "backup".
+pub const DEFAULT_TIME: &str = "Windows default";
+
+/// "Automatic (Delayed Start, Trigger Start)" -> (2, Some(1)).
+pub fn parse_type(t: &str) -> Option<(u32, Option<u32>)> {
+    let t = t.trim().to_lowercase();
+    if t.starts_with("automatic") {
+        Some((2, t.contains("delayed").then_some(1)))
+    } else if t.starts_with("manual") {
+        Some((3, None))
+    } else if t.starts_with("disabled") {
+        Some((4, None))
+    } else {
+        None
+    }
+}
+
+/// The built-in table as a backup (only the services Windows ships; none of them are removed or added).
+pub fn windows_default() -> Backup {
+    let services = DEFAULTS_TSV
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let (name, t) = l.split_once('\t')?;
+            let (start, delayed) = parse_type(t)?;
+            Some(Svc { name: name.trim().to_string(), display: String::new(), start, delayed })
+        })
+        .collect();
+    Backup { time: DEFAULT_TIME.into(), note: "clean Windows 11 install".into(), services }
+}
+
 /// Delete a saved backup: its JSON, its RESTORE .cmd and its .reg export go to the Recycle Bin.
 pub fn delete(json: &std::path::Path) -> Result<(), String> {
     let stamp = json.file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix("services-")).ok_or("not a services backup")?;
@@ -246,6 +279,8 @@ pub struct Backups {
     pub msg: Option<(String, bool)>,
     /// the service list now (read when the window opens and after each backup / restore)
     pub current: Vec<Svc>,
+    /// The open restore window puts back the Windows defaults (a backup of the PC now is saved first).
+    pub to_default: bool,
 }
 
 impl Default for Backups {
@@ -264,7 +299,7 @@ impl Backups {
                 }
             }
         }
-        Backups { backups: list(), job: None, op: None, pending: None, run: None, msg: None, current: read_current().unwrap_or_default() }
+        Backups { backups: list(), job: None, op: None, pending: None, run: None, msg: None, current: read_current().unwrap_or_default(), to_default: false }
     }
 
     pub fn busy(&self) -> bool {
@@ -340,6 +375,23 @@ impl Backups {
         match ev {
             OpEvent::Go => {
                 if let Some(diffs) = self.pending.take() {
+                    if self.to_default {
+                        // the way back: the startup types as they are now
+                        match create("automatic, before restoring the Windows defaults") {
+                            Ok(p) => {
+                                if let Some(op) = &mut self.op {
+                                    op.notes.push(format!("The startup types from before were saved as {} - restore that backup to go back.", p.file_name().and_then(|f| f.to_str()).unwrap_or("a backup")));
+                                }
+                                self.backups = list();
+                            }
+                            Err(e) => {
+                                // never change services without the way back
+                                self.msg = Some((format!("Nothing was changed: the backup of the current startup types could not be saved ({e})."), false));
+                                self.op = None;
+                                return;
+                            }
+                        }
+                    }
                     match common::secure_dir() {
                         Ok(d) => {
                             let script = restore_script(&diffs, &d.display().to_string());
@@ -374,10 +426,21 @@ impl Backups {
 
     /// "Restore this backup": open the preview for the services that differ from it.
     pub fn open_restore(&mut self, b: &Backup, diffs: &[(Svc, Svc)]) {
-        let items = diffs.iter().map(|(bk, cur)| OpItem::new(bk.name.clone(), if bk.display.is_empty() { bk.name.clone() } else { format!("{} ({})", bk.display, bk.name) }, "Startup type").detail(format!("{} -> {}", type_name(cur.start, cur.delayed), type_name(bk.start, bk.delayed)))).collect();
-        let mut w = OpWindow::new("RESTORE SERVICES BACKUP", "restore", "restored", items).noun("service", "services");
+        let default = b.time == DEFAULT_TIME;
+        self.to_default = default;
+        // the defaults table has no display names: show the one this PC has
+        let display = |bk: &Svc| if bk.display.is_empty() { self.current.iter().find(|c| c.name.eq_ignore_ascii_case(&bk.name)).map(|c| c.display.clone()).unwrap_or_default() } else { bk.display.clone() };
+        let items = diffs.iter().map(|(bk, cur)| { let d = display(bk); OpItem::new(bk.name.clone(), if d.is_empty() { bk.name.clone() } else { format!("{d} ({})", bk.name) }, "Startup type").detail(format!("{} -> {}", type_name(cur.start, cur.delayed), type_name(bk.start, bk.delayed))) }).collect();
+        let mut w = OpWindow::new(if default { "RESTORE WINDOWS DEFAULTS" } else { "RESTORE SERVICES BACKUP" }, "restore", "restored", items).noun("service", "services");
         w.show_steps = true;
-        w.preview_text = format!("Back to the backup from {}.", b.time);
+        w.preview_text = if default {
+            "Back to the startup types of a clean Windows 11 install. Services Windows does not include (drivers, apps, games) are left as they are. A backup of the startup types now is saved first, so you can go back.".into()
+        } else {
+            format!("Back to the backup from {}.", b.time)
+        };
+        if default {
+            w.warning = Some("This also undoes every service change you made on purpose (PC Tuner's and other tools').".into());
+        }
         w.go_label = "Restore".into();
         w.running_text = "Restoring services...".into();
         w.reassure = "Only startup types change. Protected services are restored as SYSTEM; a restart finishes it.".into();
@@ -395,6 +458,24 @@ mod tests {
 
     fn s(n: &str, start: u32, delayed: Option<u32>) -> Svc {
         Svc { name: n.into(), display: String::new(), start, delayed }
+    }
+
+    #[test]
+    fn svcbackup_windows_default_table() {
+        let d = windows_default();
+        assert_eq!(d.services.len(), 264);
+        assert!(!d.services.iter().any(|s| s.name == "WlanSvc" || s.name == "WwanSvc"), "hardware-dependent defaults are left out");
+        let get = |n: &str| d.services.iter().find(|s| s.name == n).unwrap_or_else(|| panic!("{n} missing"));
+        assert_eq!((get("BITS").start, get("BITS").delayed), (2, Some(1)), "Automatic (Delayed Start)");
+        assert_eq!((get("Spooler").start, get("Spooler").delayed), (2, None));
+        assert_eq!(get("RemoteRegistry").start, 4);
+        assert_eq!(get("wuauserv").start, 3, "Manual (Trigger Start)");
+        assert_eq!(get("CDPUserSvc").start, 2, "per-user services are listed by their template");
+        let names: std::collections::HashSet<String> = d.services.iter().map(|s| s.name.to_lowercase()).collect();
+        assert_eq!(names.len(), d.services.len(), "no service twice");
+        assert!(d.services.iter().all(|s| !s.name.contains(' ') && !s.name.contains('_')), "service names, not display names or per-user instances");
+        assert_eq!(parse_type("Automatic (Delayed Start, Trigger Start)"), Some((2, Some(1))));
+        assert_eq!(parse_type("Boot"), None);
     }
 
     #[test]

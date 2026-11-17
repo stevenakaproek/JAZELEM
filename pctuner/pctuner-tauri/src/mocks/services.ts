@@ -86,6 +86,13 @@ let lastAction = "";
 let showHistory = mockParams.get("sheet") === "history";
 let backupsOpen = mockParams.get("sheet") === "backups";
 let backupMsg: BackupsView["msg"] = null;
+/** services that differ from a clean Windows install (the stand-in's "Windows default" row) */
+let defaultDiffs = [
+  ["BITS", "Background Intelligent Transfer Service", "Manual", "Automatic (Delayed)"],
+  ["DoSvc", "Delivery Optimization", "Manual", "Automatic (Delayed)"],
+  ["OneSyncSvc", "Sync Host", "Manual", "Automatic (Delayed)"],
+  ["BDESVC", "BitLocker Drive Encryption Service", "Disabled", "Manual"],
+];
 let creating = 0;
 
 const history: Omit<HistoryRow, "index" | "selected">[] = [
@@ -282,6 +289,12 @@ export const services: MockTab<View, Action> = {
           : null,
       backups: backupsOpen
         ? {
+            windowsDefault: {
+              detail: "Startup types of a clean Windows 11 install (264 Windows services; drivers, apps and games are left alone)",
+              matches: defaultDiffs.length === 0,
+              diff: defaultDiffs.length === 0 ? "matches the PC now" : `${defaultDiffs.length} differ from now`,
+              canRestore: mockAdmin && !busy,
+            },
             msg: backupMsg,
             canCreate: mockAdmin && creating === 0,
             creating: creating > 0,
@@ -393,6 +406,31 @@ export const services: MockTab<View, Action> = {
             if (backupOp.op) {
               backupOp.op.can_undo = false;
               backupOp.op.notes = ["Restart the PC so every service starts the way the backup says."];
+            }
+          },
+        );
+        break;
+      }
+      case "backup_restore_default": {
+        if (!mockAdmin || backupOp.op) break;
+        const items = defaultDiffs.map(([name, display, now, def]) => opItem(name, `${display} (${name})`, "Startup type", `${now} -> ${def}`));
+        backupOp.open(
+          makeOp("RESTORE WINDOWS DEFAULTS", "restore", "restored", items, {
+            noun: ["service", "services"],
+            preview_text: "Back to the startup types of a clean Windows 11 install. Services Windows does not include (drivers, apps, games) are left as they are. A backup of the startup types now is saved first, so you can go back.",
+            warning: "This also undoes every service change you made on purpose (PC Tuner's and other tools').",
+            go_label: "Restore",
+            running_text: "Restoring services...",
+            reassure: "Only startup types change. Protected services are restored as SYSTEM; a restart finishes it.",
+            stage: items.length ? "Preview" : "Done",
+            empty_title: "Nothing to restore",
+            empty_text: "Every Windows service already has its default startup type.",
+          }),
+          () => {
+            defaultDiffs = [];
+            if (backupOp.op) {
+              backupOp.op.can_undo = false;
+              backupOp.op.notes = ["Restart the PC so every service starts the way Windows sets it."];
             }
           },
         );
