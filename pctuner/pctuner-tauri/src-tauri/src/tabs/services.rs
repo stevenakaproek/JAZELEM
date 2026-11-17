@@ -55,6 +55,7 @@ enum Action {
     BackupCreate,
     BackupFolder,
     BackupRestore { index: usize },
+    BackupDelete { index: usize },
     BackupOp { ev: OpEvent },
 }
 
@@ -383,6 +384,11 @@ impl Backend for ServicesTab {
                             b.open_restore(&bk, &diffs);
                         }
                     }
+                }
+            }
+            Action::BackupDelete { index } => {
+                if let Some(b) = &mut self.backups {
+                    b.delete_backup(index);
                 }
             }
             Action::BackupOp { ev } => {

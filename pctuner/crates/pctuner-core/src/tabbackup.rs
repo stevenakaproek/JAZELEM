@@ -97,6 +97,11 @@ pub fn list_in(dir: &std::path::Path) -> Vec<(PathBuf, Backup)> {
     v
 }
 
+/// Delete a saved backup: it goes to the Recycle Bin.
+pub fn delete(path: &std::path::Path) -> Result<(), String> {
+    common::recycle(&[path.to_path_buf()])
+}
+
 /// Settings whose value differs between the backup and now. Settings that exist only on one side
 /// (added or removed since) are left out: there is nothing to compare them with.
 pub fn differences(backup: &Backup, now: &[Item]) -> Vec<Diff> {
@@ -146,5 +151,20 @@ mod tests {
         assert!(differences(&l[0].1, &items).is_empty());
         assert_eq!(prefix("Group Policy"), "group-policy");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    /// Moves a small temp file to the real Recycle Bin, so it is only run by hand:
+    /// cargo test -p pctuner-core tabbackup_delete_goes_to_recycle_bin -- --ignored
+    #[test]
+    #[ignore]
+    fn tabbackup_delete_goes_to_recycle_bin() {
+        let p = std::env::temp_dir().join(format!("pctuner-delete-test-{}.json", std::process::id()));
+        std::fs::write(&p, "{}").unwrap();
+        super::delete(&p).unwrap();
+        assert!(!p.exists());
+        assert!(super::delete(&p).is_ok(), "a file that is already gone is not an error");
     }
 }

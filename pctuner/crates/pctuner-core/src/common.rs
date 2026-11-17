@@ -140,6 +140,22 @@ pub fn ps(script: &str) -> Result<String, String> {
     }
 }
 
+/// Move files to the Recycle Bin (so a deletion can still be taken back). Files that do not exist are skipped.
+pub fn recycle(paths: &[PathBuf]) -> Result<(), String> {
+    let list: Vec<String> = paths.iter().filter(|p| p.exists()).map(|p| format!("'{}'", p.display().to_string().replace('\'', "''"))).collect();
+    if list.is_empty() {
+        return Ok(());
+    }
+    ps(&format!(
+        "$ErrorActionPreference = 'Stop'\nAdd-Type -AssemblyName Microsoft.VisualBasic\nforeach ($f in @({})) {{ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($f, 'OnlyErrorDialogs', 'SendToRecycleBin') }}\n",
+        list.join(", ")
+    ))?;
+    match paths.iter().find(|p| p.exists()) {
+        Some(p) => Err(format!("{} is still there", p.display())),
+        None => Ok(()),
+    }
+}
+
 /// The message of a failed ps(): CLIXML error records decoded, and PowerShell's position lines
 /// ("At line:3 char:1", "+ CategoryInfo ...") dropped so only the readable text is left.
 fn ps_error_text(stderr: &str, stdout: &str) -> String {

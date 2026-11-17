@@ -366,6 +366,13 @@ export const services: MockTab<View, Action> = {
         break;
       case "backup_folder":
         break;
+      case "backup_delete": {
+        const b = backups[a.index];
+        if (!b || backupOp.op) break;
+        backups.splice(a.index, 1);
+        backupMsg = { text: `Backup from ${b.time} moved to the Recycle Bin (with its RESTORE .cmd and .reg file).`, ok: true };
+        break;
+      }
       case "backup_restore": {
         if (!mockAdmin) break;
         const b = backups[a.index];

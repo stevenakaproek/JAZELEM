@@ -1,7 +1,8 @@
 // The Backups sheet shared by Startup Cleaner, Optimization (each part), Group Policy and Processes:
 // save the tab's settings now, see how each saved backup differs from the PC, and restore one (through
 // the tab's own preview window).
-import { FolderOpen, History, Save } from "lucide-react";
+import { FolderOpen, History, Save, Trash2 } from "lucide-react";
+import { useState, type ReactNode } from "react";
 import { Banner, Button, Row, Sheet } from "./ui";
 import "../styles/backups.css";
 
@@ -23,7 +24,7 @@ export interface TabBackupsView {
   }[];
 }
 
-export type BackupAction = { kind: "backups" | "backups_close" | "backup_create" | "backup_folder" } | { kind: "backup_restore"; index: number };
+export type BackupAction = { kind: "backups" | "backups_close" | "backup_create" | "backup_folder" } | { kind: "backup_restore" | "backup_delete"; index: number };
 
 const SHOWN = 8;
 
@@ -36,7 +37,36 @@ export function BackupsButton({ act }: { act: (a: BackupAction) => void }) {
   );
 }
 
+/**
+ * A backup row's buttons: Restore (passed in) and Delete. Delete asks first, in the row itself:
+ * "Delete" again confirms (the files go to the Recycle Bin), Cancel keeps the backup.
+ */
+export function BackupButtons({ time, restore, confirming, onAsk, onCancel, onDelete }: { time: string; restore: ReactNode; confirming: boolean; onAsk: () => void; onCancel: () => void; onDelete: () => void }) {
+  if (confirming) {
+    return (
+      <span className="bk-confirm">
+        <span className="tone-warn">Delete the backup from {time}? It goes to the Recycle Bin.</span>
+        <span className="hstack">
+          <Button variant="danger-filled" icon={<Trash2 />} onClick={onDelete}>
+            Delete
+          </Button>
+          <Button onClick={onCancel}>Cancel</Button>
+        </span>
+      </span>
+    );
+  }
+  return (
+    <span className="hstack">
+      {restore}
+      <Button variant="danger" icon={<Trash2 />} title="Delete this backup (asks first; it goes to the Recycle Bin)." onClick={onAsk}>
+        Delete
+      </Button>
+    </span>
+  );
+}
+
 export function TabBackupsSheet({ b, kicker, act }: { b: TabBackupsView; kicker: string; act: (a: BackupAction) => void }) {
+  const [confirm, setConfirm] = useState<string | null>(null);
   return (
     <Sheet
       kicker={kicker}
@@ -97,9 +127,21 @@ export function TabBackupsSheet({ b, kicker, act }: { b: TabBackupsView; kicker:
                 </>
               }
               accessory={
-                <Button variant={x.diffs.length ? "primary" : "default"} disabled={!x.canRestore} title={b.admin ? "Puts back the settings that differ (a preview comes first)." : "Run PC Tuner as administrator."} onClick={() => act({ kind: "backup_restore", index: x.index })}>
-                  Restore
-                </Button>
+                <BackupButtons
+                  time={x.time}
+                  confirming={confirm === x.time}
+                  onAsk={() => setConfirm(x.time)}
+                  onCancel={() => setConfirm(null)}
+                  onDelete={() => {
+                    setConfirm(null);
+                    act({ kind: "backup_delete", index: x.index });
+                  }}
+                  restore={
+                    <Button variant={x.diffs.length ? "primary" : "default"} disabled={!x.canRestore} title={b.admin ? "Puts back the settings that differ (a preview comes first)." : "Run PC Tuner as administrator."} onClick={() => act({ kind: "backup_restore", index: x.index })}>
+                      Restore
+                    </Button>
+                  }
+                />
               }
             />
           ))}

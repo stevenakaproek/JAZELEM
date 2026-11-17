@@ -2,6 +2,7 @@
 import { Check as CheckIcon, ChevronDown, ChevronUp, FolderOpen, History as HistoryIcon, RefreshCw, Save } from "lucide-react";
 import { Fragment, useState } from "react";
 import { ABOUT_HINT, AboutRow, useOpenRows, type About } from "../components/About";
+import { BackupButtons } from "../components/TabBackups";
 import { OpSheet } from "../components/OpSheet";
 import { Badge, Banner, Button, Check, Dot, EmptyState, ErrorState, Group, Hero, LoadingState, Page, Row, SearchField, Sheet, Spinner, Stat, Switch, ViewOnlyBanner, cx, type BadgeColor } from "../components/ui";
 import { useShell } from "../lib/shell";
@@ -90,7 +91,7 @@ export type Action =
   | { kind: "change"; ty: "Disabled" | "Manual" | "Automatic" }
   | { kind: "clear" | "undo_last" | "refresh" | "history" | "history_close" | "hist_undo" | "hist_clear" | "backups" | "backups_close" | "backup_create" | "backup_folder" }
   | { kind: "hist_toggle"; index: number }
-  | { kind: "backup_restore"; index: number }
+  | { kind: "backup_restore" | "backup_delete"; index: number }
   | { kind: "op" | "backup_op"; ev: OpEvent };
 
 type Act = (a: Action) => Promise<void>;
@@ -253,6 +254,7 @@ function HistorySheet({ h, admin, act }: { h: HistoryView; admin: boolean; act: 
 }
 
 function BackupsSheet({ b, admin, act }: { b: BackupsView; admin: boolean; act: Act }) {
+  const [confirm, setConfirm] = useState<string | null>(null);
   if (b.op) return <OpSheet op={b.op} can={b.opCan} admin={admin} onEvent={(ev) => act({ kind: "backup_op", ev })} />;
   return (
     <Sheet
@@ -292,9 +294,21 @@ function BackupsSheet({ b, admin, act }: { b: BackupsView; admin: boolean; act: 
                 </>
               }
               accessory={
-                <Button variant={x.matches ? "default" : "primary"} disabled={!x.canRestore} title="Puts every service back to the startup type in this backup." onClick={() => act({ kind: "backup_restore", index: x.index })}>
-                  Restore this backup
-                </Button>
+                <BackupButtons
+                  time={x.time}
+                  confirming={confirm === x.time}
+                  onAsk={() => setConfirm(x.time)}
+                  onCancel={() => setConfirm(null)}
+                  onDelete={() => {
+                    setConfirm(null);
+                    void act({ kind: "backup_delete", index: x.index });
+                  }}
+                  restore={
+                    <Button variant={x.matches ? "default" : "primary"} disabled={!x.canRestore} title="Puts every service back to the startup type in this backup." onClick={() => act({ kind: "backup_restore", index: x.index })}>
+                      Restore this backup
+                    </Button>
+                  }
+                />
               }
             />
           ))}

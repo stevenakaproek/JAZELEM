@@ -158,6 +158,12 @@ pub fn list() -> Vec<(PathBuf, Backup)> {
     v
 }
 
+/// Delete a saved backup: its JSON, its RESTORE .cmd and its .reg export go to the Recycle Bin.
+pub fn delete(json: &std::path::Path) -> Result<(), String> {
+    let stamp = json.file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix("services-")).ok_or("not a services backup")?;
+    common::recycle(&[json.to_path_buf(), json.with_file_name(format!("RESTORE-services-{stamp}.cmd")), json.with_file_name(format!("services-{stamp}.reg"))])
+}
+
 /// Make a backup when there is none yet (called before the first service change).
 pub fn ensure_backup() -> Option<String> {
     if list().is_empty() {
@@ -263,6 +269,19 @@ impl Backups {
 
     pub fn busy(&self) -> bool {
         self.run.is_some() || self.job.is_some()
+    }
+
+    /// Delete a saved backup (to the Recycle Bin); the result is shown as the banner.
+    pub fn delete_backup(&mut self, index: usize) {
+        if self.busy() || self.op.is_some() {
+            return;
+        }
+        let Some((path, b)) = self.backups.get(index).cloned() else { return };
+        self.msg = Some(match delete(&path) {
+            Ok(()) => (format!("Backup from {} moved to the Recycle Bin (with its RESTORE .cmd and .reg file).", b.time), true),
+            Err(e) => (format!("Could not delete the backup from {}: {e}", b.time), false),
+        });
+        self.backups = list();
     }
 
     /// Poll a running backup / restore. Returns true when services changed (the list should reload).

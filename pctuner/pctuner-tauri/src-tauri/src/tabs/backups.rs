@@ -16,6 +16,7 @@ pub enum BackupAction {
     BackupCreate,
     BackupFolder,
     BackupRestore { index: usize },
+    BackupDelete { index: usize },
 }
 
 /// A Backups action, if this is one (tabs check this before their own actions).
@@ -64,6 +65,15 @@ impl Backups {
                 let _ = common::run("explorer.exe", &[&d.display().to_string()]);
             }
             BackupAction::BackupRestore { index } => return self.list.get(index).map(|(_, b)| b.clone()),
+            BackupAction::BackupDelete { index } => {
+                if let Some((path, b)) = self.list.get(index).cloned() {
+                    self.msg = Some(match tabbackup::delete(&path) {
+                        Ok(()) => (true, format!("Backup from {} moved to the Recycle Bin.", b.time)),
+                        Err(e) => (false, format!("Could not delete the backup from {}: {e}", b.time)),
+                    });
+                    self.list = tabbackup::list(self.folder);
+                }
+            }
         }
         None
     }

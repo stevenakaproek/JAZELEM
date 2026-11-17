@@ -92,6 +92,13 @@ export function mockBackups(about: string, now: () => BkItem[], restore: (diffs:
           else open = false;
           return true;
         }
+        case "backup_delete": {
+          const bk = seed()[b.index];
+          if (!bk) return true;
+          seed().splice(b.index, 1);
+          msg = { ok: true, text: `Backup from ${bk.time} moved to the Recycle Bin.` };
+          return true;
+        }
         default:
           return false;
       }
