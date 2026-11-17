@@ -4,10 +4,13 @@ use crate::backend::{json, op_event, parse, Backend};
 use pctuner_core::common;
 use pctuner_core::opwin::OpEvent;
 use pctuner_core::tweaks::{parse_log, pick_mode, script_tasks, Mode, Tweaks, GROUPS, G_EDGE, G_ONEDRIVE, G_TASKS, G_XBOX};
+use super::backups::{self, Backups};
+use pctuner_core::tabbackup::Item;
 use serde_json::{json, Value};
 
 pub struct TweaksTab {
     t: Tweaks,
+    bk: Backups,
 }
 
 #[derive(serde::Deserialize)]
@@ -24,12 +27,23 @@ enum Action {
 
 impl TweaksTab {
     pub fn new() -> Self {
-        TweaksTab { t: Tweaks::new() }
+        TweaksTab { t: Tweaks::new(), bk: Backups::new("Windows tweaks", ABOUT) }
     }
 
     /// May the page's buttons and rows be used: administrator, and the script is not running.
     fn can(&self) -> bool {
         common::is_admin() && !self.t.running()
+    }
+
+    /// The Backups sheet (`can` = a change could be started now).
+    fn bk_view(&self, can: bool) -> Value {
+        let n = self.now();
+        self.bk.view(n.as_ref().map(|x| x.1.as_slice()), can)
+    }
+
+    /// The settings for a backup (None until the tweaks are read).
+    fn now(&self) -> Option<(String, Vec<Item>)> {
+        self.t.status.as_ref().map(|s| (String::new(), pctuner_core::tweaks::backup_items(s)))
     }
 
     fn applied(&self, index: usize) -> Option<bool> {
@@ -122,10 +136,19 @@ impl Backend for TweaksTab {
             "lastRun": self.last_run(),
             "op": json(&t.op),
             "opCan": t.can_act(),
+            "backups": self.bk_view(can && t.op.is_none()),
         })
     }
 
     fn act(&mut self, action: Value) -> Result<Value, String> {
+        if let Some(a) = backups::action(&action) {
+            let now = self.now();
+            if let Some(b) = self.bk.act(a, now) {
+                let r = if common::is_admin() { self.t.open_restore(&b).map(|_| ()) } else { Err("Run PC Tuner as administrator to restore a backup.".to_string()) };
+                self.bk.restored(r);
+            }
+            return Ok(Value::Null);
+        }
         match parse::<Action>(action)? {
             Action::Toggle { index } => {
                 if index < 4 && self.can() && self.applied(index) == Some(false) {
@@ -163,3 +186,5 @@ impl Backend for TweaksTab {
         Ok(Value::Null)
     }
 }
+
+const ABOUT: &str = "A backup saves which of these tweaks are in place. Restore applies the ones the backup had. The script can only undo all its tweaks at once, so to take one back use Undo tweaks; OneDrive is never reinstalled.";

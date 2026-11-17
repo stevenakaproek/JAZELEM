@@ -1,5 +1,6 @@
 import type { Action, Compare, ProcRow, Side, View } from "../tabs/Processes";
 import { mockAdmin, mockParams } from "./env";
+import { mockBackups } from "./backups";
 import type { MockTab } from "./types";
 
 type Item = [exe: string, title: string, kind: ProcRow["kind"], mb: number | null, what: string, loses: string];
@@ -103,6 +104,21 @@ function finishMeasure() {
   });
 }
 
+const shownOf = (c: { what: "off" | "lower" } | undefined) => (c ? (c.what === "off" ? "Switched off" : "Lower priority") : "As Windows set it");
+const bk = mockBackups(
+  "A backup saves which processes PC Tuner has switched off or lowered. Restore undoes or makes only the changes that differ, one after another, and each one can still be undone here.",
+  () => items.filter((i) => i[2] !== "keep").map((i) => ({ id: i[0], title: i[1], value: changed.get(i[0])?.what ?? null, shown: shownOf(changed.get(i[0])) })),
+  (diffs) => {
+    for (const d of diffs) {
+      if (d.backup.value === null) changed.delete(d.backup.id);
+      else changed.set(d.backup.id, { what: d.backup.value as "off" | "lower", when: now() });
+    }
+    note = { ok: true, text: "Backup restored." };
+    return null;
+  },
+  (it) => ({ ...it, value: it.value ? null : "lower", shown: it.value ? "As Windows set it" : "Lower priority" }),
+);
+
 export const procs: MockTab<View, Action> = {
   view() {
     const rows = items.map(row);
@@ -119,9 +135,11 @@ export const procs: MockTab<View, Action> = {
       signIn: [...changed.values()].some((c) => c.what === "off") ? "Closed again 30 s and 2 min after every sign-in by the task \\PCTuner\\CloseSwitchedOff (Undo removes it)." : null,
       measuring: measuring === null ? null : { secs: Math.min(30, Math.floor(measuring)), of: 30 },
       compare: compare(),
+      backups: bk.view(mockAdmin),
     };
   },
   act(a) {
+    if (bk.act(a)) return;
     if (a.kind === "dismiss_note") note = null;
     else if (a.kind === "measure") measuring = measuring ?? 0;
     else if (a.kind === "refresh") return;

@@ -12,6 +12,7 @@
 
 use crate::common::{self, Job, Tone};
 use crate::sysinfo;
+use crate::tabbackup;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -544,6 +545,8 @@ pub struct Procs {
     pub work: Option<(String, Job<Result<Option<Change>, String>>)>,
     pub measuring: Option<(Instant, Job<Measure>)>,
     pub note: Option<(bool, String)>,
+    /// A backup being restored: the steps still to run (exe, what to apply; None = undo) and the errors so far.
+    pub restore: Option<(Vec<(String, Option<What>)>, Vec<String>)>,
 }
 
 impl Default for Procs {
@@ -565,11 +568,12 @@ impl Procs {
             work: None,
             measuring: None,
             note: None,
+            restore: None,
         }
     }
 
     pub fn busy(&self) -> bool {
-        self.work.is_some()
+        self.work.is_some() || self.restore.is_some()
     }
 
     pub fn rescan(&mut self) {
@@ -607,10 +611,14 @@ impl Procs {
                     Ok(None) => self.note = Some((true, format!("{label}: done."))),
                     Err(e) => self.note = Some((false, format!("{label}: {e}"))),
                 }
+                if let (Some((_, errs)), Some((false, t))) = (&mut self.restore, &self.note) {
+                    errs.push(t.clone());
+                }
                 common::save_json(HISTORY, &self.history);
                 self.rescan();
             }
         }
+        self.next_restore_step();
         if let Some((_, j)) = &self.measuring {
             if let Some(m) = j.poll() {
                 self.measuring = None;
@@ -706,6 +714,80 @@ impl Procs {
         })));
     }
 
+    /// Backups: what PC Tuner has done to each process it can change ("off", "lower", or nothing).
+    pub fn backup_items(&self) -> Vec<tabbackup::Item> {
+        CATALOG
+            .iter()
+            .filter(|e| e.kind != Kind::Keep)
+            .map(|e| {
+                let w = self.active(e.exe).map(|i| self.history[i].what);
+                let (v, shown) = match w {
+                    Some(What::Off) => (Some("off".to_string()), "Switched off"),
+                    Some(What::Lower) => (Some("lower".to_string()), "Lower priority"),
+                    None => (None, "As Windows set it"),
+                };
+                tabbackup::item(e.exe, e.title, v, shown)
+            })
+            .collect()
+    }
+
+    /// The steps that turn the PC now into the backup: undo what differs, then apply what the backup had.
+    pub fn restore_steps(&self, b: &tabbackup::Backup) -> Vec<(String, Option<What>)> {
+        let mut undo = vec![];
+        let mut apply = vec![];
+        for d in tabbackup::differences(b, &self.backup_items()) {
+            if d.now.value.is_some() {
+                undo.push((d.backup.id.clone(), None));
+            }
+            match d.backup.value.as_deref() {
+                Some("off") => apply.push((d.backup.id, Some(What::Off))),
+                Some("lower") => apply.push((d.backup.id, Some(What::Lower))),
+                _ => {}
+            }
+        }
+        undo.extend(apply);
+        undo
+    }
+
+    /// Restore a backup: runs the steps one after another (`pump` drives them); each step is a normal
+    /// change in the history, so Undo / Undo all still work afterwards.
+    pub fn start_restore(&mut self, b: &tabbackup::Backup) -> Result<(), String> {
+        if self.busy() {
+            return Err("A change is still running - try again in a moment.".into());
+        }
+        let steps = self.restore_steps(b);
+        if steps.is_empty() {
+            return Err("Nothing to restore - every process already matches this backup.".into());
+        }
+        self.restore = Some((steps, vec![]));
+        Ok(())
+    }
+
+    /// Start the next restore step, or report the restore when all are done. Called from `pump`.
+    fn next_restore_step(&mut self) {
+        if self.work.is_some() {
+            return;
+        }
+        let Some((mut steps, mut errs)) = self.restore.take() else { return };
+        if steps.is_empty() {
+            self.note = Some(if errs.is_empty() { (true, "Backup restored.".into()) } else { (false, format!("Backup restored with problems: {}", errs.join("; "))) });
+            return;
+        }
+        let (exe, what) = steps.remove(0);
+        self.note = None;
+        match what {
+            Some(w) => self.apply(&exe, w),
+            None => self.undo(&exe),
+        }
+        if self.work.is_none() {
+            // refused before it started (the note says why)
+            if let Some((false, t)) = &self.note {
+                errs.push(t.clone());
+            }
+        }
+        self.restore = Some((steps, errs));
+    }
+
     /// The changes in effect, as short words for a measurement.
     pub fn setup_words(&self) -> Vec<String> {
         self.history.iter().filter(|c| !c.undone).map(|c| format!("{} {}", c.exe, if c.what == What::Off { "off" } else { "lowered" })).collect()
@@ -739,6 +821,42 @@ pub fn state_text(e: &Entry, s: Option<&Setup>, active: Option<&Change>, running
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn procs_restore_steps_undo_first_then_apply() {
+        let ch = |exe: &str, what: What| Change { exe: exe.into(), what, time: "t".into(), writes: vec![], undone: false, notes: vec![] };
+        let mut p = Procs {
+            history: vec![ch("TabTip", What::Off), ch("AppActions", What::Lower), ch("WidgetBoard", What::Lower)],
+            measures: vec![],
+            setups: vec![],
+            live: Default::default(),
+            scan: None,
+            task: None,
+            task_tried: false,
+            work: None,
+            measuring: None,
+            note: None,
+            restore: None,
+        };
+        let mut b = tabbackup::Backup { items: p.backup_items(), ..Default::default() };
+        assert!(b.items.iter().all(|i| entry(&i.id).is_some_and(|e| e.kind != Kind::Keep)), "processes PC Tuner never changes are not in a backup");
+        assert!(p.restore_steps(&b).is_empty());
+        // the backup: touch keyboard untouched, Resume off, App actions lowered, Widgets switched... lowered too
+        for it in &mut b.items {
+            match it.id.as_str() {
+                "TabTip" => it.value = None,
+                "CrossDeviceResume" => it.value = Some("off".into()),
+                "WidgetBoard" => it.value = Some("lower".into()),
+                _ => {}
+            }
+        }
+        let steps = p.restore_steps(&b);
+        assert_eq!(steps, vec![("TabTip".to_string(), None), ("CrossDeviceResume".to_string(), Some(What::Off))]);
+        p.work = None;
+        p.start_restore(&b).unwrap();
+        assert!(p.busy(), "the page's buttons wait while a restore runs");
+        assert!(p.start_restore(&b).is_err());
+    }
 
     #[test]
     fn games_and_windows_essentials_are_never_changed() {

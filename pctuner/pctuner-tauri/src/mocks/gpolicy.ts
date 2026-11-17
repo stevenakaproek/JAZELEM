@@ -1,6 +1,7 @@
 import type { Action, PolicyRow, View } from "../tabs/Gpolicy";
 import { mockAdmin, mockParams } from "./env";
 import { MockOp, makeOp, opItem } from "./op";
+import { mockBackups, restoreOp } from "./backups";
 import type { MockTab } from "./types";
 
 type Kind = "not_configured" | "enabled" | "disabled";
@@ -132,6 +133,20 @@ function row(pol: Policy, index: number): PolicyRow {
     opts: tgt.kind === "enabled" ? pol.opts.map((o, k) => ({ label: o.label, value: vals[k], known: o.choices.some((c) => c[1] === vals[k]), choices: o.choices.map(([l, value]) => ({ label: l, value })) })) : [],  };
 }
 
+const bk = mockBackups(
+  "A backup saves the setting of every policy in this list. Restore puts back only the policies that differ, with the usual Apply preview, and can be undone.",
+  () => policies.map((x, i) => ({ id: String(i), title: x.name, value: JSON.stringify(x.cur), shown: label(x, x.cur) })),
+  (diffs) =>
+    restoreOp(op, "RESTORE GROUP POLICY BACKUP", diffs, (d) => {
+      policies[Number(d.backup.id)].cur = JSON.parse(d.backup.value ?? "null") as St;
+    }),
+  (it) => {
+    const x = policies[Number(it.id)];
+    const s = x.cur.kind === "disabled" ? nc : off;
+    return { ...it, value: JSON.stringify(s), shown: label(x, s) };
+  },
+);
+
 export const gpolicy: MockTab<View, Action> = {
   view() {
     const loaded = state !== "loading";
@@ -167,9 +182,11 @@ export const gpolicy: MockTab<View, Action> = {
       groups,
       op: op.op,
       opCan: can,
+      backups: bk.view(can && !op.op),
     };
   },
   act(a) {
+    if (bk.act(a)) return;
     switch (a.kind) {
       case "set":
         setTarget(policies[a.index], a.state === "enabled" ? on() : a.state === "disabled" ? off : nc);

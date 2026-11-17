@@ -4,6 +4,7 @@ import { History as HistoryIcon, RefreshCw, SearchX } from "lucide-react";
 import { Fragment, useState } from "react";
 import { ABOUT_HINT, AboutRow, useOpenRows, type About } from "../components/About";
 import { OpSheet } from "../components/OpSheet";
+import { BackupsButton, TabBackupsSheet, type BackupAction, type TabBackupsView } from "../components/TabBackups";
 import { Badge, Banner, Button, Check, EmptyState, ErrorState, Group, Hero, LoadingState, Page, SearchField, Sheet, Spinner, Stat, Switch, ViewOnlyBanner, cx } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow, Tone } from "../lib/types";
@@ -57,6 +58,7 @@ export interface StartupHistory {
 }
 
 export interface StartupView {
+  backups: TabBackupsView | null;
   /** false while the first scan runs. */
   ready: boolean;
   busy: boolean;
@@ -90,7 +92,8 @@ export type StartupAction =
   | { kind: "enabled_only" | "show_windows"; on: boolean }
   | { kind: "history_open" | "history_close" | "hist_undo_selected" | "hist_undo_all" | "hist_clear" }
   | { kind: "hist_toggle"; index: number }
-  | { kind: "op"; ev: OpEvent };
+  | { kind: "op"; ev: OpEvent }
+  | BackupAction;
 
 type Act = (a: StartupAction) => Promise<void>;
 
@@ -352,7 +355,7 @@ function Body({ view, act }: { view: StartupView; act: Act }) {
           </div>
         )}
       </Group>
-      {view.op ? <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} /> : view.history.open && <HistorySheet h={view.history} act={act} />}
+      {view.op ? <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} /> : view.backups ? <TabBackupsSheet b={view.backups} kicker="Startup Cleaner" act={act} /> : view.history.open && <HistorySheet h={view.history} act={act} />}
     </>
   );
 }
@@ -371,6 +374,7 @@ export function Startup() {
           <Button icon={<HistoryIcon />} disabled={!view} title="Every change this tool made, with undo." onClick={() => act({ kind: "history_open" })}>
             History...
           </Button>
+          <BackupsButton act={act} />
           <Button disabled={!view?.canExplorer} title="Needed for Explorer add-on changes to take effect. Shows a preview first." onClick={() => act({ kind: "explorer" })}>
             Restart Explorer
           </Button>

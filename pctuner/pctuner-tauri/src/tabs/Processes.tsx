@@ -5,6 +5,7 @@ import { useState } from "react";
 import { Badge, Banner, Button, ErrorState, Group, Hero, LoadingState, Page, Progress, Sheet, Spinner, Stat, ToneBadge, ViewOnlyBanner, cx } from "../components/ui";
 import type { Tone } from "../lib/types";
 import { useTab } from "../lib/useTab";
+import { BackupsButton, TabBackupsSheet, type BackupAction, type TabBackupsView } from "../components/TabBackups";
 import "../styles/procs.css";
 
 export interface ProcRow {
@@ -62,9 +63,10 @@ export interface View {
   signIn: string | null;
   measuring: { secs: number; of: number } | null;
   compare: Compare | null;
+  backups: TabBackupsView | null;
 }
 
-export type Action = { kind: "off" | "lower" | "undo"; exe: string } | { kind: "undo_all" | "measure" | "refresh" | "dismiss_note" };
+export type Action = { kind: "off" | "lower" | "undo"; exe: string } | { kind: "undo_all" | "measure" | "refresh" | "dismiss_note" } | BackupAction;
 
 type Act = (a: Action) => Promise<void>;
 
@@ -238,6 +240,7 @@ export function Processes() {
             <Button icon={<RotateCcw />} disabled={!view.canUndoAll} onClick={() => act({ kind: "undo_all" })}>
               Undo all
             </Button>
+            <BackupsButton act={act} />
             {view.refreshing && <Spinner />}
             {view.busy && (
               <>
@@ -275,6 +278,7 @@ export function Processes() {
               <RowView key={r.exe} r={r} view={view} act={act} onOff={setConfirm} />
             ))}
           </Group>
+          {view.backups && !confirm && <TabBackupsSheet b={view.backups} kicker="Processes" act={act} />}
           {confirm && (
             <Sheet
               kicker="Processes"

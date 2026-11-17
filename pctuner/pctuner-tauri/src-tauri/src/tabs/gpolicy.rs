@@ -3,10 +3,14 @@
 use crate::backend::{json, op_event, parse, Backend};
 use pctuner_core::gpolicy::{Gpolicy, Scope, St, GROUPS, POLICIES};
 use pctuner_core::opwin::OpEvent;
+use super::backups::{self, Backups};
+use pctuner_core::common;
+use pctuner_core::tabbackup::Item;
 use serde_json::{json, Value};
 
 pub struct GpolicyTab {
     g: Gpolicy,
+    bk: Backups,
 }
 
 #[derive(serde::Deserialize)]
@@ -39,7 +43,18 @@ enum Action {
 
 impl GpolicyTab {
     pub fn new() -> Self {
-        GpolicyTab { g: Gpolicy::new() }
+        GpolicyTab { g: Gpolicy::new(), bk: Backups::new("Group Policy", ABOUT) }
+    }
+
+    /// The Backups sheet (`can` = a change could be started now).
+    fn bk_view(&self, can: bool) -> Value {
+        let n = self.now();
+        self.bk.view(n.as_ref().map(|x| x.1.as_slice()), can)
+    }
+
+    /// The settings for a backup (None until the policies are read).
+    fn now(&self) -> Option<(String, Vec<Item>)> {
+        self.loaded().then(|| (String::new(), self.g.backup_items()))
     }
 
     fn loaded(&self) -> bool {
@@ -169,10 +184,19 @@ impl Backend for GpolicyTab {
             "groups": groups,
             "op": json(&g.op),
             "opCan": can,
+            "backups": self.bk_view(can && g.op.is_none()),
         })
     }
 
     fn act(&mut self, action: Value) -> Result<Value, String> {
+        if let Some(a) = backups::action(&action) {
+            let now = self.now();
+            if let Some(b) = self.bk.act(a, now) {
+                let r = if common::is_admin() { self.g.open_restore(&b) } else { Err("Run PC Tuner as administrator to restore a backup.".to_string()) };
+                self.bk.restored(r);
+            }
+            return Ok(Value::Null);
+        }
         let busy = self.g.busy_job();
         let can = self.g.can_act();
         let loaded = self.loaded();
@@ -265,3 +289,5 @@ impl Backend for GpolicyTab {
         Ok(Value::Null)
     }
 }
+
+const ABOUT: &str = "A backup saves the setting of every policy in this list. Restore puts back only the policies that differ, with the usual Apply preview, and can be undone.";

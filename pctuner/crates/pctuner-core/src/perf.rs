@@ -10,6 +10,7 @@
 
 use crate::common::{self, Job, Stream};
 use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::tabbackup;
 use serde::{Deserialize, Serialize};
 
 pub const HISTORY: &str = "perf-history.json";
@@ -110,6 +111,19 @@ pub fn selected_changes(state: &State, selected: &[bool]) -> Vec<Change> {
         .zip(selected)
         .filter(|(t, sel)| **sel && state.applicable(t.kind) && !state.is_set(t))
         .map(|(t, _)| Change { id: t.id.into(), prev: state.value(t.kind), new: Some(t.target.into()) })
+        .collect()
+}
+
+/// Backups: every setting whose value can be read now.
+pub fn backup_items(state: &State) -> Vec<tabbackup::Item> {
+    TWEAKS
+        .iter()
+        .filter(|t| state.applicable(t.kind))
+        .map(|t| {
+            let v = state.value(t.kind);
+            let shown = fmt(t.kind, v.as_deref());
+            tabbackup::item(t.id, t.name, v, shown)
+        })
         .collect()
 }
 
@@ -750,6 +764,28 @@ impl Perf {
         self.pending = Some((changes, None));
     }
 
+    /// Restore a backup: the settings that differ from it get their backed-up value, through the
+    /// normal preview window (recorded in the history, so "Undo last change" reverts the restore).
+    pub fn open_restore(&mut self, b: &tabbackup::Backup) -> Result<(), String> {
+        if self.run.is_some() || self.op.is_some() {
+            return Err("Another change is still open - finish it first.".into());
+        }
+        let Some(state) = self.state.as_ref().filter(|s| s.error.is_none()) else { return Err("The settings are still being read.".into()) };
+        let changes: Vec<Change> = tabbackup::differences(b, &backup_items(state))
+            .into_iter()
+            .map(|d| Change { id: d.backup.id, prev: d.now.value, new: d.backup.value })
+            .collect();
+        if changes.is_empty() {
+            return Err("Nothing to restore - every setting already matches this backup.".into());
+        }
+        let mut w = Self::op_window(&changes, false);
+        w.kicker = "RESTORE PERFORMANCE BACKUP".into();
+        w.preview_text = format!("Puts these settings back to the backup from {}. Each change is saved so it can be undone.", b.time);
+        self.op = Some(w);
+        self.pending = Some((changes, None));
+        Ok(())
+    }
+
     pub fn undo_changes(&self) -> Option<(Vec<Change>, usize)> {
         let i = self.history.iter().rposition(|h| !h.undone)?;
         let changes = self.history[i].changes.iter().rev().map(|c| Change { id: c.id.clone(), prev: c.new.clone(), new: c.prev.clone() }).collect();
@@ -905,6 +941,27 @@ impl Perf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perf_backup_restore_opens_the_preview() {
+        let now = State { menu: Some("100".into()), taskanim: Some(0), ..Default::default() };
+        let items = backup_items(&now);
+        assert!(items.iter().any(|i| i.id == "menu" && i.value.as_deref() == Some("100") && i.shown == fmt(Kind::MenuDelay, Some("100"))));
+        assert!(!items.iter().any(|i| i.id == "epp" || i.id == "mouseaccel"), "settings that could not be read are not backed up");
+        let b = tabbackup::Backup { time: "then".into(), items: backup_items(&State::default()), ..Default::default() };
+        let mut p = Perf { state: Some(now), loading: None, selected: vec![false; TWEAKS.len()], history: vec![], op: None, pending: None, run: None, explorer: None, explorer_preview: false, demo: false, note: None };
+        p.open_restore(&b).unwrap();
+        let (changes, undo_of) = p.pending.clone().unwrap();
+        assert!(undo_of.is_none(), "a restore is a new change, so Undo last change reverts it");
+        let got: Vec<(&str, Option<&str>, Option<&str>)> = changes.iter().map(|c| (c.id.as_str(), c.prev.as_deref(), c.new.as_deref())).collect();
+        assert_eq!(got, vec![("menu", Some("100"), Some("400")), ("taskanim", Some("0"), None)], "an absent value goes back to absent");
+        assert_eq!(p.op.as_ref().unwrap().items.len(), 2);
+        assert!(p.open_restore(&b).is_err(), "never over an open window");
+        p.op = None;
+        p.pending = None;
+        let same = tabbackup::Backup { items: backup_items(p.state.as_ref().unwrap()), ..Default::default() };
+        assert!(p.open_restore(&same).unwrap_err().starts_with("Nothing to restore"));
+    }
 
     #[test]
     fn perf_dx_pairs() {

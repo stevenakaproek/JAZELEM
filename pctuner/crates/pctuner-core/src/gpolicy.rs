@@ -12,6 +12,7 @@
 
 use crate::common::{self, Job};
 use crate::opwin::{OpEvent, OpItem, OpWindow};
+use crate::tabbackup;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use winreg::enums::*;
@@ -249,6 +250,30 @@ pub enum St {
     Disabled,
     /// Values present that match neither Enabled nor Disabled (set by something else).
     Other,
+}
+
+/// A setting as saved in a backup: "nc", "off", "on", "on:1,2" or "other".
+pub fn st_key(s: &St) -> String {
+    match s {
+        St::NotConfigured => "nc".into(),
+        St::Disabled => "off".into(),
+        St::Other => "other".into(),
+        St::Enabled(v) if v.is_empty() => "on".into(),
+        St::Enabled(v) => format!("on:{}", v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")),
+    }
+}
+
+/// The setting a backup value puts back (None for "other": it cannot be written back).
+pub fn st_parse(k: &str) -> Option<St> {
+    match k {
+        "nc" => Some(St::NotConfigured),
+        "off" => Some(St::Disabled),
+        "on" => Some(St::Enabled(vec![])),
+        _ => {
+            let v: Result<Vec<u32>, _> = k.strip_prefix("on:")?.split(',').map(|x| x.parse()).collect();
+            v.ok().map(St::Enabled)
+        }
+    }
 }
 
 impl Policy {
@@ -937,6 +962,43 @@ impl Gpolicy {
         self.pending = Some(Pending::Apply { items: ch });
     }
 
+    /// Restore a backup: the policies that differ from it are set to their backed-up setting and the
+    /// usual Apply preview opens (recorded in the history, so "Undo last change" reverts the restore).
+    /// Policies the backup found "set by something else" cannot be written back and are left out.
+    pub fn open_restore(&mut self, b: &tabbackup::Backup) -> Result<(), String> {
+        if self.busy_job() || self.op.is_some() {
+            return Err("Another change is still open - finish it first.".into());
+        }
+        if self.states.len() != POLICIES.len() {
+            return Err("The policies are still being read.".into());
+        }
+        let mut want = vec![None; POLICIES.len()];
+        let mut n = 0;
+        for d in tabbackup::differences(b, &self.backup_items()) {
+            let Some(i) = POLICIES.iter().position(|p| p.name == d.backup.id) else { continue };
+            if let Some(s) = d.backup.value.as_deref().and_then(st_parse) {
+                want[i] = Some(s);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Err("Nothing to restore - every policy already matches this backup.".into());
+        }
+        self.want = want;
+        self.picked.clear();
+        self.open_apply();
+        if let Some(w) = &mut self.op {
+            w.kicker = "RESTORE GROUP POLICY BACKUP".into();
+            w.preview_text = format!("Puts these policies back to the backup from {}. {}", b.time, w.preview_text);
+        }
+        Ok(())
+    }
+
+    /// Backups: every policy's setting as the page shows it.
+    pub fn backup_items(&self) -> Vec<tabbackup::Item> {
+        POLICIES.iter().zip(&self.states).map(|(p, s)| tabbackup::item(p.name, p.name, Some(st_key(s)), p.label(s))).collect()
+    }
+
     pub fn open_undo(&mut self) {
         let Some(b) = self.history.iter().rev().find(|b| !b.undone) else {
             self.last_action = "Nothing to undo.".into();
@@ -1111,6 +1173,17 @@ pub enum RowAct {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpolicy_backup_values_round_trip() {
+        for s in [St::NotConfigured, St::Disabled, St::Enabled(vec![]), St::Enabled(vec![2, 0, 15])] {
+            assert_eq!(st_parse(&st_key(&s)), Some(s));
+        }
+        assert_eq!(st_parse(&st_key(&St::Other)), None, "set by something else cannot be written back");
+        assert_eq!(st_parse("on:x"), None);
+        let names: std::collections::HashSet<&str> = POLICIES.iter().map(|p| p.name).collect();
+        assert_eq!(names.len(), POLICIES.len(), "policy names are the backup ids, so they must be unique");
+    }
 
     /// Click selects a row; a right-click choice goes to every selected row (or just the clicked one).
     #[test]

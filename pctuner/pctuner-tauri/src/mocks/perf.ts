@@ -1,6 +1,7 @@
 import type { PerfAction, PerfRow, PerfView } from "../tabs/Performance";
 import { mockAdmin, mockParams } from "./env";
 import { MockOp, makeOp, opItem } from "./op";
+import { mockBackups, restoreOp } from "./backups";
 import type { MockTab } from "./types";
 
 type Seed = [name: string, group: string, why: string, optional: boolean, now: string, target: string, set: boolean, applicable?: boolean];
@@ -48,6 +49,19 @@ let note: string | null = null;
 let customErr: string | null = null;
 const state = mockParams.get("state");
 
+const bk = mockBackups(
+  "A backup saves every performance setting in this list (not the Defender folders). Restore puts back only the settings that differ, with the usual preview, and can be undone.",
+  () => rows.filter((r) => r.applicable).map((r) => ({ id: String(r.index), title: r.name, value: r.now, shown: r.now })),
+  (diffs) =>
+    restoreOp(op, "RESTORE PERFORMANCE BACKUP", diffs, (d) => {
+      const r = rows[Number(d.backup.id)];
+      r.now = d.backup.shown;
+      r.set = r.now === r.target;
+      r.selectable = r.applicable && !r.set;
+    }),
+  (it) => ({ ...it, value: it.value === "On" ? "Off" : "On", shown: it.value === "On" ? "Off" : "On" }),
+);
+
 export const perf: MockTab<PerfView, PerfAction> = {
   view() {
     const pending = rows.filter((r) => r.selected).length;
@@ -64,6 +78,7 @@ export const perf: MockTab<PerfView, PerfAction> = {
       note,
       op: op.op,
       opCan: mockAdmin,
+      backups: bk.view(mockAdmin && !op.op),
       defender: {
         scanning: false,
         error: "",
@@ -81,6 +96,7 @@ export const perf: MockTab<PerfView, PerfAction> = {
     };
   },
   act(a) {
+    if (bk.act(a)) return;
     switch (a.kind) {
       case "toggle":
         if (rows[a.index].selectable) rows[a.index].selected = !rows[a.index].selected;

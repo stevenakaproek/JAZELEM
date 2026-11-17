@@ -1,0 +1,18 @@
+/* The Backups sheet shared by several tabs (components/TabBackups.tsx). */
+.bk-scroll {
+  max-height: 380px;
+  overflow-y: auto;
+  border-radius: var(--r-lg);
+  background: var(--bg-elevated);
+}
+
+.bk-diffs {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.bk-diffs strong {
+  font-weight: 600;
+}

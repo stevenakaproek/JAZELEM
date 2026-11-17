@@ -1,6 +1,7 @@
 // Optimization > Network: pick adapter and Windows network settings, apply them, undo the last change.
 import { ArrowRight, RefreshCw } from "lucide-react";
 import { OpSheet } from "../components/OpSheet";
+import { BackupsButton, TabBackupsSheet, type BackupAction, type TabBackupsView } from "../components/TabBackups";
 import { Badge, Button, ErrorState, Group, LoadingState, Row, Spinner } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow } from "../lib/types";
@@ -32,9 +33,10 @@ export interface NetworkView {
   canUndo: boolean;
   op: OpWindow | null;
   opCan: boolean;
+  backups: TabBackupsView | null;
 }
 
-export type NetworkAction = { kind: "toggle"; index: number } | { kind: "clear" | "apply" | "undo" | "refresh" } | { kind: "op"; ev: OpEvent };
+export type NetworkAction = { kind: "toggle"; index: number } | { kind: "clear" | "apply" | "undo" | "refresh" } | { kind: "op"; ev: OpEvent } | BackupAction;
 
 function SettingRow({ r, onToggle }: { r: NetworkRow; onToggle: () => void }) {
   return (
@@ -99,6 +101,7 @@ export function Network() {
           Undo last change
         </Button>
         <span className="spacer" />
+        <BackupsButton act={act} />
         {refresh}
       </div>
       {(view.groups ?? []).map((g) => (
@@ -108,7 +111,7 @@ export function Network() {
           ))}
         </Group>
       ))}
-      {view.op && <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} />}
+      {view.op ? <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} /> : view.backups && <TabBackupsSheet b={view.backups} kicker="Optimization · Network" act={act} />}
     </>
   );
 }

@@ -2,6 +2,7 @@
 import { RefreshCw } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { OpSheet } from "../components/OpSheet";
+import { BackupsButton, TabBackupsSheet, type BackupAction, type TabBackupsView } from "../components/TabBackups";
 import { Badge, Button, ErrorState, Group, LoadingState, Row, Spinner, Switch, cx } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow } from "../lib/types";
@@ -42,9 +43,10 @@ export interface TweaksView {
   lastRun: TweaksLastRun;
   op: OpWindow | null;
   opCan: boolean;
+  backups: TabBackupsView | null;
 }
 
-export type TweaksAction = { kind: "toggle"; index: number } | { kind: "clear" | "apply" | "undo" | "refresh" } | { kind: "details"; on: boolean } | { kind: "op"; ev: OpEvent };
+export type TweaksAction = { kind: "toggle"; index: number } | { kind: "clear" | "apply" | "undo" | "refresh" } | { kind: "details"; on: boolean } | { kind: "op"; ev: OpEvent } | BackupAction;
 
 function TweakRowView({ r, onToggle }: { r: TweakRow; onToggle: () => void }) {
   return (
@@ -135,6 +137,7 @@ export function Tweaks() {
           Undo tweaks
         </Button>
         <span className="spacer" />
+        <BackupsButton act={act} />
         <Button icon={<RefreshCw />} disabled={!view.canRefresh} onClick={() => act({ kind: "refresh" })}>
           Refresh status
         </Button>
@@ -145,7 +148,7 @@ export function Tweaks() {
         ))}
       </Group>
       <LastRun run={view.lastRun} onDetails={(on) => act({ kind: "details", on })} />
-      {view.op && <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} />}
+      {view.op ? <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} /> : view.backups && <TabBackupsSheet b={view.backups} kicker="Optimization · Windows tweaks" act={act} />}
     </>
   );
 }

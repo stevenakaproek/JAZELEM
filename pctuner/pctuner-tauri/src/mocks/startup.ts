@@ -2,6 +2,7 @@ import type { Tone } from "../lib/types";
 import type { StartupAction, StartupKind, StartupView } from "../tabs/Startup";
 import { mockAdmin, mockParams } from "./env";
 import { MockOp, makeOp, opItem } from "./op";
+import { mockBackups, restoreOp } from "./backups";
 import type { MockTab } from "./types";
 
 type Category = "Junk" | "Optional" | "Keep" | "Review" | "Windows";
@@ -192,6 +193,16 @@ function openUndo(idx: number[], title: string, run = false) {
   });
 }
 
+const bk = mockBackups(
+  "A backup saves whether each startup item is switched on or off. Restore switches back only the items that differ (new items are left as they are), with the usual preview, and can be undone.",
+  () => entries.map((e) => ({ id: e.id, title: `${e.name} (${GROUP[e.kind]})`, value: e.on ? "on" : "off", shown: e.on ? "On" : "Off" })),
+  (diffs) =>
+    restoreOp(op, "RESTORE STARTUP BACKUP", diffs, (d) => {
+      const e = entries.find((x) => x.id === d.backup.id);
+      if (e) e.on = d.backup.value === "on";
+    }),
+);
+
 export const startup: MockTab<StartupView, StartupAction> = {
   view() {
     const ready = state !== "loading";
@@ -248,9 +259,11 @@ export const startup: MockTab<StartupView, StartupAction> = {
       },
       op: op.op,
       opCan: mockAdmin || op.op?.kicker === "Restart Explorer",
+      backups: bk.view(mockAdmin && !op.op),
     };
   },
   act(a) {
+    if (bk.act(a)) return;
     const sel = () => visible().filter((e) => selected.has(e.id));
     switch (a.kind) {
       case "toggle":

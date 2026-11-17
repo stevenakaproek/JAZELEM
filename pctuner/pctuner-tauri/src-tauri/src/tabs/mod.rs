@@ -2,6 +2,7 @@
 
 use crate::backend::Backend;
 
+mod backups;
 mod bloat;
 mod fan;
 mod gpolicy;

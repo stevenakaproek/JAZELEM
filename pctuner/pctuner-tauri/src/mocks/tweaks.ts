@@ -1,6 +1,7 @@
 import type { TweakRow, TweaksAction, TweaksView } from "../tabs/Tweaks";
 import { mockAdmin, mockParams } from "./env";
 import { MockOp, makeOp, opItem } from "./op";
+import { mockBackups } from "./backups";
 import type { MockTab } from "./types";
 
 const TASKS = "Scheduled tasks";
@@ -119,6 +120,25 @@ function ask(groups: number[], undo: boolean) {
   );
 }
 
+const bk = mockBackups(
+  "A backup saves which of these tweaks are in place. Restore applies the ones the backup had. The script can only undo all its tweaks at once, so to take one back use Undo tweaks; OneDrive is never reinstalled.",
+  () => seeds.map((s, i) => ({ id: String(i), title: s[0], value: applied[i] ? "on" : "off", shown: applied[i] ? `Applied (${s[4]})` : `Not applied (${s[3]})` })),
+  (diffs) => {
+    if (op.op) return "Another change is still open - finish it first.";
+    const groups = diffs.filter((d) => d.backup.value === "on").map((d) => Number(d.backup.id));
+    const left = diffs.filter((d) => d.backup.value !== "on").map((d) => `"${d.backup.title}" is applied now but was not in this backup - "Undo tweaks" puts all tweaks back`);
+    if (!groups.length) return left.join("; ") || "Nothing to restore - every tweak already matches this backup.";
+    ask(groups, false);
+    const w = op.op as { notes: string[] } | null; // opened by ask()
+    if (w && left.length) {
+      w.notes = [`Not changed by this restore: ${left.join("; ")}.`];
+      (w as { preview_text?: string }).preview_text += ` Not changed by this restore: ${left.join("; ")}.`;
+    }
+    return null;
+  },
+  (it) => (Number(it.id) < 3 ? { ...it, value: it.value === "on" ? "off" : "on", shown: it.value === "on" ? "Not applied" : "Applied" } : it),
+);
+
 export const tweaks: MockTab<TweaksView, TweaksAction> = {
   view() {
     const known = checking === 0;
@@ -157,9 +177,11 @@ export const tweaks: MockTab<TweaksView, TweaksAction> = {
             },
       op: op.op,
       opCan: mockAdmin && !running(),
+      backups: bk.view(can && !op.op),
     };
   },
   act(a) {
+    if (bk.act(a)) return;
     const can = mockAdmin && !running();
     switch (a.kind) {
       case "toggle":

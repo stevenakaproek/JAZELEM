@@ -6,6 +6,7 @@
 
 use crate::common::{self, Stream};
 use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::tabbackup;
 
 pub const SCRIPT: &str = crate::scripts::POST_INSTALL_TWEAKS;
 
@@ -123,6 +124,23 @@ impl Status {
             _ => if self.onedrive_installed { "Installed".into() } else { "Not installed".into() },
         }
     }
+}
+
+/// Backups: whether each tweak is in place ("on" / "off"; tweaks whose state is unknown are left out).
+pub fn backup_items(st: &Status) -> Vec<tabbackup::Item> {
+    GROUPS
+        .iter()
+        .filter_map(|g| {
+            let on = st.applied(g)?;
+            let title = match *g {
+                G_TASKS => "Telemetry scheduled tasks off",
+                G_EDGE => "Edge preloading off",
+                G_XBOX => "Teredo on (Xbox networking)",
+                _ => "OneDrive removed",
+            };
+            Some(tabbackup::item(*g, title, Some(if on { "on" } else { "off" }.to_string()), if on { format!("Applied ({})", st.now(g)) } else { format!("Not applied ({})", st.now(g)) }))
+        })
+        .collect()
 }
 
 /// The script's scheduled tasks that exist here and are not disabled.
@@ -773,11 +791,65 @@ impl Tweaks {
         self.pending = Some(mode);
         self.op = Some(preview_window(mode));
     }
+
+    /// Restore a backup. Tweaks the backup had in place and the PC does not get applied again (normal
+    /// preview). The script can only undo all its tweaks at once, so a tweak in place now that the backup
+    /// did not have is named in the result instead of being undone; OneDrive is never reinstalled.
+    /// Ok(None) = a preview opened; Ok(Some(text)) = a preview opened, plus what it cannot do.
+    pub fn open_restore(&mut self, b: &tabbackup::Backup) -> Result<Option<String>, String> {
+        if self.running() || self.op.is_some() {
+            return Err("Another change is still open - finish it first.".into());
+        }
+        let Some(st) = &self.status else { return Err("The tweaks are still being read.".into()) };
+        let diffs = tabbackup::differences(b, &backup_items(st));
+        let mut sel = [false; 4];
+        let mut left: Vec<String> = vec![];
+        for d in &diffs {
+            let Some(i) = GROUPS.iter().position(|g| *g == d.backup.id) else { continue };
+            if d.backup.value.as_deref() == Some("on") {
+                sel[i] = true;
+            } else if GROUPS[i] == G_ONEDRIVE {
+                left.push("OneDrive was removed after this backup - reinstall it from onedrive.com if you want it back".into());
+            } else {
+                left.push(format!("{} is applied now but was not in this backup - \"Undo tweaks\" puts all tweaks back", d.backup.title));
+            }
+        }
+        let left = (!left.is_empty()).then(|| format!("{}.", left.join("; ")));
+        match pick_mode(&sel) {
+            Some(mode) => {
+                self.ask(mode);
+                if let Some(w) = &mut self.op {
+                    w.kicker = "RESTORE WINDOWS TWEAKS BACKUP".into();
+                    w.preview_text = format!("Applies the tweaks that were in place in the backup from {}. {}", b.time, w.preview_text);
+                    if let Some(l) = &left {
+                        w.preview_text.push_str(&format!(" Not changed by this restore: {l}"));
+                        w.notes.push(format!("Not changed by this restore: {l}"));
+                    }
+                }
+                Ok(left)
+            }
+            None => Err(left.unwrap_or_else(|| "Nothing to restore - every tweak already matches this backup.".into())),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tweaks_restore_applies_what_the_backup_had() {
+        let st = |tasks_on: usize, edge_off: bool| Status { teredo_type: "client".into(), edge_off, tasks_on: Some(tasks_on), onedrive_installed: true };
+        let b = tabbackup::Backup { time: "then".into(), items: backup_items(&st(0, false)), ..Default::default() };
+        assert_eq!(b.items.len(), 4);
+        let mut t = Tweaks { status: Some(st(3, true)), job: None, stream: None, mode: None, op: None, pending: None, show_details: false, demo: false, selected: [false; 4] };
+        let left = t.open_restore(&b).unwrap();
+        assert_eq!(t.pending, Some(Mode::Only(G_TASKS)), "the tasks tweak the backup had is applied again");
+        assert!(left.unwrap().contains("Edge preloading off"), "a tweak to take back on its own is named, not undone");
+        let mut t2 = Tweaks { status: Some(st(3, true)), job: None, stream: None, mode: None, op: None, pending: None, show_details: false, demo: false, selected: [false; 4] };
+        let only_edge = tabbackup::Backup { items: backup_items(&st(3, false)), ..Default::default() };
+        assert!(t2.open_restore(&only_edge).is_err() && t2.op.is_none(), "nothing it can apply: no window");
+    }
 
     #[test]
     fn tweaks_log_to_rows() {

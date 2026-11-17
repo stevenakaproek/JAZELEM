@@ -11,6 +11,7 @@
 
 use crate::common::{self, Job};
 use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::tabbackup;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1466,6 +1467,8 @@ pub enum What {
     Clean { spotlight: bool },
     Switch { on: bool },
     Undo { idx: Vec<usize> },
+    /// Put a backup back: each item goes to the opposite of its state now.
+    Restore,
     Explorer,
     /// Sample data for screenshots (PCTUNER_DEMO) - never touches the PC.
     Demo,
@@ -1639,7 +1642,8 @@ pub fn demo_op(stage: Stage) -> OpShow {
 
 pub enum Work {
     Rescan,
-    Toggle { items: Vec<Entry>, on: bool, verb: String, skipped: usize, batch: u32 },
+    /// Switch entries; each one goes to the opposite of its state (`on` for all of them, or mixed for a restore).
+    Toggle { items: Vec<Entry>, verb: String, skipped: usize, batch: u32 },
     Undo { idx: Vec<usize> },
 }
 
@@ -1750,9 +1754,16 @@ impl Startup {
             self.last_action = format!("Nothing to change - already switched {}.", if on { "on" } else { "off" });
             return;
         }
+        self.flip(work, verb, total);
+    }
+
+    /// Switch each entry to the opposite of its state, as ONE history batch (`total` = how many were
+    /// asked for, for the "already in that state" count).
+    pub fn flip(&mut self, work: Vec<Entry>, verb: &str, total: usize) {
         let ops = work
             .iter()
             .map(|e| {
+                let on = !e.enabled;
                 let mut loc = e.loc.clone();
                 if e.kind == Kind::Tweak && on {
                     // Use the snapshot taken when this tool switched it off, if there is one.
@@ -1766,7 +1777,7 @@ impl Startup {
             .collect();
         let skipped = total - work.len();
         let batch = self.next_batch();
-        self.start(Work::Toggle { items: work, on, verb: verb.to_string(), skipped, batch }, ops);
+        self.start(Work::Toggle { items: work, verb: verb.to_string(), skipped, batch }, ops);
     }
 
     /// Undo-Entries
@@ -1805,7 +1816,7 @@ impl Startup {
         let mut new_batch = None;
         match work {
             None | Some(Work::Rescan) => return,
-            Some(Work::Toggle { items, on, verb, skipped, batch }) => {
+            Some(Work::Toggle { items, verb, skipped, batch }) => {
                 let mut failed = 0;
                 let time = common::now();
                 for (e, r) in items.iter().zip(out.results) {
@@ -1819,7 +1830,7 @@ impl Startup {
                                 location: e.location.clone(),
                                 loc,
                                 from: e.enabled,
-                                to: on,
+                                to: !e.enabled,
                                 undone: false,
                             });
                             explorer |= e.kind == Kind::ShellExt;
@@ -1919,6 +1930,43 @@ impl Startup {
         self.op = Some(op);
     }
 
+    /// Backups: whether each item found by the scan is switched on.
+    pub fn backup_items(&self) -> Vec<tabbackup::Item> {
+        self.entries
+            .iter()
+            .map(|e| tabbackup::item(e.id.as_str(), format!("{} ({})", e.name, group_label(e.kind)), Some(if e.enabled { "on" } else { "off" }.to_string()), if e.enabled { "On" } else { "Off" }))
+            .collect()
+    }
+
+    /// Restore a backup: the items whose on / off state differs from it are switched back, through
+    /// the usual preview (one history batch, so "Undo last change" reverts the restore). Items that
+    /// are new since the backup are left as they are.
+    pub fn open_restore(&mut self, b: &tabbackup::Backup) -> Result<(), String> {
+        if self.busy() || self.op.is_some() {
+            return Err("Another change is still open - finish it first.".into());
+        }
+        if !self.scanned || self.job.is_some() {
+            return Err("The startup items are still being read.".into());
+        }
+        let ids: Vec<String> = tabbackup::differences(b, &self.backup_items()).into_iter().map(|d| d.backup.id).collect();
+        let mut work = self.by_ids(&ids);
+        if work.is_empty() {
+            return Err("Nothing to restore - every item already matches this backup.".into());
+        }
+        work.sort_by_cached_key(|e| (group_rank(e.kind), e.name.to_lowercase()));
+        let items = work
+            .iter()
+            .map(|e| entry_item(e).detail(if e.enabled { "On -> Off" } else { "Off -> On" }))
+            .collect();
+        let mut win = OpWindow::new("RESTORE STARTUP BACKUP", "restore", "restored", items);
+        win.preview_text = format!("Switches these back to how they were in the backup from {}. Nothing is deleted.", b.time);
+        win.reassure = "Every change goes into the history and can be undone.".into();
+        win.go_label = "Restore".into();
+        win.running_text = "Restoring...".into();
+        self.op = Some(OpShow { win, what: What::Restore, batch: None });
+        Ok(())
+    }
+
     /// Undo-LastBatch: opens the preview of the newest active batch.
     pub fn undo_last(&mut self) {
         let Some(last) = self.history.iter().filter(|h| !h.undone).map(|h| h.batch).max() else {
@@ -2004,6 +2052,11 @@ impl Startup {
                     What::Undo { idx } => {
                         let idx = idx.clone();
                         self.undo(idx);
+                    }
+                    What::Restore => {
+                        let items = self.by_ids(&ids);
+                        let total = items.len();
+                        self.flip(items, "restored from the backup", total);
                     }
                     What::Explorer => self.restart_explorer(),
                     What::Demo => {}
@@ -2101,6 +2154,24 @@ pub fn demo_history() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_restore_switches_back_both_ways() {
+        let mut s = Startup::from_load(HistLoad { hist: vec![], note: None, warning: None, writable: false });
+        let e = |name: &str, on: bool| new_entry(Kind::Run, name, "HKCU Run", "c:\\x.exe", on, Loc::default(), "");
+        s.entries = vec![e("A", true), e("B", false), e("C", true)];
+        s.scanned = true;
+        let b = tabbackup::Backup { time: "then".into(), items: s.backup_items(), ..Default::default() };
+        assert!(s.open_restore(&b).unwrap_err().starts_with("Nothing to restore"));
+        // since the backup: A switched off, B switched on, D is new
+        s.entries = vec![e("A", false), e("B", true), e("C", true), e("D", true)];
+        s.open_restore(&b).unwrap();
+        let op = s.op.as_ref().unwrap();
+        assert!(matches!(op.what, What::Restore));
+        let got: Vec<(&str, &str)> = op.win.items.iter().map(|i| (i.name.as_str(), i.detail.as_str())).collect();
+        assert_eq!(got, vec![("A", "Off -> On"), ("B", "On -> Off")], "only the differing items; the new one is left alone");
+        assert_eq!(tabbackup::new_since(&b, &s.backup_items()), 1);
+    }
 
     #[test]
     fn startup_clean_selection() {

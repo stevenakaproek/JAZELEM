@@ -21,6 +21,7 @@ pub mod services;
 pub mod startup;
 pub mod sysinfo;
 pub mod svcbackup;
+pub mod tabbackup;
 pub mod tweaks;
 pub mod usb;
 

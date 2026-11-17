@@ -9,6 +9,7 @@
 
 use crate::common::{self, Job, Stream};
 use crate::opwin::{self, OpEvent, OpItem, OpWindow, Stage};
+use crate::tabbackup;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use winreg::enums::*;
@@ -87,6 +88,26 @@ pub const TWEAKS: &[Tweak] = &[
 
 pub fn tweak(id: &str) -> Option<&'static Tweak> {
     TWEAKS.iter().find(|t| t.id == id)
+}
+
+/// Backups: every setting that exists here. Adapter settings get "@adapter" on their id, so a backup
+/// made on another adapter never writes them to this one.
+pub fn backup_items(state: &State) -> Vec<tabbackup::Item> {
+    TWEAKS
+        .iter()
+        .filter(|t| state.applicable(t.kind))
+        .map(|t| {
+            let v = state.value(t.kind);
+            let id = if matches!(t.kind, Kind::Adv(_)) { format!("{}@{}", t.id, state.adapter()) } else { t.id.to_string() };
+            let shown = fmt(t.kind, v.as_deref());
+            tabbackup::item(id, t.name, v, shown)
+        })
+        .collect()
+}
+
+/// "eee@Ethernet" -> "eee".
+pub fn tweak_id(backup_id: &str) -> &str {
+    backup_id.split('@').next().unwrap_or(backup_id)
 }
 
 // ------------------------------------------------------------------ state
@@ -506,6 +527,29 @@ impl Network {
         self.pending = Some((changes, None));
     }
 
+    /// Restore a backup through the normal preview window (recorded, so "Undo last change" reverts it).
+    /// Adapter settings are only compared on the adapter the backup was made on (their ids carry it).
+    pub fn open_restore(&mut self, b: &tabbackup::Backup) -> Result<(), String> {
+        if self.run.is_some() || self.op.is_some() {
+            return Err("Another change is still open - finish it first.".into());
+        }
+        let Some(state) = self.state.as_ref().filter(|s| s.error.is_none()) else { return Err("The settings are still being read.".into()) };
+        let changes: Vec<Change> = tabbackup::differences(b, &backup_items(state))
+            .into_iter()
+            .map(|d| Change { id: tweak_id(&d.backup.id).to_string(), prev: d.now.value, new: d.backup.value })
+            .collect();
+        if changes.is_empty() {
+            let other = if !b.scope.is_empty() && b.scope != state.adapter() { format!(" (its adapter settings are for \"{}\", not \"{}\")", b.scope, state.adapter()) } else { String::new() };
+            return Err(format!("Nothing to restore - every setting already matches this backup{other}."));
+        }
+        let mut w = Self::op_window(&changes, false, state.adapter());
+        w.kicker = "RESTORE NETWORK BACKUP".into();
+        w.preview_text = format!("Adapter: {}. Puts these settings back to the backup from {}. Each change is saved so it can be undone.", state.adapter(), b.time);
+        self.op = Some(w);
+        self.pending = Some((changes, None));
+        Ok(())
+    }
+
     /// Changes that put back the last change that has not been undone.
     pub fn undo_changes(&self) -> Option<(Vec<Change>, usize)> {
         let i = self.history.iter().rposition(|h| !h.undone)?;
@@ -639,6 +683,27 @@ impl Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_backup_keeps_adapter_settings_on_their_adapter() {
+        let state = |name: &str, eee: &str, throttle: u32| State {
+            info: Some(AdapterInfo { name: name.into(), guid: "g".into(), adv: [("*EEE".to_string(), eee.to_string())].into_iter().collect(), ..Default::default() }),
+            throttle: Some(throttle),
+            ..Default::default()
+        };
+        let items = backup_items(&state("Ethernet", "1", 10));
+        assert!(items.iter().any(|i| i.id == "eee@Ethernet"));
+        assert_eq!(tweak_id("eee@Ethernet"), "eee");
+        let b = tabbackup::Backup { time: "then".into(), scope: "Ethernet".into(), items, ..Default::default() };
+        let mut n = Network { state: Some(state("Wi-Fi", "0", 4294967295)), loading: None, selected: vec![false; TWEAKS.len()], history: vec![], op: None, pending: None, run: None, demo: false };
+        n.open_restore(&b).unwrap();
+        let ids: Vec<String> = n.pending.as_ref().unwrap().0.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids, vec!["throttle"], "another adapter: only the Windows settings are restored");
+        let mut same = Network { state: Some(state("Ethernet", "0", 10)), loading: None, selected: vec![false; TWEAKS.len()], history: vec![], op: None, pending: None, run: None, demo: false };
+        same.open_restore(&b).unwrap();
+        let c = &same.pending.as_ref().unwrap().0;
+        assert_eq!((c[0].id.as_str(), c[0].new.as_deref()), ("eee", Some("1")), "the same adapter gets its adapter setting back");
+    }
 
     /// Parses (does not run) the generated scripts with the PowerShell parser.
     #[test]

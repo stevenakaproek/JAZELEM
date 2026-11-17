@@ -1,6 +1,7 @@
 import type { NetworkAction, NetworkRow, NetworkView } from "../tabs/Network";
 import { mockAdmin, mockParams } from "./env";
 import { MockOp, makeOp, opItem } from "./op";
+import { mockBackups, restoreOp } from "./backups";
 import type { MockTab } from "./types";
 
 type Seed = [name: string, group: string, why: string, optional: boolean, now: string, target: string, set: boolean, applicable?: boolean];
@@ -83,6 +84,19 @@ function undo() {
   );
 }
 
+const bk = mockBackups(
+  "A backup saves every network setting in this list. Restore puts back only the settings that differ, with the usual preview, and can be undone. Adapter settings are only restored on the adapter the backup was made on.",
+  () => rows.filter((r) => r.applicable).map((r) => ({ id: String(r.index), title: r.name, value: r.now, shown: r.now })),
+  (diffs) =>
+    restoreOp(op, "RESTORE NETWORK BACKUP", diffs, (d) => {
+      const r = rows[Number(d.backup.id)];
+      r.now = d.backup.shown;
+      r.set = r.now === r.target;
+      r.selectable = r.applicable && !r.set;
+    }),
+  (it) => ({ ...it, value: it.value === "Off" ? "On" : "Off", shown: it.value === "Off" ? "On" : "Off" }),
+);
+
 export const network: MockTab<NetworkView, NetworkAction> = {
   view() {
     const pending = rows.filter((r) => r.selected).length;
@@ -97,9 +111,11 @@ export const network: MockTab<NetworkView, NetworkAction> = {
       canUndo: mockAdmin && last.length > 0 && op.op?.stage !== "Running",
       op: op.op,
       opCan: mockAdmin && op.op?.stage !== "Running",
+      backups: bk.view(mockAdmin && !op.op),
     };
   },
   act(a) {
+    if (bk.act(a)) return;
     switch (a.kind) {
       case "toggle":
         if (rows[a.index]?.selectable) rows[a.index].selected = !rows[a.index].selected;

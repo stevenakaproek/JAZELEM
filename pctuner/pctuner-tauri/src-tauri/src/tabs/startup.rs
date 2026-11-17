@@ -4,10 +4,14 @@
 use crate::backend::{json, parse, Backend};
 use pctuner_core::opwin::{OpEvent, Stage};
 use pctuner_core::startup::{clean_sel_op, explorer_op, Entry, Kind, Startup, KINDS};
+use super::backups::{self, Backups};
+use pctuner_core::common;
+use pctuner_core::tabbackup::Item;
 use serde_json::{json, Value};
 
 pub struct StartupTab {
     s: Startup,
+    bk: Backups,
 }
 
 #[derive(serde::Deserialize)]
@@ -36,10 +40,21 @@ enum Action {
 
 impl StartupTab {
     pub fn new() -> Self {
-        StartupTab { s: Startup::new() }
+        StartupTab { s: Startup::new(), bk: Backups::new("Startup", ABOUT) }
     }
 
     /// The selected items among the rows shown now (the egui tab's `sel`).
+    /// The Backups sheet (`can` = a change could be started now).
+    fn bk_view(&self, can: bool) -> Value {
+        let n = self.now();
+        self.bk.view(n.as_ref().map(|x| x.1.as_slice()), can)
+    }
+
+    /// The settings for a backup (None until the first scan is done).
+    fn now(&self) -> Option<(String, Vec<Item>)> {
+        (self.s.scanned && self.s.job.is_none() && !self.s.entries.is_empty()).then(|| (String::new(), self.s.backup_items()))
+    }
+
     fn sel(&self) -> Vec<Entry> {
         let s = &self.s;
         s.visible().iter().map(|&i| &s.entries[i]).filter(|e| s.selected.contains(&e.id)).cloned().collect()
@@ -201,10 +216,19 @@ impl Backend for StartupTab {
             "history": self.history(),
             "op": json(&s.op.as_ref().map(|o| &o.win)),
             "opCan": s.can_act(),
+            "backups": self.bk_view(s.can_act() && s.op.is_none()),
         })
     }
 
     fn act(&mut self, action: Value) -> Result<Value, String> {
+        if let Some(a) = backups::action(&action) {
+            let now = self.now();
+            if let Some(b) = self.bk.act(a, now) {
+                let r = if common::is_admin() { self.s.open_restore(&b) } else { Err("Run PC Tuner as administrator to restore a backup.".to_string()) };
+                self.bk.restored(r);
+            }
+            return Ok(Value::Null);
+        }
         let busy = self.s.busy();
         match parse::<Action>(action)? {
             Action::Toggle { id } => {
@@ -284,3 +308,5 @@ impl Backend for StartupTab {
         Ok(Value::Null)
     }
 }
+
+const ABOUT: &str = "A backup saves whether each startup item is switched on or off. Restore switches back only the items that differ (new items are left as they are), with the usual preview, and can be undone.";

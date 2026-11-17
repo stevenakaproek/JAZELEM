@@ -4,10 +4,13 @@ use crate::backend::{json, op_event, parse, Backend};
 use pctuner_core::common;
 use pctuner_core::network::{fmt, selected_changes, Network, TWEAKS};
 use pctuner_core::opwin::OpEvent;
+use super::backups::{self, Backups};
+use pctuner_core::tabbackup::Item;
 use serde_json::{json, Value};
 
 pub struct NetworkTab {
     n: Network,
+    bk: Backups,
 }
 
 #[derive(serde::Deserialize)]
@@ -23,10 +26,22 @@ enum Action {
 
 impl NetworkTab {
     pub fn new() -> Self {
-        NetworkTab { n: Network::new() }
+        NetworkTab { n: Network::new(), bk: Backups::new("Network", ABOUT) }
     }
 
     /// A row can be clicked: it exists on this adapter, is not applied yet and nothing is running.
+    /// The Backups sheet (`can` = a change could be started now).
+    fn bk_view(&self, can: bool) -> Value {
+        let n = self.now();
+        self.bk.view(n.as_ref().map(|x| x.1.as_slice()), can)
+    }
+
+    /// The settings for a backup (None until the adapter is read).
+    fn now(&self) -> Option<(String, Vec<Item>)> {
+        let s = self.n.state.as_ref().filter(|s| s.error.is_none() && s.info.is_some())?;
+        Some((s.adapter().to_string(), pctuner_core::network::backup_items(s)))
+    }
+
     fn selectable(&self, index: usize) -> bool {
         let (Some(state), Some(t)) = (&self.n.state, TWEAKS.get(index)) else { return false };
         state.info.is_some() && state.applicable(t.kind) && !state.is_set(t) && self.n.run.is_none()
@@ -112,10 +127,19 @@ impl Backend for NetworkTab {
             "canUndo": can && self.has_undo(),
             "op": json(&n.op),
             "opCan": n.can_act(),
+            "backups": self.bk_view(can && n.op.is_none()),
         })
     }
 
     fn act(&mut self, action: Value) -> Result<Value, String> {
+        if let Some(a) = backups::action(&action) {
+            let now = self.now();
+            if let Some(b) = self.bk.act(a, now) {
+                let r = if common::is_admin() { self.n.open_restore(&b) } else { Err("Run PC Tuner as administrator to restore a backup.".to_string()) };
+                self.bk.restored(r);
+            }
+            return Ok(Value::Null);
+        }
         match parse::<Action>(action)? {
             Action::Toggle { index } => {
                 if self.selectable(index) {
@@ -150,3 +174,5 @@ impl Backend for NetworkTab {
         Ok(Value::Null)
     }
 }
+
+const ABOUT: &str = "A backup saves every network setting in this list. Restore puts back only the settings that differ, with the usual preview, and can be undone. Adapter settings are only restored on the adapter the backup was made on.";

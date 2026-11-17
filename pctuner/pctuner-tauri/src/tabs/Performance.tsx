@@ -2,6 +2,7 @@
 import { ArrowRight, FolderPlus, RefreshCw } from "lucide-react";
 import { useState } from "react";
 import { OpSheet } from "../components/OpSheet";
+import { BackupsButton, TabBackupsSheet, type BackupAction, type TabBackupsView } from "../components/TabBackups";
 import { Badge, Banner, Button, ErrorState, Group, LoadingState, Row, Spinner } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow } from "../lib/types";
@@ -50,6 +51,7 @@ export interface PerfView {
   op: OpWindow | null;
   opCan: boolean;
   defender: DefenderView;
+  backups: TabBackupsView | null;
 }
 
 export type PerfAction =
@@ -59,7 +61,8 @@ export type PerfAction =
   | { kind: "defender_tick"; path: string; on: boolean }
   | { kind: "defender_add"; path: string }
   | { kind: "defender_exclude" | "defender_undo" | "defender_rescan" }
-  | { kind: "defender_op"; ev: OpEvent };
+  | { kind: "defender_op"; ev: OpEvent }
+  | BackupAction;
 
 function SettingRow({ r, onToggle }: { r: PerfRow; onToggle: () => void }) {
   return (
@@ -201,6 +204,7 @@ export function Performance() {
         </Button>
         <span className="spacer" />
         {view.note && <span className="secondary">{view.note}</span>}
+        <BackupsButton act={act} />
         <Button icon={view.refreshing ? <Spinner /> : <RefreshCw />} disabled={view.refreshing} onClick={() => act({ kind: "refresh" })}>
           Refresh
         </Button>
@@ -215,6 +219,8 @@ export function Performance() {
       <DefenderCard d={view.defender} admin={admin} act={act} />
       {view.op ? (
         <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} />
+      ) : view.backups ? (
+        <TabBackupsSheet b={view.backups} kicker="Optimization · Performance" act={act} />
       ) : (
         view.defender.op && <OpSheet op={view.defender.op} can={view.defender.opCan} admin={admin} onEvent={(ev) => act({ kind: "defender_op", ev })} />
       )}

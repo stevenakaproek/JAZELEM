@@ -5,11 +5,14 @@ use pctuner_core::common;
 use pctuner_core::defender::Defender;
 use pctuner_core::opwin::OpEvent;
 use pctuner_core::perf::{fmt, selected_changes, Kind, Perf, TWEAKS};
+use super::backups::{self, Backups};
+use pctuner_core::tabbackup::Item;
 use serde_json::{json, Value};
 
 pub struct PerfTab {
     p: Perf,
     d: Defender,
+    bk: Backups,
 }
 
 #[derive(serde::Deserialize)]
@@ -32,7 +35,19 @@ enum Action {
 
 impl PerfTab {
     pub fn new() -> Self {
-        PerfTab { p: Perf::new(), d: Defender::new() }
+        PerfTab { p: Perf::new(), d: Defender::new(), bk: Backups::new("Performance", ABOUT) }
+    }
+
+    /// The Backups sheet (`can` = a change could be started now).
+    fn bk_view(&self, can: bool) -> Value {
+        let n = self.now();
+        self.bk.view(n.as_ref().map(|x| x.1.as_slice()), can)
+    }
+
+    /// The settings for a backup (None until they are read).
+    fn now(&self) -> Option<(String, Vec<Item>)> {
+        let s = self.p.state.as_ref().filter(|s| s.error.is_none())?;
+        Some((String::new(), pctuner_core::perf::backup_items(s)))
     }
 
     fn settings(&self) -> Value {
@@ -137,10 +152,19 @@ impl Backend for PerfTab {
             "op": json(&p.op),
             "opCan": p.can_act(),
             "defender": self.defender(),
+            "backups": self.bk_view(can && p.op.is_none()),
         })
     }
 
     fn act(&mut self, action: Value) -> Result<Value, String> {
+        if let Some(a) = backups::action(&action) {
+            let now = self.now();
+            if let Some(b) = self.bk.act(a, now) {
+                let r = if common::is_admin() { self.p.open_restore(&b) } else { Err("Run PC Tuner as administrator to restore a backup.".to_string()) };
+                self.bk.restored(r);
+            }
+            return Ok(Value::Null);
+        }
         match parse::<Action>(action)? {
             Action::Toggle { index } => {
                 if let Some(s) = self.p.selected.get_mut(index) {
@@ -193,3 +217,5 @@ impl Backend for PerfTab {
         Ok(Value::Null)
     }
 }
+
+const ABOUT: &str = "A backup saves every performance setting in this list (not the Defender folders). Restore puts back only the settings that differ, with the usual preview, and can be undone.";

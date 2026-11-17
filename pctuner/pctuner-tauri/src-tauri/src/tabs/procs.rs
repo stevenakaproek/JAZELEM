@@ -4,6 +4,8 @@
 use crate::backend::{parse, Backend};
 use pctuner_core::common;
 use pctuner_core::procs::*;
+use super::backups::{self, Backups};
+use pctuner_core::tabbackup::Item;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11,6 +13,7 @@ pub struct ProcsTab {
     p: Procs,
     /// The page has been opened: the first read starts then, not at program start.
     opened: AtomicBool,
+    bk: Backups,
 }
 
 #[derive(serde::Deserialize)]
@@ -27,7 +30,18 @@ enum Action {
 
 impl ProcsTab {
     pub fn new() -> Self {
-        ProcsTab { p: Procs::new(), opened: AtomicBool::new(false) }
+        ProcsTab { p: Procs::new(), opened: AtomicBool::new(false), bk: Backups::new("Processes", ABOUT) }
+    }
+
+    /// The Backups sheet (`can` = a change could be started now).
+    fn bk_view(&self, can: bool) -> Value {
+        let n = self.now();
+        self.bk.view(n.as_ref().map(|x| x.1.as_slice()), can)
+    }
+
+    /// The settings for a backup (None until the processes are read).
+    fn now(&self) -> Option<(String, Vec<Item>)> {
+        (!self.p.setups.is_empty()).then(|| (String::new(), self.p.backup_items()))
     }
 
     fn can(&self) -> bool {
@@ -142,10 +156,19 @@ impl Backend for ProcsTab {
             }) },
             "measuring": p.measuring.as_ref().map(|(t, _)| json!({ "secs": t.elapsed().as_secs().min(MEASURE_SECS), "of": MEASURE_SECS })),
             "compare": self.compare(),
+            "backups": self.bk_view(self.can()),
         })
     }
 
     fn act(&mut self, action: Value) -> Result<Value, String> {
+        if let Some(a) = backups::action(&action) {
+            let now = self.now();
+            if let Some(b) = self.bk.act(a, now) {
+                let r = if common::is_admin() { self.p.start_restore(&b) } else { Err("Run PC Tuner as administrator to restore a backup.".to_string()) };
+                self.bk.restored(r);
+            }
+            return Ok(Value::Null);
+        }
         let admin = common::is_admin();
         match parse::<Action>(action)? {
             Action::Off { exe } if admin => self.p.apply(&exe, What::Off),
@@ -160,3 +183,5 @@ impl Backend for ProcsTab {
         Ok(Value::Null)
     }
 }
+
+const ABOUT: &str = "A backup saves which processes PC Tuner has switched off or lowered. Restore undoes or makes only the changes that differ, one after another, and each one can still be undone here.";

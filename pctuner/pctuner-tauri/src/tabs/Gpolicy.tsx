@@ -2,6 +2,7 @@
 import { RefreshCw, Search as SearchIcon } from "lucide-react";
 import { useState } from "react";
 import { OpSheet } from "../components/OpSheet";
+import { BackupsButton, TabBackupsSheet, type BackupAction, type TabBackupsView } from "../components/TabBackups";
 import { Badge, Banner, Button, EmptyState, ErrorState, Group, Hero, LoadingState, Page, SearchField, Segmented, Spinner, Stat, ViewOnlyBanner, cx, type BadgeColor } from "../components/ui";
 import { useShell } from "../lib/shell";
 import type { OpEvent, OpWindow } from "../lib/types";
@@ -41,6 +42,7 @@ export interface PolicyRow {
 }
 
 export interface View {
+  backups: TabBackupsView | null;
   loaded: boolean;
   gpo: boolean;
   edition: string;
@@ -70,7 +72,8 @@ export type Action =
   | { kind: "opt"; index: number; opt: number; value: number }
   | { kind: "search"; text: string }
   | { kind: "apply" | "discard" | "undo" | "refresh" | "gpedit" }
-  | { kind: "op"; ev: OpEvent };
+  | { kind: "op"; ev: OpEvent }
+  | BackupAction;
 
 type Act = (a: Action) => Promise<void>;
 
@@ -191,6 +194,7 @@ function Body({ view, admin, act }: { view: View; admin: boolean; act: Act }) {
         <Button icon={view.working ? <Spinner /> : <RefreshCw />} disabled={!view.canRefresh} onClick={() => act({ kind: "refresh" })}>
           Refresh
         </Button>
+        <BackupsButton act={act} />
         {view.gpo && (
           <Button title="Windows' own Group Policy editor (everything set here shows there)." onClick={() => act({ kind: "gpedit" })}>
             Open gpedit
@@ -212,7 +216,7 @@ function Body({ view, admin, act }: { view: View; admin: boolean; act: Act }) {
           </Group>
         ))
       )}
-      {view.op && <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} />}
+      {view.op ? <OpSheet op={view.op} can={view.opCan} admin={admin} onEvent={(ev) => act({ kind: "op", ev })} /> : view.backups && <TabBackupsSheet b={view.backups} kicker="Group Policy" act={act} />}
     </>
   );
 }
